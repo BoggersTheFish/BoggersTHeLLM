@@ -83,25 +83,28 @@ The network contains only:
 git clone --recurse-submodules https://github.com/BoggersTheFish/idekatp.git
 cd idekatp
 python3 -m venv .venv
-source .venv/bin/activate
+source .venv/bin/activate   # after this, `python` usually works; without venv use `python3`
 pip install -r requirements.txt
 ```
+
+On **Ubuntu / Linux Mint**, only `python3` may be installed. Either activate `.venv` as above or call `python3 sandbox.py` instead of `python sandbox.py`.
 
 ### Train the baseline model
 
 ```bash
-python sandbox.py
+python3 sandbox.py
 ```
 
-With trajectory contrastive loss (recommended), LR schedule, and metrics CSV:
+With trajectory contrastive loss (recommended), LR schedule, metrics CSV, and a fixed epoch count:
 
 ```bash
-python sandbox.py \
+python3 sandbox.py \
   --epoch-metrics-csv metrics.csv \
   --lr 0.001 \
   --lr-decay-every 15 \
   --lr-gamma 0.7 \
-  --val-fraction 0.1
+  --val-fraction 0.1 \
+  --max-epochs 30
 ```
 
 ### Run the smoke test
@@ -109,13 +112,13 @@ python sandbox.py \
 Verifies dynamics, tension, training step, and TSCore wave cycle all pass:
 
 ```bash
-python smoke_test.py
+python3 smoke_test.py
 ```
 
 ### Run the evaluation harness
 
 ```bash
-python eval_harness.py --val-fraction 0.2 --max-ticks 11 --output eval_results.json
+python3 eval_harness.py --val-fraction 0.2 --max-ticks 11 --output eval_results.json
 ```
 
 (`--wave-cycles` is a deprecated alias for `--max-ticks`.)
@@ -365,7 +368,7 @@ T_window = 1 − mean_cos(token_states, mean_direction)
 ## CLI reference
 
 ```
-python sandbox.py [options]
+python3 sandbox.py [options]    # or: source .venv/bin/activate && python sandbox.py
 
 Data & tokenizer:
   --corpus PATH              Training text (default: data/corpus.txt)
@@ -386,6 +389,7 @@ Training:
   --readout-aux-alpha FLOAT  Aux CE on single-state readout (default: 0.15; 0 = off)
   --lr, --lr-decay-every, --lr-gamma
   --epoch-copies INT         Repeat training lines per epoch
+  --max-epochs N, --epochs N Number of training epochs (default: 25)
   --seed INT
 
 Device & checkpointing:
@@ -416,7 +420,30 @@ When `--epoch-metrics-csv` is set, each row includes: `epoch`, `loss_mode`, `mea
 
 ### A/B example (GOAT on vs off)
 
-Use the same `--seed`, corpus, and hyperparameters; only add `--use-goat-memory` for the treatment run. Log with `--epoch-metrics-csv` and compare `val_ce` / `mean_loss` curves.
+Use the same `--seed`, corpus, and hyperparameters; only add `--use-goat-memory` for the treatment run. Log with `--epoch-metrics-csv` and compare `val_ce` / `mean_loss` curves (or `exp(val_ce)` for val perplexity).
+
+```bash
+mkdir -p experiments/goat_ab
+# Baseline
+python3 sandbox.py \
+  --corpus data/corpus.txt \
+  --val-fraction 0.15 \
+  --seed 42 \
+  --device cpu \
+  --tokenizer fallback \
+  --max-epochs 30 \
+  --epoch-metrics-csv experiments/goat_ab/baseline_42.csv
+# +GOAT
+python3 sandbox.py \
+  --corpus data/corpus.txt \
+  --val-fraction 0.15 \
+  --seed 42 \
+  --device cpu \
+  --tokenizer fallback \
+  --use-goat-memory \
+  --max-epochs 30 \
+  --epoch-metrics-csv experiments/goat_ab/goat_42.csv
+```
 
 ---
 

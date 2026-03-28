@@ -1257,6 +1257,7 @@ def _format_phase0_baseline_block(
     seed: int,
     val_fraction: float,
     epoch_copies: int,
+    num_epochs: int,
     window_size: int,
     num_dynamics_steps: int,
     loss_mode: str,
@@ -1292,8 +1293,8 @@ def _format_phase0_baseline_block(
         f"corpus: {corpus_path}\n"
         f"seed: {seed}  val_fraction: {val_fraction}  epoch_copies: {epoch_copies}\n"
         f"loss_mode: {loss_mode}  token_aux_ce: {token_aux_ce}\n"
-        f"window_size: {window_size}  num_dynamics_steps: {num_dynamics_steps}  num_epochs: {NUM_EPOCHS}\n"
-        f"last_epoch: {last_epoch}/{NUM_EPOCHS}  windows: {last_n_windows}  epoch_sec: {last_epoch_sec:.1f}\n"
+        f"window_size: {window_size}  num_dynamics_steps: {num_dynamics_steps}  num_epochs: {num_epochs}\n"
+        f"last_epoch: {last_epoch}/{num_epochs}  windows: {last_n_windows}  epoch_sec: {last_epoch_sec:.1f}\n"
         f"train_sec_total: {train_sec_total:.1f}\n"
         f"mean_loss (objective): {last_mean_loss:.4f}\n"
         f"train_CE: {last_train_ce:.4f}  val_CE: {val_s}\n"
@@ -1348,6 +1349,15 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--epoch-copies", type=int, default=CORPUS_EPOCH_COPIES,
         help="Repeat training sentence list N times per epoch.")
+    parser.add_argument(
+        "--max-epochs",
+        "--epochs",
+        type=int,
+        default=NUM_EPOCHS,
+        dest="max_epochs",
+        metavar="N",
+        help=f"Number of training epochs (default: {NUM_EPOCHS}).",
+    )
     parser.add_argument("--baseline-out", type=Path, default=None,
         help="Write Phase-0 baseline snapshot to this file.")
     parser.add_argument("--window-size", type=int, default=WINDOW_SIZE,
@@ -1414,6 +1424,9 @@ def main() -> None:
         raise SystemExit("window size must be >= 2")
     if args.loss_mode == "trajectory" and traj_batch_size < 2:
         raise SystemExit("trajectory batch size must be >= 2 for contrastive training")
+    num_epochs = args.max_epochs
+    if num_epochs < 1:
+        raise SystemExit("--max-epochs must be >= 1")
 
     random.seed(args.seed)
 
@@ -1562,7 +1575,7 @@ def main() -> None:
         )
 
     print(
-        f"Pre-training ({NUM_EPOCHS} epochs, window={window_size}, "
+        f"Pre-training ({num_epochs} epochs, window={window_size}, "
         f"dynamics_steps={args.num_dynamics_steps}, loss={args.loss_mode}, "
         f"aux_ce={args.token_aux_ce}, readout_aux_alpha={args.readout_aux_alpha}, "
         f"batch={traj_batch_size}, lr={args.lr}, device={device})...",
@@ -1585,7 +1598,7 @@ def main() -> None:
     last_epoch_sec = 0.0
     last_epoch_num = 0
 
-    for epoch in range(start_epoch, start_epoch + NUM_EPOCHS):
+    for epoch in range(start_epoch, start_epoch + num_epochs):
         t_ep0 = time.perf_counter()
         loss_sum = 0.0
         mean_final_step_tension = float("nan")
@@ -1623,7 +1636,7 @@ def main() -> None:
             n_est = max(1, (len(legacy_dataset) + _bs - 1) // _bs)
             report_every = max(1, n_est // 10)
 
-        print(f"  epoch {epoch + 1}/{start_epoch + NUM_EPOCHS}", flush=True)
+        print(f"  epoch {epoch + 1}/{start_epoch + num_epochs}", flush=True)
 
         # Bug 4: accumulate real train CE from batch readout logits.
         train_ce_sum = 0.0
@@ -1938,6 +1951,7 @@ def main() -> None:
         seed=args.seed,
         val_fraction=args.val_fraction,
         epoch_copies=args.epoch_copies,
+        num_epochs=num_epochs,
         window_size=window_size,
         num_dynamics_steps=args.num_dynamics_steps,
         loss_mode=args.loss_mode,
