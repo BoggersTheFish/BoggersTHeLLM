@@ -52,7 +52,42 @@ Default training text is **`data/corpus.txt`** (next to `sandbox.py`). Use your 
 python sandbox.py --corpus path/to/sentences.txt
 ```
 
-Useful flags: `--val-fraction 0.05` (validation cross-entropy after each epoch; `0` disables), `--seed 42`, `--epoch-copies 2` (repeat the sentence list per epoch before shuffling), `--baseline-out path` (Phase 0 snapshot; see `docs/BASELINE.md`). Run `python sandbox.py --help` for details.
+Useful flags: `--val-fraction 0.05` (validation cross-entropy after each epoch; `0` disables), `--seed 42`, `--epoch-copies 2` (repeat the sentence list per epoch before shuffling), `--baseline-out path` (Phase 0 snapshot; see `docs/BASELINE.md`). **Training objective:** `--loss-mode trajectory` (default) uses **contrastive** alignment between the **evolved** context-window state and the **evolved** shifted teacher window `[x₂…x_W, next_token]`, plus optional `--token-aux-ce` on the readout. Window evolution is **tension-adaptive** (early exit when stable, noise when unstable), not a fixed step count. Use `--trajectory-batch-size` (≥2) for in-batch negatives. Use `--loss-mode ce` for classic next-token CE only. Run `python sandbox.py --help` for details.
+
+**Data scale:** the default corpus is only **dozens of lines**—enough to smoke-test the code, not to train a useful model. For real runs, add **thousands to tens of thousands** of lines (one sentence per line; UTF-8) with words from the vocab. With a tiny hold-out, **val CE is noisy**; the script warns when the validation window count is very small—trust **train CE** and qualitative generations until you have enough lines and a larger val split.
+
+**Diagnostics:** `--epoch-metrics-csv run.csv` appends per-epoch columns (mean loss, CE, traj contrast, **mean final-step tension**, max batch loss, LR) for plotting. `--log-hard-batch-loss-above 0.2` prints the first context in a batch when loss spikes. `--lr-decay-every 10 --lr-gamma 0.5` applies `StepLR` after each epoch block.
+
+### Example run (trajectory mode, default corpus, Mar 2026)
+
+From the repo root with the venv active (CPU; ~12 min for 25 epochs on a typical laptop):
+
+```bash
+source .venv/bin/activate
+python sandbox.py \
+  --epoch-metrics-csv metrics.csv \
+  --log-hard-batch-loss-above 0.22 \
+  --lr 0.001 \
+  --lr-decay-every 15 \
+  --lr-gamma 0.7
+```
+
+Observed on one run (49 usable train lines after filtering; **val CE is not trustworthy** with only 2 held-out lines):
+
+| Quantity (last epoch) | Order of magnitude |
+|------------------------|--------------------|
+| `mean_loss` (trajectory objective: contrastive + weighted aux CE) | ~0.17 |
+| `train_CE` | ~0.64 |
+| `val_CE` | ~8 (noisy; tiny val split) |
+| `train_traj_contrast` / `val_traj_contrast` | ~0.05 / ~0.2 (val noisy) |
+| `mean_final_T` (mean tension at last adaptive step) | ~0.24 |
+| Wall time | ~720 s total pre-training |
+
+**Tension curves:** With geometry-only tension (`WINDOW_TENSION_USE_ENTROPY = False` in `sandbox.py`), final-step tension often stays **above** `WINDOW_TENSION_TOL_GEOMETRY`, so runs may show **`Steps: 16`** (full `MAX_WINDOW_STEPS`) every batch—decaying curves are still useful to see smooth relaxation vs oscillation. For early exit, raise tol slightly or enable entropy in tension (and use the entropy tol/high constants).
+
+**Qualitative checks:** `compare_prompts` on reordered text can show **large L2 / moderate cosine** (context sensitivity). Generation on ~50 lines remains template-like; scale the corpus for language quality.
+
+Full Phase 0 copy-paste block for `docs/BASELINE.md` is maintained in **`docs/BASELINE.md`** (recorded run).
 
 On startup the script prints **corpus coverage**: how many lines are long enough after dropping out-of-vocabulary words. The **512-token vocabulary** is built from (1) a few legacy seed sentences, (2) **all unique words in `data/corpus.txt`**, then (3) filling to 512 from a large word blob. Custom `--corpus` files are not added to the vocab at runtime—use words already in the vocab or edit the default corpus / vocab construction.
 
@@ -73,7 +108,9 @@ The script is tuned for **CPU** research runs, not large-batch GPU training.
 | Idea | Where |
 |------|--------|
 | Window length / epochs / entropy bonus | `WINDOW_SIZE`, `NUM_EPOCHS`, `ENTROPY_WEIGHT`, `ENTROPY_FLOOR`, `DRIFT_MIN` |
-| Data CLI | `--corpus`, `--val-fraction`, `--seed`, `--epoch-copies`, `--baseline-out` |
+| Window differentiation (anti-collapse) | `WINDOW_NONLINEAR_GAIN` (tanh strength in window path), `POSITION_ASYM_STRENGTH`, `WINDOW_INTERACTION_SCALE_INIT`, `WINDOW_POSITION_GAMMA_INIT` |
+| Tension-adaptive window | `MAX_WINDOW_STEPS`; `WINDOW_TENSION_USE_ENTROPY` (if False, tension is geometry-only: energy + λ·mismatch — no readout entropy); separate tol/high for geometry vs entropy (`WINDOW_TENSION_TOL_GEOMETRY`, `WINDOW_TENSION_TOL_ENTROPY`, …); coupling step `WINDOW_INTERACTION_DT_INIT`, `WINDOW_NONLINEAR_GAIN` |
+| Data CLI | `--corpus`, `--val-fraction`, `--seed`, `--epoch-copies`, `--baseline-out`, `--window-size`, `--num-dynamics-steps`, `--trajectory-batch-size`, `--quick-test`, `--loss-mode`, `--token-aux-ce`, `--lr`, `--lr-decay-every`, `--lr-gamma`, `--epoch-metrics-csv`, `--log-hard-batch-loss-above` |
 | Training regularization | `LABEL_SMOOTHING`, `BIGRAM_TRAIN_WEIGHT`, `TRAIN_LOGIT_NOISE` |
 | Generation sampling | `GEN_TOP_K`, `GEN_REPEAT_LOGIT_PENALTY`, `GEN_NO_REPEAT_LAST_EXTRA`, `GEN_TENSION_TEMP_SCALE`, `generation_temperature` (constructor arg) |
 | Slow memory | `slow_decay`; learnable `slow_lr` |
@@ -84,9 +121,11 @@ The script is tuned for **CPU** research runs, not large-batch GPU training.
 
 ## API sketch
 
-- `TorchAttractorLanguageModel` — `get_signal`, `evolve_token`, `next_token_logits`, `next_token_logits_distance`, `generate`, `encode_prompt`, `reset_readout_trajectory`, `compute_tension` (used inside `evolve_token`)
-- `compare_prompts(model, prompt_a, prompt_b)` — distance / cosine between final combined states
+- `TorchAttractorLanguageModel` — **training and generation** use the same path: `window_ids_from_sequence` → `embed_window` → `run_window_dynamics` → `readout_window` (`forward_training_window`). Legacy helpers (`get_signal`, `evolve_token`, `next_token_logits`, …) remain for experiments / tension tooling but are not used in the default `generate` loop.
+- `encode_prompt` — returns converged window state tensor `(W, D)` after dynamics (for analysis / `compare_prompts`).
+- `compare_prompts(model, prompt_a, prompt_b)` — L2 / cosine between flattened window states
 - `build_sequence_dataset(tokens, window_size)` — sliding (context, target) pairs
+- `generate(..., log_dynamics=True)` — prints per–outer-step metrics (norm change, token variance, cosine to previous step) while sampling
 
 ## License
 

@@ -7,14 +7,25 @@ Phase 0 locks a **reproducible reference** before scaling data, windows, or mode
 1. From the repo root, with your venv active:
 
    ```bash
+   source .venv/bin/activate
    python sandbox.py --baseline-out docs/BASELINE_LAST_RUN.txt
    ```
 
-   Use the same command later (same defaults, or document any flags you changed).
+   Add any flags you use in production (e.g. trajectory mode, LR schedule, CSV logging):
+
+   ```bash
+   python sandbox.py \
+     --epoch-metrics-csv metrics.csv \
+     --log-hard-batch-loss-above 0.22 \
+     --lr 0.001 \
+     --lr-decay-every 15 \
+     --lr-gamma 0.7 \
+     --baseline-out docs/BASELINE_LAST_RUN.txt
+   ```
 
 2. The script prints a **Phase 0 baseline** block at the end (metrics + three fixed generations). `--baseline-out` saves that block to a file for git or notes.
 
-3. Optionally copy the printed block (or `docs/BASELINE_LAST_RUN.txt`) into the **“Recorded baseline”** section below and commit.
+3. Copy the printed block into the **“Recorded baseline”** section below when you want a frozen snapshot in git.
 
 **Fixed generation prompts** (defined in `sandbox.py` as `BASELINE_PROMPT_1` … `BASELINE_PROMPT_3`) are always the same so outputs are comparable across runs.
 
@@ -22,18 +33,20 @@ Phase 0 locks a **reproducible reference** before scaling data, windows, or mode
 
 | Metric | Meaning |
 |--------|--------|
-| **train_CE** (last epoch) | Smoothed cross-entropy on training windows, eval-style (no train noise). Compare across runs. |
-| **val_CE** (last epoch) | Same, on held-out lines. Noisy if the val set is tiny; use **trend** after scale-up, not a single number. |
-| **mean_loss** (last epoch) | Training objective `CE − ENTROPY_WEIGHT × entropy`; good for optimization, not 1:1 with CE. |
+| **train_CE** (last epoch) | Cross-entropy from readout on training windows, eval-style. Compare across runs. |
+| **val_CE** (last epoch) | Held-out lines. **Ignore absolute value** when the validation split is tiny (e.g. 2 lines); use trend after scale-up. |
+| **mean_loss** (last epoch) | With `--loss-mode trajectory` (default): training step objective (trajectory contrastive + optional aux CE), **not** `CE − entropy`. |
+| **train_traj_contrast** / **val_traj_contrast** | Mean trajectory contrastive term; auxiliary signal for geometry. |
+| **mean_final_T** | Mean window tension at the **last** adaptive dynamics step each epoch—track drift vs epoch via `--epoch-metrics-csv`. |
 
-Architecture changes (tension-adaptive dynamics, symplectic readout) will change absolute CE values vs older commits—re-record baseline after major `sandbox.py` updates.
+Architecture changes will change absolute numbers—re-record baseline after major `sandbox.py` updates.
 
 ## v1 scale-up success check (agreed criteria)
 
 Treat a change as **successful for v1** when **both** hold:
 
-1. **Calibration:** **val_CE** is **lower than this baseline** (same seed/split settings), or at least not worse while **train_CE** improves — i.e. no clear collapse to memorized noise.
-2. **Subjective quality:** On the **three fixed prompts**, text shows **less pointless repetition** (fewer tight loops like the same function word or phrase) than the baseline generations, without becoming random gibberish.
+1. **Calibration:** **val_CE** is **lower than this baseline** (same seed/split settings), or at least not worse while **train_CE** improves — i.e. no clear collapse to memorized noise. Only meaningful once the val set has **enough windows**.
+2. **Subjective quality:** On the **three fixed prompts**, text shows **less pointless repetition** than the baseline generations, without becoming random gibberish.
 
 Optional: note wall time and epoch count if you change data size or model size.
 
@@ -41,30 +54,71 @@ Optional: note wall time and epoch count if you change data size or model size.
 
 ## Recorded baseline
 
-Fill this in after your official Phase 0 run (or paste from `docs/BASELINE_LAST_RUN.txt`).
+Official snapshot from a **trajectory-mode** run on the default corpus (CPU, seed 42). Command:
+
+```bash
+source .venv/bin/activate
+python sandbox.py \
+  --epoch-metrics-csv metrics.csv \
+  --log-hard-batch-loss-above 0.22 \
+  --lr 0.001 \
+  --lr-decay-every 15 \
+  --lr-gamma 0.7
+```
 
 | Field | Value |
 |-------|--------|
-| Date (UTC) | |
-| Git commit | |
-| Command | `python sandbox.py --baseline-out docs/BASELINE_LAST_RUN.txt` |
-| Last epoch train_CE | |
-| Last epoch val_CE | |
-| Last epoch mean_loss | |
-| Notes | |
+| Date (UTC) | 2026-03-28T15:49:20+00:00 |
+| Git commit | `6858eca` (parent of doc update; re-run `git rev-parse --short HEAD` after your commit) |
+| Corpus | `data/corpus.txt` — 51 lines loaded, 49 usable (≥7 in-vocab tokens), 2 train / val lines for val split |
+| Last epoch | 25/25 |
+| Windows per epoch | 180 |
+| `mean_loss` (objective) | 0.1737 |
+| `train_CE` | 0.6365 |
+| `val_CE` | 7.9570 (noisy) |
+| `train_traj_contrast` | 0.046814 |
+| `val_traj_contrast` | 0.200000 |
+| Train wall time (total pre-training) | 718.7 s |
+| Notes | LR stepped down with `StepLR` every 15 epochs (`lr-gamma` 0.7). Window dynamics often used all 16 steps (`MAX_WINDOW_STEPS`) because geometry tension stayed above early-exit tolerance. |
 
-**Generation snapshot:** attach `docs/BASELINE_LAST_RUN.txt` or paste the three **generation baseline** sections here.
+### Phase 0 block (copy-paste)
+
+```
+--- Phase 0 baseline (copy into docs/BASELINE.md) ---
+time_utc: 2026-03-28T15:49:20+00:00
+git: 6858eca
+corpus: data/corpus.txt
+seed: 42  val_fraction: 0.05  epoch_copies: 2
+loss_mode: trajectory  token_aux_ce: 0.2
+window_size: 6  num_dynamics_steps: 16  num_epochs: 25
+last_epoch: 25/25  windows: 180  epoch_sec: 16.0
+train_sec_total: 718.7
+mean_loss (objective): 0.1737
+train_CE: 0.6365  val_CE: 7.9570
+train_traj_contrast: 0.046814  val_traj_contrast: 0.200000
+
+--- generation baseline prompt 1 ---
+the quick brown fox jumps over the lazy dog and then what happens in the system of mind and reason system yak one dance clear cause we the system patterns effect reason move like tie the lazy in clear reason of effect system ink flow dead lives reason time care the lazy coin clear reason ready pattern come mind lazy
+
+--- generation baseline prompt 2 ---
+mind reason cause effect system the flow inside reason cause of the system demands pattern reason the strong of pure reason responds pattern flow the demands of clear reason lid pattern mind patterns flow effect clear reason one us the acts demands the effect system
+
+--- generation baseline prompt 3 ---
+effect cause reason mind system the lazy concept pay cost active and dog remains sea cell brown cause action eat mind effect chin reason flow cause into effect one the job of mind patterns share brown us was cause the effect hub action clear reason
+--- end baseline ---
+```
+
+### Debug attractor (representative)
+
+One prompt with `log_dynamics`-style metrics at end of training:
+
+- **Tension curve:** monotone decay over 16 steps (example final values ~0.24–0.29), not oscillatory.
+- **mean_var** (token variance across positions): ~0.00155 — still low; differentiation remains the main qualitative bottleneck at tiny data scale.
+- **mean_cos(step):** ~0.998 — smooth step-to-step updates.
+- **compare_prompts** (order sensitivity): e.g. L2(window) ~3.0–3.3, cosine ~0.12–0.25 between reordered same-word prompts.
 
 ---
 
-## Example (replace with your numbers)
+## Example row (illustrative only)
 
-This row is illustrative only; it does not replace running the script yourself.
-
-| Field | Example |
-|-------|---------|
-| Last epoch train_CE | ~8.x |
-| Last epoch val_CE | ~8.x |
-| Last epoch mean_loss | ~1.x |
-
-After scaling, you want **train_CE / val_CE** to move in a sensible direction together, and the three prompt outputs to read **less repetitively** than this example snapshot.
+Older CE-only runs might show different `mean_loss` semantics. After scaling data, you want **train_CE** and (with a real val split) **val_CE** to move together sensibly, and the three prompt outputs to read **less repetitively** than the snapshot above.

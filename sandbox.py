@@ -1,7 +1,9 @@
 import argparse
+import csv
 import datetime
 import math
 import random
+import statistics
 import subprocess
 import time
 from collections import Counter
@@ -168,6 +170,10 @@ GEN_NO_REPEAT_LAST_EXTRA = 5.0
 BIGRAM_TRAIN_WEIGHT = 0.025
 LABEL_SMOOTHING = 0.06
 
+# Trajectory training (default): match evolved state of context window to evolved state of shifted
+# teacher window [x2..xW, next_token]. Auxiliary CE on readout(pred_state) keeps decoding trainable.
+TOKEN_AUX_CE_WEIGHT_DEFAULT = 0.2
+
 # --- GOAT-TS-style tension (adaptive dynamics + symplectic readout) ---
 # T ≈ |ΔE_state| + λ(1 - cos(fast,slow)) + μ·H(logits); used to adapt inner steps and modulate noise.
 TENSION_LAMBDA = 0.35
@@ -177,6 +183,27 @@ MAX_CONVERGENCE_STEPS = 12
 TENSION_BREAK_THRESH = 2.5
 TENSION_NOISE_GAIN = 0.15
 GEN_TENSION_TEMP_SCALE = 0.035
+
+# Training: full-window state (W × D), tension-adaptive interaction + step_state (no attention).
+NUM_WINDOW_DYNAMICS_STEPS = 8  # legacy default for max_window_steps if not overridden
+MAX_WINDOW_STEPS = 16
+# Window tension: two regimes — with readout entropy (scale ~0.7–0.9) vs geometry-only (much smaller).
+WINDOW_TENSION_USE_ENTROPY = False
+WINDOW_TENSION_TOL_GEOMETRY = 0.05
+WINDOW_TENSION_HIGH_GEOMETRY = 0.22
+WINDOW_TENSION_TOL_ENTROPY = 0.75
+WINDOW_TENSION_HIGH_ENTROPY = 0.92
+TRAJECTORY_BATCH_SIZE_DEFAULT = 16
+# Larger outer step → more movement per iteration (target mean_cos(step) ~0.98–0.995 vs ~0.997+).
+WINDOW_INTERACTION_DT_INIT = 0.09
+# Sharper distance decay → less mixing of far positions (reduces over-smoothing vs nonlinearity).
+WINDOW_POSITION_GAMMA_INIT = 0.52
+# Lower than earlier defaults: coupling was washing token rows together (low mean_var in logs).
+WINDOW_INTERACTION_SCALE_INIT = 0.07
+# Extra gain on tanh(c) in step_state_batch for the window path only (differentiation vs collapse).
+WINDOW_NONLINEAR_GAIN = 4.0
+# Scales (1 + strength * tanh(asym) * sign(j−i)); was 0.5, too weak for left/right contrast.
+POSITION_ASYM_STRENGTH = 1.25
 
 
 def sample_next_token_id(
@@ -218,6 +245,8 @@ class TorchAttractorLanguageModel(nn.Module):
         gamma_init=0.2,
         generation_temperature=1.02,
         max_convergence_steps=MAX_CONVERGENCE_STEPS,
+        train_window_size: int = 6,
+        max_window_steps: int = MAX_WINDOW_STEPS,
     ):
         super().__init__()
         self.vocab = vocab
@@ -225,6 +254,20 @@ class TorchAttractorLanguageModel(nn.Module):
         # O(1) word → index (list.index is O(V) and dominated training/data prep).
         self._word_to_idx: dict[str, int] = {w: i for i, w in enumerate(vocab)}
         self.state_dim = state_dim
+        self.train_window_size = train_window_size
+        self.max_window_steps = max_window_steps
+        _wtol = (
+            WINDOW_TENSION_TOL_ENTROPY
+            if WINDOW_TENSION_USE_ENTROPY
+            else WINDOW_TENSION_TOL_GEOMETRY
+        )
+        _whigh = (
+            WINDOW_TENSION_HIGH_ENTROPY
+            if WINDOW_TENSION_USE_ENTROPY
+            else WINDOW_TENSION_HIGH_GEOMETRY
+        )
+        self.register_buffer("window_tension_tol", torch.tensor(float(_wtol)))
+        self.register_buffer("window_tension_high", torch.tensor(float(_whigh)))
         # Partial updates per token (path-dependent evolution; not full relaxation).
         self.convergence_steps = convergence_steps
         self.max_convergence_steps = max_convergence_steps
@@ -243,6 +286,22 @@ class TorchAttractorLanguageModel(nn.Module):
         self.embedder = nn.Embedding(self.vocab_size, state_dim)
         self.norm = nn.LayerNorm(state_dim, elementwise_affine=False)
         self.readout = nn.Linear(self.state_dim, self.vocab_size, bias=False)
+        # Training: readout from full converged window tensor flattened (context interaction path).
+        self.readout_window = nn.Linear(
+            train_window_size * state_dim, self.vocab_size, bias=False
+        )
+        # Positional interaction strength (softplus > 0); left/right differ via |i−j|.
+        self.position_gamma_raw = nn.Parameter(
+            torch.tensor(math.log(math.exp(WINDOW_POSITION_GAMMA_INIT) - 1.0))
+        )
+        self.interaction_scale_raw = nn.Parameter(
+            torch.tensor(math.log(math.exp(WINDOW_INTERACTION_SCALE_INIT) - 1.0))
+        )
+        self.interaction_dt_raw = nn.Parameter(
+            torch.tensor(math.log(math.exp(WINDOW_INTERACTION_DT_INIT) - 1.0))
+        )
+        # Left vs right neighbor strength (tanh-bounded inside coupling).
+        self.position_asym = nn.Parameter(torch.tensor(0.0))
         self.register_buffer("_vocab_ids", torch.arange(self.vocab_size, dtype=torch.long))
         # Unconstrained raw; effective temperature = softplus(raw) > 0 (learnable temp can hit 0 otherwise -> inf logits).
         t0 = 0.12
@@ -269,6 +328,12 @@ class TorchAttractorLanguageModel(nn.Module):
         self._last_slow_norm = 0.0
         # Trajectory drift pressure in readout (reset at each new sequence via reset_readout_trajectory).
         self._prev_combined = None
+        # Filled when collect_dynamics_metrics=True in forward_training_window / run_window_dynamics.
+        self._last_dynamics_logs: list[dict] | None = None
+        self._last_window_tension_mean: torch.Tensor | None = None
+        self._last_adaptive_window_steps: int = 0
+        # Mean tension after each outer step (last run_window_dynamics with record_tension_log=True).
+        self._last_window_tension_curve: list[float] = []
 
     def reset_readout_trajectory(self):
         """Clear stored combined state for drift pressure (call once per training window / at generate start)."""
@@ -464,17 +529,230 @@ class TorchAttractorLanguageModel(nn.Module):
         logits = torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=-1e4)
         return logits
 
-    def encode_prompt(self, prompt: str):
-        """Run dynamics on prompt tokens only; return (fast_state, slow_state)."""
+    def compute_window_tension(self, state: torch.Tensor) -> torch.Tensor:
+        """
+        state: (B, W, D) normalized states
+
+        Returns:
+            scalar tension per batch (B,)
+        """
+        assert state.dim() == 3 and state.size(1) >= 2
+        lam = self.tension_lambda.to(device=state.device, dtype=state.dtype)
+        delta = state[:, 1:] - state[:, :-1]
+        energy = delta.pow(2).mean(dim=(1, 2))
+        cos = F.cosine_similarity(state[:, 1:], state[:, :-1], dim=-1)
+        misalign = (1 - cos).mean(dim=1)
+        T = energy + lam * misalign
+        if WINDOW_TENSION_USE_ENTROPY:
+            mu = self.tension_mu.to(device=state.device, dtype=state.dtype)
+            flat = state.reshape(state.size(0), -1)
+            logits = self.readout_window(flat)
+            probs = F.softmax(logits, dim=-1)
+            entropy = -(probs * torch.log(probs + 1e-9)).sum(dim=-1)
+            T = T + mu * entropy
+        return T
+
+    def _single_window_step(self, S: torch.Tensor) -> torch.Tensor:
+        """One coupling + relaxation step; S is (B, W, D)."""
+        B, W, D = S.shape
+        assert W == self.train_window_size
+        dyn = self.dynamics
+        zero_sig = torch.zeros(B, W, D, device=S.device, dtype=S.dtype)
+        pos_g = F.softplus(self.position_gamma_raw) + 1e-6
+        isc = F.softplus(self.interaction_scale_raw)
+        idt = F.softplus(self.interaction_dt_raw)
+        ns = (
+            dyn.noise_scale.to(device=S.device, dtype=S.dtype)
+            if self.training
+            else torch.tensor(0.0, device=S.device, dtype=S.dtype)
+        )
+        delta = positional_coupling_delta(S, pos_g, self.position_asym)
+        S = S + idt * isc * delta
+        S = step_state_batch(
+            S,
+            dyn.diffusion,
+            zero_sig,
+            dyn.dt,
+            dyn.cubic_scale,
+            beta=dyn.beta,
+            noise_scale=ns,
+            lambda_decay=dyn.lambda_decay,
+            signal_scale=dyn.signal_scale,
+            state_norm_eps=dyn.state_norm_eps,
+            nonlinear_gain=WINDOW_NONLINEAR_GAIN,
+        )
+        return S
+
+    def run_window_dynamics(
+        self,
+        S: torch.Tensor,
+        collect_metrics: bool = False,
+        record_tension_log: bool = True,
+    ) -> tuple[torch.Tensor, list[dict] | None]:
+        """
+        Tension-adaptive evolution: (W, D) or (B, W, D). Gradients flow through all steps.
+        If record_tension_log, fills _last_window_tension_curve with mean(T) after each step
+        (use False on teacher-only passes so the student curve is preserved).
+        """
+        single = S.dim() == 2
+        if single:
+            S = S.unsqueeze(0)
+        B, W, D = S.shape
+        assert W == self.train_window_size
+        step_logs: list[dict] | None = [] if collect_metrics else None
+        tension_curve: list[float] = []
+        tol = self.window_tension_tol.to(device=S.device, dtype=S.dtype)
+        thigh = self.window_tension_high.to(device=S.device, dtype=S.dtype)
+        for step in range(self.max_window_steps):
+            S0 = S.detach().clone() if collect_metrics else None
+            S = self._single_window_step(S)
+            T = self.compute_window_tension(S)
+            self._last_window_tension_mean = T.mean().detach()
+            self._last_adaptive_window_steps = step + 1
+            if record_tension_log:
+                tension_curve.append(float(T.mean().detach()))
+            if collect_metrics and S0 is not None and step_logs is not None:
+                with torch.no_grad():
+                    diff = S - S0
+                    nd = float(torch.linalg.vector_norm(diff).item())
+                    tok_var = float(
+                        S.var(dim=(0, 1), unbiased=False).mean().item()
+                    )
+                    cos = float(
+                        F.cosine_similarity(S.flatten(), S0.flatten(), dim=0).item()
+                    )
+                    mn = float(torch.linalg.vector_norm(S, dim=-1).mean().item())
+                    step_logs.append(
+                        {
+                            "norm_delta": nd,
+                            "token_var_mean": tok_var,
+                            "cosine_to_prev": cos,
+                            "mean_row_norm": mn,
+                        }
+                    )
+            if (T < tol).all():
+                break
+            if (T > thigh).any():
+                noise = 0.01 * torch.randn_like(S)
+                S = S + noise
+                S = S / (torch.linalg.vector_norm(S, dim=-1, keepdim=True) + 1e-8)
+        if record_tension_log:
+            self._last_window_tension_curve = tension_curve
+        if single:
+            S = S.squeeze(0)
+        return S, step_logs
+
+    def trajectory_contrastive_loss(
+        self, state_a: torch.Tensor, state_b: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        state_a: evolved(context); state_b: evolved(shifted_context + target).
+        Same shape (B, W, D).
+        """
+        a = state_a.reshape(state_a.size(0), -1)
+        b = state_b.reshape(state_b.size(0), -1)
+        a = F.normalize(a, dim=-1)
+        b = F.normalize(b, dim=-1)
+        pos = (a * b).sum(dim=-1)
+        b_neg = b[torch.randperm(b.size(0), device=b.device)]
+        neg = (a * b_neg).sum(dim=-1)
+        return F.relu(0.2 - pos + neg).mean()
+
+    def window_ids_from_sequence(self, seq_ids: list[int]) -> list[int]:
+        """Last W token ids; left-pad with seq_ids[0] if shorter than window (full window for dynamics)."""
+        W = self.train_window_size
+        if not seq_ids:
+            seq_ids = [0]
+        if len(seq_ids) >= W:
+            return seq_ids[-W:]
+        pad = seq_ids[0]
+        return [pad] * (W - len(seq_ids)) + list(seq_ids)
+
+    def embed_window(self, context_ids: list[int]) -> torch.Tensor:
+        assert len(context_ids) == self.train_window_size
+        device = self.embedder.weight.device
+        dtype = self.embedder.weight.dtype
+        ids = torch.tensor(context_ids, device=device, dtype=torch.long)
+        emb = self.norm(self.embedder(ids))
+        n0 = torch.linalg.vector_norm(emb, dim=-1, keepdim=True).clamp(min=1e-12)
+        return emb / n0
+
+    def forward_training_window(
+        self, context_ids: list[int], collect_dynamics_metrics: bool = False
+    ) -> torch.Tensor:
+        """
+        Embed window tokens to (W, D), run multi-step interacting dynamics, read out vocab logits.
+        Training, validation, and generation all use this path.
+        """
+        assert len(context_ids) == self.train_window_size
+        S = self.embed_window(context_ids)
+        S, dyn_logs = self.run_window_dynamics(S, collect_metrics=collect_dynamics_metrics)
+        self._last_dynamics_logs = dyn_logs
+        logits = self.readout_window(S.reshape(-1))
+        logits = logits / self.effective_temperature()
+        return torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=-1e4)
+
+    def shifted_next_window(self, context_ids: list[int], target_id: int) -> list[int]:
+        """One-step shift: [x2, …, xW, next_token] — teacher window for trajectory consistency."""
+        assert len(context_ids) == self.train_window_size
+        return context_ids[1:] + [target_id]
+
+    def trajectory_contrastive_loss_and_logits(
+        self, contexts: list[list[int]], targets: list[int]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Batched trajectory contrastive loss + readout logits from pred state.
+        Teacher states are detached (no grad through shifted window).
+        """
+        B = len(contexts)
+        assert B == len(targets) and B >= 1
+        S_pred = torch.stack([self.embed_window(c) for c in contexts], dim=0)
+        S_pred, _ = self.run_window_dynamics(
+            S_pred, collect_metrics=False, record_tension_log=True
+        )
+        with torch.no_grad():
+            S_tgt = torch.stack(
+                [
+                    self.embed_window(self.shifted_next_window(c, t))
+                    for c, t in zip(contexts, targets, strict=True)
+                ],
+                dim=0,
+            )
+            S_tgt, _ = self.run_window_dynamics(
+                S_tgt, collect_metrics=False, record_tension_log=False
+            )
+        loss_traj = self.trajectory_contrastive_loss(S_pred, S_tgt)
+        logits = self.readout_window(S_pred.reshape(B, -1)) / self.effective_temperature()
+        logits = torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=-1e4)
+        return loss_traj, logits
+
+    @staticmethod
+    def summarize_dynamics_logs(logs: list[dict] | None) -> str:
+        if not logs:
+            return ""
+        nds = [x["norm_delta"] for x in logs]
+        tvs = [x["token_var_mean"] for x in logs]
+        coss = [x["cosine_to_prev"] for x in logs]
+        mns = [x["mean_row_norm"] for x in logs]
+        return (
+            f"steps={len(logs)}  "
+            f"mean|Δ|={statistics.mean(nds):.4f}  "
+            f"mean_var={statistics.mean(tvs):.6f}  "
+            f"mean_cos(step)={statistics.mean(coss):.4f}  "
+            f"mean||row||={statistics.mean(mns):.4f}"
+        )
+
+    def encode_prompt(self, prompt: str) -> torch.Tensor:
+        """Run window dynamics on the trailing context; return converged state (W, D)."""
         self.reset_readout_trajectory()
         w2i = self._word_to_idx
         tokens = [w for w in prompt.lower().split() if w in w2i] or ["the"]
         input_ids = [w2i[w] for w in tokens]
-        fast_state, slow_state = None, None
-        for tid in input_ids:
-            sig = self.get_signal(tid, fast_state, slow_state)
-            fast_state, slow_state = self.evolve_token(fast_state, slow_state, sig)
-        return fast_state, slow_state
+        wid = self.window_ids_from_sequence(input_ids)
+        with torch.inference_mode():
+            S = self.embed_window(wid)
+            S, _ = self.run_window_dynamics(S, collect_metrics=False)
+        return S
 
     def _print_attractor_diversity(self, top_k: int = 5):
         ctr = self._attractor_counts
@@ -493,38 +771,48 @@ class TorchAttractorLanguageModel(nn.Module):
         )
         print(f"[diversity] top-{top_k} raw counts: {[c for _, c in top]}")
 
-    def generate(self, prompt: str, max_tokens=40, debug_track=False):
+    def generate(
+        self,
+        prompt: str,
+        max_tokens=40,
+        debug_track=False,
+        log_dynamics: bool = False,
+    ):
+        """Autoregressive generation: each step uses last-W context → dynamics → readout (same as training)."""
         w2i = self._word_to_idx
         tokens = [w for w in prompt.lower().split() if w in w2i] or ["the"]
         input_ids = [w2i[w] for w in tokens]
 
-        self.track_attractors = debug_track
-        if debug_track:
-            self._attractor_counts = Counter()
-
         was_training = self.training
         self.eval()
         self.reset_readout_trajectory()
-        fast_state, slow_state = None, None
+        generated = tokens[:]
+        generated_ids = list(input_ids)
         with torch.inference_mode():
-            for tid in input_ids:
-                sig = self.get_signal(tid, fast_state, slow_state)
-                fast_state, slow_state = self.evolve_token(fast_state, slow_state, sig)
-
-            generated = tokens[:]
-            generated_ids = list(input_ids)
             base_gen_temp = self.generation_temperature
             if torch.is_tensor(base_gen_temp):
                 base_gen_temp = float(base_gen_temp.detach())
-            tol_f = float(self.tension_tol)
-            for _ in range(max_tokens):
-                logits = self.next_token_logits(fast_state, slow_state)
-                gen_temp = base_gen_temp * (
-                    1.0 + GEN_TENSION_TEMP_SCALE * max(0.0, self._last_tension_val - tol_f)
-                )
+            for ti in range(max_tokens):
+                wid = self.window_ids_from_sequence(generated_ids)
+                want_metrics = bool(log_dynamics or debug_track)
+                logits = self.forward_training_window(wid, collect_dynamics_metrics=want_metrics)
+                if want_metrics and self._last_dynamics_logs:
+                    show = log_dynamics or (debug_track and ti < 4)
+                    if show:
+                        summ = self.summarize_dynamics_logs(self._last_dynamics_logs)
+                        curve = self._last_window_tension_curve
+                        curve_s = (
+                            "[" + ", ".join(f"{x:.4f}" for x in curve) + "]"
+                            if curve
+                            else "[]"
+                        )
+                        print(
+                            f"  [dyn t={ti}] tension_curve={curve_s}  "
+                            f"steps={self._last_adaptive_window_steps}  {summ}"
+                        )
                 next_id = sample_next_token_id(
                     logits,
-                    gen_temp,
+                    base_gen_temp,
                     GEN_TOP_K,
                     generated_ids,
                     GEN_REPEAT_LOGIT_PENALTY,
@@ -533,16 +821,9 @@ class TorchAttractorLanguageModel(nn.Module):
                 next_word = self.vocab[next_id]
                 generated.append(next_word)
                 generated_ids.append(next_id)
-                sig = self.get_signal(next_id, fast_state, slow_state)
-                fast_state, slow_state = self.evolve_token(fast_state, slow_state, sig)
 
         if debug_track:
-            print(
-                f"[norms] last ||fast||={self._last_state_norm:.4f}  ||slow||={self._last_slow_norm:.4f}  "
-                f"||combined||={self._last_combined_norm:.4f}"
-            )
-            self._print_attractor_diversity(top_k=5)
-            self.track_attractors = False
+            print("[generate] window path: last step dynamics summary (if logged above).")
 
         if was_training:
             self.train()
@@ -597,19 +878,56 @@ def make_diffusion_matrix(dim):
 
 
 def compare_prompts(model: "TorchAttractorLanguageModel", prompt1: str, prompt2: str):
-    """Encode two prompts and report distance between final weighted combined states (path dependence)."""
+    """Encode two prompts via window dynamics and compare converged window states (flattened)."""
     model.eval()
     with torch.inference_mode():
-        f1, s1 = model.encode_prompt(prompt1)
-        f2, s2 = model.encode_prompt(prompt2)
-    c1 = model.combined_state(f1, s1)
-    c2 = model.combined_state(f2, s2)
-    dist = torch.linalg.vector_norm(c1 - c2).item()
-    cos = F.cosine_similarity(c1.unsqueeze(0), c2.unsqueeze(0), dim=1).item()
+        S1 = model.encode_prompt(prompt1)
+        S2 = model.encode_prompt(prompt2)
+    v1 = S1.reshape(-1)
+    v2 = S2.reshape(-1)
+    dist = torch.linalg.vector_norm(v1 - v2).item()
+    cos = F.cosine_similarity(v1.unsqueeze(0), v2.unsqueeze(0), dim=1).item()
     print(
-        f"[compare_prompts] L2(combined)={dist:.6f}  cosine={cos:.6f}  "
-        f"||c1||={torch.linalg.vector_norm(c1).item():.4f}  ||c2||={torch.linalg.vector_norm(c2).item():.4f}"
+        f"[compare_prompts] L2(window)={dist:.6f}  cosine={cos:.6f}  "
+        f"||S1||={torch.linalg.vector_norm(v1).item():.4f}  ||S2||={torch.linalg.vector_norm(v2).item():.4f}"
     )
+
+
+def run_quick_window_tests(model: TorchAttractorLanguageModel) -> None:
+    """Sanity checks: divergent states for different orderings; dynamics summary (no training)."""
+    print("--- quick window / context test ---", flush=True)
+    model.eval()
+    w2i = model._word_to_idx
+    W = model.train_window_size
+
+    def to_ids(text: str) -> list[int]:
+        return [w2i[w] for w in text.lower().split() if w in w2i]
+
+    long_a = to_ids("the cat sat on the mat and then there was a reason")
+    long_b = to_ids("there was a reason and then the cat sat on the mat")
+    if len(long_a) < W + 1 or len(long_b) < W + 1:
+        long_a = to_ids("the quick brown fox jumps over lazy dog and then".split())
+        long_b = to_ids("and then lazy dog jumps over the quick brown fox".split())
+    wid_a = model.window_ids_from_sequence(long_a)
+    wid_b = model.window_ids_from_sequence(long_b)
+    with torch.inference_mode():
+        Sa = model.embed_window(wid_a)
+        Sa, _ = model.run_window_dynamics(Sa)
+        Sb = model.embed_window(wid_b)
+        Sb, _ = model.run_window_dynamics(Sb)
+    va = Sa.reshape(-1)
+    vb = Sb.reshape(-1)
+    dist = torch.linalg.vector_norm(va - vb).item()
+    cos = F.cosine_similarity(va.unsqueeze(0), vb.unsqueeze(0), dim=1).item()
+    print(
+        f"  different order (trailing window): L2={dist:.6f}  cosine={cos:.6f}",
+        flush=True,
+    )
+    with torch.inference_mode():
+        _, logs = model.run_window_dynamics(model.embed_window(wid_a), collect_metrics=True)
+    if logs:
+        print(f"  single-window dynamics: {model.summarize_dynamics_logs(logs)}", flush=True)
+    print("--- end quick test ---", flush=True)
 
 
 def step_state(
@@ -639,6 +957,93 @@ def step_state(
         eps = eps.to(device=s.device, dtype=s.dtype)
     s = s / (nrm + eps)
     return torch.clamp(s, -10.0, 10.0)
+
+
+def step_state_batch(
+    state_batch: torch.Tensor,
+    diffusion: torch.Tensor,
+    applied_signal_batch: torch.Tensor,
+    dt: float,
+    cubic_scale: float,
+    beta: torch.Tensor | float = 1.0,
+    noise_scale: torch.Tensor | float = 0.0,
+    lambda_decay: torch.Tensor | float = 0.1,
+    signal_scale: torch.Tensor | float = 0.5,
+    state_norm_eps: torch.Tensor | float = 1e-8,
+    nonlinear_gain: float = 1.0,
+) -> torch.Tensor:
+    """
+    Same physics as step_state applied row-wise: each s_i is (D,) like a single state vector.
+    c = s_i - mean(s_i) over D (matches step_state on shape (D,)).
+    nonlinear_gain scales tanh(c) (window training uses >1 to resist row collapse).
+    """
+    if state_batch.dim() == 3:
+        B = state_batch.size(0)
+        outs = [
+            step_state_batch(
+                state_batch[b],
+                diffusion,
+                applied_signal_batch[b],
+                dt,
+                cubic_scale,
+                beta=beta,
+                noise_scale=noise_scale,
+                lambda_decay=lambda_decay,
+                signal_scale=signal_scale,
+                state_norm_eps=state_norm_eps,
+                nonlinear_gain=nonlinear_gain,
+            )
+            for b in range(B)
+        ]
+        return torch.stack(outs, dim=0)
+    c = state_batch - state_batch.mean(dim=-1, keepdim=True)
+    nonlinear = cubic_scale * float(nonlinear_gain) * torch.tanh(c)
+    scaled_signal = signal_scale * applied_signal_batch
+    drift = state_batch @ diffusion.T + nonlinear + beta * scaled_signal - lambda_decay * state_batch
+    s = state_batch + dt * drift
+    if noise_scale is not None and float(noise_scale) > 0:
+        s = s + noise_scale * torch.randn_like(s)
+    s = torch.nan_to_num(s, nan=0.0, posinf=0.0, neginf=0.0)
+    nrm = torch.linalg.vector_norm(s, dim=-1, keepdim=True)
+    eps = state_norm_eps
+    if torch.is_tensor(eps):
+        eps = eps.to(device=s.device, dtype=s.dtype)
+    s = s / (nrm + eps)
+    return torch.clamp(s, -10.0, 10.0)
+
+
+def positional_coupling_delta(
+    S: torch.Tensor,
+    position_gamma: torch.Tensor,
+    position_asym: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """
+    Sum_j w_ij (S_j - S_i), zero diagonal.
+    Base: exp(-gamma * |i-j|); optional asymmetry scales left vs right neighbors (sign j-i).
+    """
+    if S.dim() == 3:
+        return torch.stack(
+            [
+                positional_coupling_delta(S[b], position_gamma, position_asym)
+                for b in range(S.size(0))
+            ],
+            dim=0,
+        )
+    W, _D = S.shape
+    device = S.device
+    dtype = S.dtype
+    idx = torch.arange(W, device=device, dtype=dtype)
+    rel = (idx.unsqueeze(0) - idx.unsqueeze(1)).abs()
+    weights = torch.exp(-position_gamma * rel) * (1.0 - torch.eye(W, device=device, dtype=dtype))
+    if position_asym is not None:
+        ji = idx.unsqueeze(0) - idx.unsqueeze(1)
+        sign_ji = torch.sign(ji)
+        sign_ji = torch.where(ji == 0, torch.zeros_like(sign_ji), sign_ji)
+        asym_fac = 1.0 + POSITION_ASYM_STRENGTH * torch.tanh(position_asym) * sign_ji
+        # Keep strictly positive (avoid inverted coupling if asym + tanh are large).
+        weights = weights * asym_fac.clamp(min=0.2)
+    wsum = weights.sum(dim=1, keepdim=True)
+    return (weights @ S) - wsum * S
 
 
 def _sequence_is_weak_or_repetitive(token_ids):
@@ -777,12 +1182,7 @@ def mean_cross_entropy_eval(
     model.eval()
     total = 0.0
     for context, target_id in dataset:
-        model.reset_readout_trajectory()
-        fast_state, slow_state = None, None
-        for t_id in context:
-            sig = model.get_signal(t_id, fast_state, slow_state)
-            fast_state, slow_state = model.evolve_token(fast_state, slow_state, sig)
-        logits = model.next_token_logits(fast_state, slow_state)
+        logits = model.forward_training_window(context)
         prev_id = context[-1]
         logits = logits + BIGRAM_TRAIN_WEIGHT * torch.matmul(
             model.embedder.weight, model.embedder.weight[prev_id]
@@ -798,6 +1198,87 @@ def mean_cross_entropy_eval(
     if was_training:
         model.train()
     return total / len(dataset)
+
+
+@torch.no_grad()
+def mean_trajectory_contrastive_eval(
+    model: TorchAttractorLanguageModel,
+    dataset: list,
+    batch_size: int = TRAJECTORY_BATCH_SIZE_DEFAULT,
+) -> float:
+    """Mean trajectory contrastive loss over the dataset (batched)."""
+    if not dataset:
+        return float("nan")
+    was_training = model.training
+    model.eval()
+    total = 0.0
+    n_seen = 0
+    i = 0
+    while i < len(dataset):
+        chunk = dataset[i : i + batch_size]
+        if len(chunk) < 2:
+            chunk = chunk + chunk
+        contexts = [c for c, _t in chunk]
+        targets = [t for _c, t in chunk]
+        S_pred = torch.stack([model.embed_window(c) for c in contexts], dim=0)
+        S_pred, _ = model.run_window_dynamics(
+            S_pred, collect_metrics=False, record_tension_log=False
+        )
+        S_tgt = torch.stack(
+            [
+                model.embed_window(model.shifted_next_window(c, t))
+                for c, t in zip(contexts, targets, strict=True)
+            ],
+            dim=0,
+        )
+        S_tgt, _ = model.run_window_dynamics(
+            S_tgt, collect_metrics=False, record_tension_log=False
+        )
+        total += float(model.trajectory_contrastive_loss(S_pred, S_tgt).item()) * len(
+            contexts
+        )
+        n_seen += len(contexts)
+        i += batch_size
+    if was_training:
+        model.train()
+    return total / max(n_seen, 1)
+
+
+def _aux_ce_loss_batch(
+    model: TorchAttractorLanguageModel,
+    logits: torch.Tensor,
+    contexts: list[list[int]],
+    targets: list[int],
+) -> torch.Tensor:
+    """Mean per-example CE − entropy bonus (matches single-window training shaping)."""
+    device = logits.device
+    acc = torch.zeros((), device=device, dtype=logits.dtype)
+    B = logits.size(0)
+    for bi in range(B):
+        lo = logits[bi]
+        prev_id = contexts[bi][-1]
+        lo = lo + BIGRAM_TRAIN_WEIGHT * torch.matmul(
+            model.embedder.weight, model.embedder.weight[prev_id]
+        )
+        lo = lo.clone()
+        lo[prev_id] -= 2.0
+        for t in contexts[bi][-3:]:
+            lo[t] -= 1.0
+        lo = lo + TRAIN_LOGIT_NOISE * torch.randn_like(lo)
+        probs_floor = F.softmax(lo, dim=-1)
+        ent_s = -(probs_floor * torch.log(probs_floor + 1e-9)).sum()
+        if float(ent_s.detach()) < ENTROPY_FLOOR:
+            lo = lo + torch.randn_like(lo) * ENTROPY_FLOOR_NOISE
+            probs_for_entropy = F.softmax(lo, dim=-1)
+        else:
+            probs_for_entropy = probs_floor
+        tgt = torch.tensor([targets[bi]], device=device, dtype=torch.long)
+        loss_ce = F.cross_entropy(
+            lo.unsqueeze(0), tgt, label_smoothing=LABEL_SMOOTHING
+        )
+        entropy = -(probs_for_entropy * torch.log(probs_for_entropy + 1e-8)).sum()
+        acc = acc + (loss_ce - ENTROPY_WEIGHT * entropy)
+    return acc / B
 
 
 WINDOW_SIZE = 6
@@ -831,10 +1312,16 @@ def _format_phase0_baseline_block(
     seed: int,
     val_fraction: float,
     epoch_copies: int,
+    window_size: int,
+    num_dynamics_steps: int,
+    loss_mode: str,
+    token_aux_ce: float,
     last_epoch: int,
     last_mean_loss: float,
     last_train_ce: float,
     last_val_ce: float | None,
+    last_train_traj_contrast: float | None,
+    last_val_traj_contrast: float | None,
     last_n_windows: int,
     last_epoch_sec: float,
     train_sec_total: float,
@@ -843,17 +1330,29 @@ def _format_phase0_baseline_block(
     gen3: str,
 ) -> str:
     val_s = f"{last_val_ce:.4f}" if last_val_ce is not None else "n/a (no val)"
+    traj_train = (
+        f"{last_train_traj_contrast:.6f}"
+        if last_train_traj_contrast is not None
+        else "n/a"
+    )
+    traj_val = (
+        f"{last_val_traj_contrast:.6f}"
+        if last_val_traj_contrast is not None
+        else "n/a"
+    )
     return (
         f"--- Phase 0 baseline (copy into docs/BASELINE.md) ---\n"
         f"time_utc: {datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat()}\n"
         f"git: {_git_short_hash()}\n"
         f"corpus: {corpus_path}\n"
         f"seed: {seed}  val_fraction: {val_fraction}  epoch_copies: {epoch_copies}\n"
-        f"window_size: {WINDOW_SIZE}  num_epochs: {NUM_EPOCHS}\n"
+        f"loss_mode: {loss_mode}  token_aux_ce: {token_aux_ce}\n"
+        f"window_size: {window_size}  num_dynamics_steps: {num_dynamics_steps}  num_epochs: {NUM_EPOCHS}\n"
         f"last_epoch: {last_epoch}/{NUM_EPOCHS}  windows: {last_n_windows}  epoch_sec: {last_epoch_sec:.1f}\n"
         f"train_sec_total: {train_sec_total:.1f}\n"
         f"mean_loss (objective): {last_mean_loss:.4f}\n"
         f"train_CE: {last_train_ce:.4f}  val_CE: {val_s}\n"
+        f"train_traj_contrast: {traj_train}  val_traj_contrast: {traj_val}\n"
         f"\n--- generation baseline prompt 1 ---\n{gen1}\n"
         f"\n--- generation baseline prompt 2 ---\n{gen2}\n"
         f"\n--- generation baseline prompt 3 ---\n{gen3}\n"
@@ -896,29 +1395,116 @@ def main() -> None:
         default=None,
         help="Write Phase 0 baseline snapshot (metrics + fixed generations) to this file (UTF-8).",
     )
+    parser.add_argument(
+        "--window-size",
+        type=int,
+        default=WINDOW_SIZE,
+        help="Sliding context length W; dataset yields (W tokens, next token).",
+    )
+    parser.add_argument(
+        "--num-dynamics-steps",
+        type=int,
+        default=MAX_WINDOW_STEPS,
+        help="Max outer steps per window (tension-adaptive run_window_dynamics; may exit early).",
+    )
+    parser.add_argument(
+        "--trajectory-batch-size",
+        type=int,
+        default=TRAJECTORY_BATCH_SIZE_DEFAULT,
+        help="Batch size for trajectory contrastive training (need >=2 for negatives).",
+    )
+    parser.add_argument(
+        "--quick-test",
+        action="store_true",
+        help="Run window/context sanity checks and exit (no training).",
+    )
+    parser.add_argument(
+        "--loss-mode",
+        choices=("trajectory", "ce"),
+        default="trajectory",
+        help="trajectory: contrastive(evolved pred vs teacher state) + optional token CE aux; "
+        "ce: classic next-token cross-entropy only.",
+    )
+    parser.add_argument(
+        "--token-aux-ce",
+        type=float,
+        default=TOKEN_AUX_CE_WEIGHT_DEFAULT,
+        help="When loss-mode=trajectory, weight on auxiliary readout CE (0 disables).",
+    )
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=0.001,
+        help="Adam learning rate.",
+    )
+    parser.add_argument(
+        "--lr-decay-every",
+        type=int,
+        default=0,
+        help="Multiply LR by --lr-gamma every N epochs (0 = no decay).",
+    )
+    parser.add_argument(
+        "--lr-gamma",
+        type=float,
+        default=0.5,
+        help="LR multiplier when --lr-decay-every is set.",
+    )
+    parser.add_argument(
+        "--epoch-metrics-csv",
+        type=Path,
+        default=None,
+        help="Append one CSV row per epoch (loss, CE, traj contrast, mean final-step tension, lr, …) for plotting.",
+    )
+    parser.add_argument(
+        "--log-hard-batch-loss-above",
+        type=float,
+        default=0.0,
+        help="Trajectory mode: print a hint for batches with loss above this (0 = off).",
+    )
     args = parser.parse_args()
     corpus_path = args.corpus if args.corpus is not None else DEFAULT_CORPUS_PATH
     random.seed(args.seed)
+    window_size = args.window_size
+    if window_size < 2:
+        raise SystemExit("--window-size must be >= 2")
+    if args.loss_mode == "trajectory" and args.trajectory_batch_size < 2:
+        raise SystemExit("--trajectory-batch-size must be >= 2 for contrastive training")
 
     print(f"Vocab size: {len(FULL_VOCAB)}", flush=True)
-    model = TorchAttractorLanguageModel(FULL_VOCAB)
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
+    model = TorchAttractorLanguageModel(
+        FULL_VOCAB,
+        train_window_size=window_size,
+        max_window_steps=args.num_dynamics_steps,
+    )
+    if args.quick_test:
+        run_quick_window_tests(model)
+        return
+    optimizer = torch.optim.Adam(
+        model.parameters(), lr=args.lr, weight_decay=1e-5
+    )
+    lr_scheduler = None
+    if args.lr_decay_every > 0:
+        lr_scheduler = torch.optim.lr_scheduler.StepLR(
+            optimizer,
+            step_size=args.lr_decay_every,
+            gamma=args.lr_gamma,
+        )
     vocab_set = set(model.vocab)
 
     sentences = load_corpus(corpus_path)
     print(f"Loaded corpus: {corpus_path}  ({len(sentences)} lines)", flush=True)
-    corpus_coverage_report(sentences, vocab_set, WINDOW_SIZE)
+    corpus_coverage_report(sentences, vocab_set, window_size)
 
-    usable = sentences_with_training_windows(sentences, vocab_set, WINDOW_SIZE)
+    usable = sentences_with_training_windows(sentences, vocab_set, window_size)
     if not usable:
         raise RuntimeError(
             "No corpus lines have enough in-vocabulary tokens to form a training window. "
-            "Add text using words from the model vocab, or lower WINDOW_SIZE."
+            "Add text using words from the model vocab, or lower --window-size."
         )
     n_skip = len(sentences) - len(usable)
     if n_skip:
         print(
-            f"Training/validation use only lines with ≥{WINDOW_SIZE + 1} in-vocab tokens "
+            f"Training/validation use only lines with ≥{window_size + 1} in-vocab tokens "
             f"({len(usable)} lines; {n_skip} lines skipped).",
             flush=True,
         )
@@ -930,17 +1516,36 @@ def main() -> None:
             f"(fraction={args.val_fraction:g}, seed={args.seed})",
             flush=True,
         )
-    val_dataset = build_dataset_from_sentences(val_sents, model, WINDOW_SIZE)
+    val_dataset = build_dataset_from_sentences(val_sents, model, window_size)
+    if val_sents and len(val_dataset) < 32:
+        print(
+            f"Warning: validation set is tiny ({len(val_dataset)} windows from {len(val_sents)} lines); "
+            "val CE is mostly noise — use train CE and samples until you hold out more lines.",
+            flush=True,
+        )
 
     print(
-        f"Pre-training ({NUM_EPOCHS} epochs, sliding window size={WINDOW_SIZE}, "
-        f"epoch_copies={args.epoch_copies})...",
+        f"Pre-training ({NUM_EPOCHS} epochs, sliding window size={window_size}, "
+        f"num_dynamics_steps={args.num_dynamics_steps}, "
+        f"epoch_copies={args.epoch_copies}, "
+        f"loss_mode={args.loss_mode}, token_aux_ce={args.token_aux_ce}, "
+        f"trajectory_batch_size={args.trajectory_batch_size}, lr={args.lr}, "
+        f"lr_decay_every={args.lr_decay_every})...",
         flush=True,
     )
+    if args.loss_mode == "trajectory" and args.token_aux_ce <= 0:
+        print(
+            "Warning: trajectory contrastive loss does not depend on readout_window; with "
+            "token_aux_ce=0 the readout gets no gradients — generation quality may collapse. "
+            f"Use --token-aux-ce > 0 (default {TOKEN_AUX_CE_WEIGHT_DEFAULT}) unless you decode only by distance.",
+            flush=True,
+        )
     t_train0 = time.perf_counter()
     last_mean_loss = 0.0
     last_train_ce = 0.0
     last_val_ce: float | None = None
+    last_train_traj_contrast: float | None = None
+    last_val_traj_contrast: float | None = None
     last_n_windows = 0
     last_epoch_sec = 0.0
     last_epoch_num = 0
@@ -951,75 +1556,205 @@ def main() -> None:
         dataset = []
         for sentence in training_sentences:
             words = [w for w in sentence.split() if w in w2i]
-            if len(words) < WINDOW_SIZE + 1:
+            if len(words) < window_size + 1:
                 continue
             ids = [w2i[w] for w in words]
-            dataset.extend(build_sequence_dataset(ids, window_size=WINDOW_SIZE))
+            dataset.extend(build_sequence_dataset(ids, window_size=window_size))
         random.shuffle(dataset)
 
         n = len(dataset)
         t_ep0 = time.perf_counter()
         print(f"  epoch {epoch + 1}/{NUM_EPOCHS}  |  {n} windows", flush=True)
         loss_sum = 0.0
-        report_every = max(1, n // 10)
-
-        for step, (context, target_id) in enumerate(dataset):
-            # One reset per (context, target): evolve through full window without resetting mid-context.
-            model.reset_readout_trajectory()
-            fast_state, slow_state = None, None
-            for t_id in context:
-                sig = model.get_signal(t_id, fast_state, slow_state)
-                fast_state, slow_state = model.evolve_token(fast_state, slow_state, sig)
-            logits = model.next_token_logits(fast_state, slow_state)
-            prev_id = context[-1]
-            logits = logits + BIGRAM_TRAIN_WEIGHT * torch.matmul(
-                model.embedder.weight, model.embedder.weight[prev_id]
-            )
-            logits[prev_id] -= 2.0
-            for t in context[-3:]:
-                logits[t] -= 1.0
-            logits = logits + TRAIN_LOGIT_NOISE * torch.randn_like(logits)
-            probs_floor = F.softmax(logits, dim=-1)
-            ent_s = -(probs_floor * torch.log(probs_floor + 1e-9)).sum()
-            if float(ent_s.detach()) < ENTROPY_FLOOR:
-                logits = logits + torch.randn_like(logits) * ENTROPY_FLOOR_NOISE
-                probs_for_entropy = F.softmax(logits, dim=-1)
-            else:
-                probs_for_entropy = probs_floor
-            target = torch.tensor([target_id], device=logits.device, dtype=torch.long)
-            loss_ce = F.cross_entropy(
-                logits.unsqueeze(0), target, label_smoothing=LABEL_SMOOTHING
-            )
-            entropy = -(probs_for_entropy * torch.log(probs_for_entropy + 1e-8)).sum()
-            loss = loss_ce - ENTROPY_WEIGHT * entropy
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            optimizer.step()
-            loss_sum += float(loss.detach())
-            if step % report_every == 0 or step == n - 1:
-                pct = 100.0 * (step + 1) / max(n, 1)
-                print(
-                    f"    [{step + 1}/{n}] {pct:5.1f}%  loss={loss.item():.4f}",
-                    flush=True,
+        mean_final_step_tension = float("nan")
+        max_batch_loss_epoch = float("nan")
+        if args.loss_mode == "trajectory":
+            bs = max(2, args.trajectory_batch_size)
+            nb_total = (n + bs - 1) // bs
+            report_every = max(1, nb_total // 10)
+            final_tension_values: list[float] = []
+            max_batch_loss = -1.0
+            for bi, batch_start in enumerate(range(0, n, bs)):
+                chunk = dataset[batch_start : batch_start + bs]
+                if len(chunk) < 2:
+                    chunk = chunk + chunk
+                contexts = [c for c, t in chunk]
+                targets = [t for c, t in chunk]
+                loss_traj, logits = model.trajectory_contrastive_loss_and_logits(
+                    contexts, targets
                 )
+                loss = loss_traj
+                if args.token_aux_ce > 0.0:
+                    loss = loss + args.token_aux_ce * _aux_ce_loss_batch(
+                        model, logits, contexts, targets
+                    )
+                curve = model._last_window_tension_curve
+                if curve:
+                    final_tension_values.append(curve[-1])
+                li = float(loss.detach())
+                loss_sum += li
+                if li > max_batch_loss:
+                    max_batch_loss = li
+                if (
+                    args.log_hard_batch_loss_above > 0
+                    and li >= args.log_hard_batch_loss_above
+                ):
+                    words0 = " ".join(model.vocab[tid] for tid in contexts[0])
+                    print(
+                        f"    [hard batch] batch={bi + 1}/{nb_total} loss={li:.4f}  "
+                        f"first_ctx={words0!r}",
+                        flush=True,
+                    )
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                optimizer.step()
+                ts = model._last_adaptive_window_steps
+                if bi % report_every == 0 or batch_start + bs >= n:
+                    if curve:
+                        curve_s = "[" + ", ".join(f"{x:.4f}" for x in curve) + "]"
+                        print(
+                            f"    [batch {bi + 1}/{nb_total}] loss={loss.item():.4f}  "
+                            f"Tension curve: {curve_s}  |  Steps: {ts}",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            f"    [batch {bi + 1}/{nb_total}] loss={loss.item():.4f}",
+                            flush=True,
+                        )
+            mean_loss = loss_sum / max(nb_total, 1)
+            if final_tension_values:
+                mean_final_step_tension = float(statistics.mean(final_tension_values))
+            if nb_total > 0:
+                max_batch_loss_epoch = max_batch_loss
+        else:
+            report_every = max(1, n // 10)
+            for step, (context, target_id) in enumerate(dataset):
+                logits = model.forward_training_window(context)
+                prev_id = context[-1]
+                logits = logits + BIGRAM_TRAIN_WEIGHT * torch.matmul(
+                    model.embedder.weight, model.embedder.weight[prev_id]
+                )
+                logits[prev_id] -= 2.0
+                for t in context[-3:]:
+                    logits[t] -= 1.0
+                logits = logits + TRAIN_LOGIT_NOISE * torch.randn_like(logits)
+                probs_floor = F.softmax(logits, dim=-1)
+                ent_s = -(probs_floor * torch.log(probs_floor + 1e-9)).sum()
+                if float(ent_s.detach()) < ENTROPY_FLOOR:
+                    logits = logits + torch.randn_like(logits) * ENTROPY_FLOOR_NOISE
+                    probs_for_entropy = F.softmax(logits, dim=-1)
+                else:
+                    probs_for_entropy = probs_floor
+                target = torch.tensor([target_id], device=logits.device, dtype=torch.long)
+                loss_ce = F.cross_entropy(
+                    logits.unsqueeze(0), target, label_smoothing=LABEL_SMOOTHING
+                )
+                entropy = -(probs_for_entropy * torch.log(probs_for_entropy + 1e-8)).sum()
+                loss = loss_ce - ENTROPY_WEIGHT * entropy
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                optimizer.step()
+                loss_sum += float(loss.detach())
+                if step % report_every == 0 or step == n - 1:
+                    pct = 100.0 * (step + 1) / max(n, 1)
+                    print(
+                        f"    [{step + 1}/{n}] {pct:5.1f}%  loss={loss.item():.4f}",
+                        flush=True,
+                    )
+            mean_loss = loss_sum / max(n, 1)
 
         ep_sec = time.perf_counter() - t_ep0
-        mean_loss = loss_sum / max(n, 1)
-        # Same CE as val (no logit noise): comparable to val CE. mean_loss above is CE - ENTROPY_WEIGHT*H.
         train_ce = mean_cross_entropy_eval(model, dataset)
         val_msg = ""
         vce: float | None = None
         if val_dataset:
             vce = mean_cross_entropy_eval(model, val_dataset)
             val_msg = f"  |  val CE={vce:.4f}"
-        print(
-            f"  epoch {epoch + 1} done  |  {ep_sec:.1f}s  |  "
-            f"mean loss={mean_loss:.4f}  |  train CE={train_ce:.4f}{val_msg}",
-            flush=True,
-        )
+        train_traj_contrast: float | None = None
+        val_traj_contrast: float | None = None
+        lr_now = optimizer.param_groups[0]["lr"]
+        if args.loss_mode == "trajectory":
+            train_traj_contrast = mean_trajectory_contrastive_eval(
+                model, dataset, batch_size=args.trajectory_batch_size
+            )
+            if val_dataset:
+                val_traj_contrast = mean_trajectory_contrastive_eval(
+                    model, val_dataset, batch_size=args.trajectory_batch_size
+                )
+            tm_s = f"{train_traj_contrast:.6f}" if train_traj_contrast is not None else "n/a"
+            vm_s = f"{val_traj_contrast:.6f}" if val_traj_contrast is not None else "n/a"
+            mft_s = (
+                f"  mean_final_T={mean_final_step_tension:.4f}"
+                if math.isfinite(mean_final_step_tension)
+                else ""
+            )
+            mb_s = (
+                f"  max_batch_loss={max_batch_loss_epoch:.4f}"
+                if math.isfinite(max_batch_loss_epoch)
+                else ""
+            )
+            print(
+                f"  epoch {epoch + 1} done  |  {ep_sec:.1f}s  |  lr={lr_now:g}  |  "
+                f"mean loss={mean_loss:.4f}  |  train traj contrast={tm_s}  train CE={train_ce:.4f}  "
+                f"val traj contrast={vm_s}{mft_s}{mb_s}{val_msg}",
+                flush=True,
+            )
+        else:
+            print(
+                f"  epoch {epoch + 1} done  |  {ep_sec:.1f}s  |  lr={lr_now:g}  |  "
+                f"mean loss={mean_loss:.4f}  |  train CE={train_ce:.4f}{val_msg}",
+                flush=True,
+            )
+        if args.epoch_metrics_csv is not None:
+            mpath = Path(args.epoch_metrics_csv)
+            mpath.parent.mkdir(parents=True, exist_ok=True)
+            new_file = not mpath.exists() or mpath.stat().st_size == 0
+            row = [
+                epoch + 1,
+                args.loss_mode,
+                f"{mean_loss:.6f}",
+                f"{train_ce:.6f}",
+                f"{vce:.6f}" if vce is not None else "",
+                f"{train_traj_contrast:.6f}" if train_traj_contrast is not None else "",
+                f"{val_traj_contrast:.6f}" if val_traj_contrast is not None else "",
+                f"{mean_final_step_tension:.6f}"
+                if math.isfinite(mean_final_step_tension)
+                else "",
+                f"{max_batch_loss_epoch:.6f}"
+                if math.isfinite(max_batch_loss_epoch)
+                else "",
+                f"{lr_now:.8f}",
+            ]
+            with mpath.open("a", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                if new_file:
+                    w.writerow(
+                        [
+                            "epoch",
+                            "loss_mode",
+                            "mean_loss",
+                            "train_ce",
+                            "val_ce",
+                            "train_traj_contrast",
+                            "val_traj_contrast",
+                            "mean_final_step_tension",
+                            "max_batch_loss",
+                            "lr",
+                        ]
+                    )
+                w.writerow(row)
+        if lr_scheduler is not None:
+            lr_scheduler.step()
         last_mean_loss = mean_loss
         last_train_ce = train_ce
         last_val_ce = vce
+        last_train_traj_contrast = (
+            train_traj_contrast if args.loss_mode == "trajectory" else None
+        )
+        last_val_traj_contrast = (
+            val_traj_contrast if args.loss_mode == "trajectory" else None
+        )
         last_n_windows = n
         last_epoch_sec = ep_sec
         last_epoch_num = epoch + 1
@@ -1042,10 +1777,16 @@ def main() -> None:
         seed=args.seed,
         val_fraction=args.val_fraction,
         epoch_copies=args.epoch_copies,
+        window_size=window_size,
+        num_dynamics_steps=args.num_dynamics_steps,
+        loss_mode=args.loss_mode,
+        token_aux_ce=args.token_aux_ce,
         last_epoch=last_epoch_num,
         last_mean_loss=last_mean_loss,
         last_train_ce=last_train_ce,
         last_val_ce=last_val_ce,
+        last_train_traj_contrast=last_train_traj_contrast,
+        last_val_traj_contrast=last_val_traj_contrast,
         last_n_windows=last_n_windows,
         last_epoch_sec=last_epoch_sec,
         train_sec_total=train_sec_total,

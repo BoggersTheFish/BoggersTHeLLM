@@ -1,4 +1,7 @@
 .venv/
+# Local training / metric dumps (use --epoch-metrics-csv paths you choose)
+metrics.csv
+docs/BASELINE_LAST_RUN.txt
 __pycache__/
 *.py[cod]
 .Python
