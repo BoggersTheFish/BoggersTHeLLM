@@ -1,0 +1,55 @@
+# One sentence per line. Unique words here are included when building the 512-token vocab (then the
+# word list is padded from the built-in blob). OOV only affects lines you add that use rare words.
+# Lines starting with # are ignored. Empty lines are ignored.
+
+the quick brown fox jumps over the lazy dog
+mind reason cause effect system pattern flow
+a clear solution exists in the mind of reason
+the dog runs through the system of cause and effect
+reason creates a clear pattern in the mind
+effect flows into cause and the system responds
+the lazy dog understands the quick brown pattern
+mind and reason together build the future effect
+clear cause leads to strong system effect
+the pattern of mind flows into clear reason
+a system of reason creates powerful effect
+the quick fox sees the pattern in the effect
+lazy dog rests in the mind of the system
+cause and effect dance inside the reason
+clear mind produces strong pattern and flow
+the brown fox jumps into the system of reason
+effect creates new pattern in the lazy dog
+reason flows through the mind like quick effect
+the dog follows the clear path of cause
+system and pattern exist inside every mind
+quick brown thoughts jump over lazy doubt
+reason builds the bridge between cause and effect
+a clear solution appears in the system of mind
+the fox and dog represent cause and effect
+mind understands the pattern of every effect
+strong reason creates lasting system change
+the lazy pattern breaks when quick mind acts
+cause flows naturally into clear effect
+the system of reason holds every pattern
+dog and fox move through the mind of effect
+clear thinking produces strong cause and effect
+reason exists inside the pattern of the system
+the quick mind jumps over the lazy effect
+brown fox discovers the system of pure reason
+effect and cause create beautiful mind patterns
+lazy dog learns the flow of clear reason
+mind reason and system work as one pattern
+the future effect lives inside present cause
+clear solution emerges from deep system reason
+pattern recognition happens in the mind of effect
+the dog jumps when the system demands action
+reason turns cause into powerful lasting effect
+quick brown fox runs through fields of mind
+every effect has its root in clear cause
+the system reveals pattern to the ready mind
+lazy thoughts dissolve in strong active reason
+mind flows into reason and reason into effect
+the pattern remains stable through every cause
+clear effect shows the true nature of the system
+the quick brown fox and lazy dog share one mind
+cause meets effect inside the flow of reason
