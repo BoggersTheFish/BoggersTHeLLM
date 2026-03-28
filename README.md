@@ -58,6 +58,8 @@ The network contains only:
 | `dynamics_vectorized.py` | B | Vectorized `MultiHeadDynamics` window step; `torch.compile` wrapper |
 | `state_cache.py` | C | Rolling attractor state cache — O(1) per token at inference |
 | `data_pipeline.py` | D | Streaming sharded DataLoader (txt / JSONL, multi-worker) |
+| `data/generate_corpus.py` | — | Deterministic synthetic `.txt` corpus (tiktoken-sized); CLI + `sandbox` fallback |
+| `data/__init__.py` | — | Package marker for `data.generate_corpus` imports |
 | `llm_substrate_node.py` | E | Registers model as a native TSCore node; Evolve hook |
 | `goat_memory_transitions.py` | F | GOAT-TS ACTIVE → DORMANT → DEEP token state transitions |
 | `inference_server.py` | G | FastAPI inference server — OpenAI-compatible `/v1/completions` |
@@ -150,6 +152,73 @@ Endpoints:
 
 ---
 
+## Usage guide
+
+This section is the operational manual — what to run, how data and validation behave, and how to reproduce runs: how training consumes data, how validation stays honest, how to reproduce runs, and how the main scripts relate to each other. For a compact flag list, see [CLI reference](#cli-reference) below.
+
+### Training entry point (`sandbox.py`)
+
+`python3 sandbox.py` is the full training and baseline run: it builds the tokenizer and `TorchAttractorLanguageModel`, loads (or synthesizes) the corpus, constructs an `AttractorDataPipeline` when possible, runs `num_epochs` of optimization, prints sample generations, and optionally writes checkpoints and CSV metrics.
+
+**Default data mode is streaming (recommended).** The whole corpus file (or merged directory of `.txt` / `.jsonl`) is read as one string, encoded once into a single token sequence, and training uses all sliding windows `(context, target)` along that sequence. Legacy **line-based** mode (`--no-streaming-dataset`) tokenizes each non-empty line separately and skips lines shorter than `window_size + 1`; it also uses `--epoch-copies` to repeat the training line list each epoch. In **stream mode**, `--epoch-copies` is ignored on purpose: repetition is controlled only by `--max-epochs` and by shuffled window sampling, not by duplicating tokens in memory.
+
+**Device and checkpoints.** `--device auto` picks CUDA when available. `--resume-checkpoint` restores weights and optimizer state. `--checkpoint-dir` and `--save-every` control where and how often numbered checkpoints are written.
+
+**Integrations.** `--use-substrate` attaches `LLMSubstrateNode` so language tension can drive TSCore propagation and logging. `--use-goat-memory` enables `GoatMemoryManager` and injects a per-position signal into window dynamics. `--dynamics vectorized` swaps in `VectorizedWindowDynamics` from `dynamics_vectorized.py`.
+
+### Corpus, paths, and automatic synthetic text
+
+**Corpus path.** `--dataset-path` wins over `--corpus` if both are set; otherwise the default is `data/corpus.txt`. Paths may be a single file, a directory (all `.txt` / `.jsonl` / `.json` under it, merged), or `.jsonl` with `text` / `content` / `sentence` fields concatenated.
+
+**Automatic fallback.** If no text files resolve for the path, or if the tokenized sequence is shorter than `20 * window_size` tokens, training prints `Corpus too small — generating synthetic corpus...`, writes a **temporary** UTF-8 file using `data/generate_corpus.py`’s `generate_corpus()` (target length at least 20k tiktoken GPT-2 tokens, scaled up slightly with window size), trains from that file, and deletes the temp file after the run. This keeps local experiments runnable without hand-curating a large corpus.
+
+**Manual corpus generation.** To persist synthetic text instead of a temp file:
+
+```bash
+python3 data/generate_corpus.py --out data/generated.txt --tokens 20000 --seed 42
+python3 sandbox.py --corpus data/generated.txt
+```
+
+`generate_corpus` grows paragraphs until the **tiktoken** GPT-2 encoding length reaches `--tokens`. Counts may differ slightly from the sandbox tokenizer (`--tokenizer tiktoken` vs `fallback`), but the generated file is always large enough for the small-corpus threshold above.
+
+### Train/validation split (stream mode) and reliable metrics
+
+**Token-level split with a gap.** Validation is a suffix of the token stream. Between the last training token and the first validation token the code skips **`window_size` tokens** so no sliding window’s context crosses into the other split (no train/val leakage). Each side must still have at least `window_size + 1` tokens to form one window.
+
+**Minimum validation windows.** The code targets at least **50** validation windows (`MIN_VAL_WINDOWS`). After the first split, if there are fewer than 50 val windows, it **recomputes the split once** using an effective hold-out fraction of at least `(50 + window_size) / total_tokens`, then logs **`final val_fraction`** (actual `len(val_tokens) / total_tokens`). If 50 windows are still impossible (corpus too small), it prints `Validation set too small (X windows). Metrics will be noisy.` and, at startup, `WARNING: validation unreliable` when `val_windows < 50`. Treat `val_ce` / perplexity on tiny val sets as qualitative only.
+
+**What you see at startup (stream mode).** Lines such as `total_tokens=`, `train_tokens=`, `val_tokens=`, `train_windows=`, `val_windows=`, and `final val_fraction=…` summarize the run. For statistically stable validation on modest corpora, prefer **`--val-fraction 0.2`**–**`0.3`** or more tokens.
+
+### Reproducibility
+
+**Global seed.** `--seed` seeds Python’s `random` module at process start.
+
+**Per-epoch batch order (stream mode).** `AttractorDataPipeline.epoch_batches(epoch_index=epoch)` uses `random.Random(seed + epoch_index)` to shuffle window start indices. Fixing `--seed` fixes the entire sequence of batch orders across epochs; changing the epoch index changes the shuffle, so epochs are not identical copies of the same ordering.
+
+**No stream duplication.** Training does not multiply the train token list by `epoch_copies` in stream mode; multiple passes are real epochs over reshuffled windows.
+
+### Other scripts (when to use them)
+
+| Command | Purpose |
+|--------|---------|
+| `python3 smoke_test.py` | Fast integration check: model + one dynamics pass + training step + TSCore wave cycle. Run after install or refactors. |
+| `python3 eval_harness.py …` | Perplexity, mean tension, trajectory contrast, optional TSCore `WaveCycleRunner` metrics; writes JSON (e.g. `--output eval_results.json`). |
+| `python3 inference_server.py` | FastAPI server: OpenAI-style `/v1/completions`, cache-backed generation, optional TSCore hooks. Needs `pip install fastapi uvicorn`. |
+| `python3 data/generate_corpus.py --out PATH --tokens N` | Offline synthetic corpus for tests or a fixed `data/generated.txt`. |
+
+### Docker and deployment
+
+`docker compose up` builds and runs the inference image from `Dockerfile` / `docker-compose.yml`. Swap the PyTorch wheel in the Dockerfile for CUDA if you need GPU in the container. The compose service name is noted in `docker-compose.yml` (see Quick start).
+
+### How this maps to the rest of the README
+
+- **Architecture and tension:** [Architecture overview](#architecture-overview) and [Tension semantics](#tension-semantics).
+- **Loss function:** [Training objective](#training-objective).
+- **Per-flag list:** [CLI reference](#cli-reference) and [Epoch metrics CSV columns](#epoch-metrics-csv-columns).
+- **Module-by-module history:** [Wave-by-wave implementation log](#wave-by-wave-implementation-log).
+
+---
+
 ## Wave-by-wave implementation log
 
 ### Phase 0 — Substrate initialisation
@@ -215,6 +284,8 @@ text = generate_with_cache(model, cache, prompt="the cat sat", max_tokens=30)
 - **Legacy line mode:** `streaming_dataset=False` keeps per-line encoding (short lines dropped); `shuffle_buffer` refills between batch groups.
 - Multi-shard round-robin (`shard_id` / `num_shards`) for data-parallel workers
 - Too few tokens (`len < window_size + 1`) raises a clear **“Corpus too small after tokenization”** error.
+- **Synthetic fallback:** if the corpus path yields no files or fewer than `20 * window_size` tokens after encoding, `sandbox.py` generates a temporary corpus via **`data/generate_corpus.py`** (see [Usage guide](#usage-guide)).
+- **Startup logging:** stream mode prints `total_tokens`, `train_tokens`, `val_tokens`, `train_windows`, `val_windows`, and **`final val_fraction`** after any minimum-val-window adjustment.
 
 ```python
 from data_pipeline import AttractorDataPipeline

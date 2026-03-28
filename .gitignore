@@ -1,4 +1,7 @@
 .venv/
+# Local checkpoint weights (use --checkpoint-dir outside repo or upload artifacts separately)
+checkpoints/
+experiments/
 # Local TSCore data dir used by smoke / dev runs
 .tscore_smoke/
 # Local training / metric dumps (use --epoch-metrics-csv paths you choose)

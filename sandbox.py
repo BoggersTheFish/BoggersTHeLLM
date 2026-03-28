@@ -97,7 +97,8 @@ WINDOW_TENSION_TOL_ENTROPY = 0.75
 WINDOW_TENSION_HIGH_ENTROPY = 0.92
 TRAJECTORY_BATCH_SIZE_DEFAULT = 16
 # Below this many val windows, val CE / PPL are not statistically reliable.
-MIN_VAL_WINDOWS_RELIABLE = 50
+MIN_VAL_WINDOWS = 50
+MIN_VAL_WINDOWS_RELIABLE = MIN_VAL_WINDOWS  # legacy alias
 # Larger outer step → more movement per iteration (target mean_cos(step) ~0.98–0.995 vs ~0.997+).
 WINDOW_INTERACTION_DT_INIT = 0.09
 # Sharper distance decay → less mixing of far positions (reduces over-smoothing vs nonlinearity).
@@ -1071,7 +1072,8 @@ def split_tokens_train_val(
     tokens: list[int],
     val_fraction: float,
     window_size: int,
-) -> tuple[list[int], list[int]]:
+    min_val_windows: int = MIN_VAL_WINDOWS,
+) -> tuple[list[int], list[int], float]:
     """
     Split a token sequence into train / val at token boundaries.
 
@@ -1079,24 +1081,55 @@ def split_tokens_train_val(
     sliding window straddles the boundary (avoids train/val leakage).
 
     Each side must be able to form at least one window (len >= window_size + 1),
-    or val is empty.
+    or val is empty. Requires ``len(train_tokens) > window_size`` when val is on
+    (equivalently train has at least ``window_size + 1`` tokens).
+
+    If the hold-out has fewer than ``min_val_windows`` sliding windows after the
+    initial split, recomputes once using
+    ``max(val_fraction, (min_val_windows + window_size) / n)``.
+
+    Returns ``(train_tokens, val_tokens, effective_val_fraction)`` where
+    ``effective_val_fraction = len(val_tokens) / n`` (0 if no val).
     """
     n = len(tokens)
-    min_need = window_size + 1
-    gap = window_size
+    W = window_size
+    min_need = W + 1
+    gap = W
     if val_fraction <= 0:
-        return list(tokens), []
+        return list(tokens), [], 0.0
     # train segment, gap, val segment — each of train and val needs min_need tokens
     min_n = min_need + gap + min_need
     if n < min_n:
-        return list(tokens), []
-    split_idx = int(n * (1 - val_fraction))
-    split_idx = max(min_need + gap, split_idx)
-    split_idx = min(split_idx, n - min_need)
-    train_end = split_idx - gap
-    if train_end < min_need or (n - split_idx) < min_need:
-        return list(tokens), []
-    return tokens[:train_end], tokens[split_idx:]
+        return list(tokens), [], 0.0
+
+    def _split(vf: float) -> tuple[list[int], list[int]]:
+        split_idx = int(n * (1 - vf))
+        split_idx = max(min_need + gap, split_idx)
+        split_idx = min(split_idx, n - min_need)
+        train_end = split_idx - gap
+        if train_end < min_need or (n - split_idx) < min_need:
+            return [], []
+        return tokens[:train_end], tokens[split_idx:]
+
+    train_tok, val_tok = _split(val_fraction)
+    val_w = max(0, len(val_tok) - W) if val_tok else 0
+
+    if (not val_tok) or val_w < min_val_windows:
+        vf2 = max(val_fraction, (min_val_windows + W) / n)
+        train_tok, val_tok = _split(vf2)
+        val_w = max(0, len(val_tok) - W) if val_tok else 0
+
+    if val_tok and val_w < min_val_windows:
+        print(
+            f"Validation set too small ({val_w} windows). Metrics will be noisy.",
+            flush=True,
+        )
+
+    if not val_tok:
+        return list(tokens), [], 0.0
+
+    effective_vf = len(val_tok) / n
+    return train_tok, val_tok, effective_vf
 
 
 def corpus_coverage_report(
@@ -1316,6 +1349,7 @@ def _format_phase0_baseline_block(
     corpus_path: Path,
     seed: int,
     val_fraction: float,
+    effective_stream_val_fraction: float | None = None,
     epoch_copies: int,
     num_epochs: int,
     window_size: int,
@@ -1346,12 +1380,16 @@ def _format_phase0_baseline_block(
         if last_val_traj_contrast is not None
         else "n/a"
     )
+    _vf_line = f"seed: {seed}  val_fraction: {val_fraction}"
+    if effective_stream_val_fraction is not None:
+        _vf_line += f"  effective_stream_val_fraction: {effective_stream_val_fraction:g}"
+    _vf_line += f"  epoch_copies: {epoch_copies}"
     return (
         f"--- Phase 0 baseline (copy into docs/BASELINE.md) ---\n"
         f"time_utc: {datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat()}\n"
         f"git: {_git_short_hash()}\n"
         f"corpus: {corpus_path}\n"
-        f"seed: {seed}  val_fraction: {val_fraction}  epoch_copies: {epoch_copies}\n"
+        f"{_vf_line}\n"
         f"loss_mode: {loss_mode}  token_aux_ce: {token_aux_ce}\n"
         f"window_size: {window_size}  num_dynamics_steps: {num_dynamics_steps}  num_epochs: {num_epochs}\n"
         f"last_epoch: {last_epoch}/{num_epochs}  windows: {last_n_windows}  epoch_sec: {last_epoch_sec:.1f}\n"
@@ -1406,7 +1444,7 @@ def main() -> None:
         help=f"Training text (one sentence/line). Default: {DEFAULT_CORPUS_PATH}")
     parser.add_argument("--val-fraction", type=float, default=0.05,
         help="Hold-out fraction for validation (token-level in stream mode). "
-        f"Use ~0.3 if you need ≥{MIN_VAL_WINDOWS_RELIABLE} val windows; 0 = off.")
+        f"Use ~0.3 if you need ≥{MIN_VAL_WINDOWS} val windows; 0 = off.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--epoch-copies", type=int, default=CORPUS_EPOCH_COPIES,
         help="Repeat training sentence list N times per epoch.")
@@ -1583,18 +1621,48 @@ def main() -> None:
     stream_train_ids: list[int] | None = None
     train_sents: list[str] = []
     _tmp_train_path: Path | None = None
+    _synthetic_corpus_cleanup: Path | None = None
     val_metrics_unreliable = False
+    stream_source_path = corpus_path
+    stream_val_fraction_effective: float = 0.0
 
     if streaming_dataset:
-        full_text = load_corpus_text_stream(corpus_path)
-        tokens = tok.encode(full_text)
+        from data_pipeline import _collect_text_files  # type: ignore[import]
+
+        files = _collect_text_files(corpus_path)
+        need_syn = not files
+        if files:
+            full_text = load_corpus_text_stream(corpus_path)
+            tokens = tok.encode(full_text)
+            need_syn = len(tokens) < window_size * 20
+        if need_syn:
+            print("Corpus too small — generating synthetic corpus...", flush=True)
+            import tempfile as _tmpcorpus
+
+            _tf = _tmpcorpus.NamedTemporaryFile(
+                mode="w", delete=False, suffix=".txt", encoding="utf-8"
+            )
+            _tf.close()
+            _syn_p = Path(_tf.name)
+            from data.generate_corpus import generate_corpus  # type: ignore[import]
+
+            generate_corpus(
+                _syn_p,
+                target_tokens=max(20_000, window_size * 20 + 2_000),
+                seed=args.seed,
+            )
+            stream_source_path = _syn_p
+            _synthetic_corpus_cleanup = _syn_p
+            full_text = load_corpus_text_stream(stream_source_path)
+            tokens = tok.encode(full_text)
+
         need = window_size + 1
         if len(tokens) < need:
             raise RuntimeError(
                 "Corpus too small after tokenization: need at least "
                 f"{need} tokens for window_size={window_size}, got {len(tokens)}."
             )
-        train_tok, val_tok = split_tokens_train_val(
+        train_tok, val_tok, stream_val_fraction_effective = split_tokens_train_val(
             tokens, args.val_fraction, window_size
         )
         if args.val_fraction > 0 and not val_tok:
@@ -1607,32 +1675,41 @@ def main() -> None:
             )
         n_train_win = max(0, len(train_tok) - window_size)
         n_val_win = max(0, len(val_tok) - window_size)
-        print(
-            f"Loaded corpus (stream): {corpus_path}",
-            flush=True,
-        )
-        print(
-            f"  total_tokens={len(tokens)}  train_windows={n_train_win}  "
-            f"val_windows={n_val_win}  window_size={window_size}  "
-            f"(train/val gap={window_size} tokens, no window leakage)",
-            flush=True,
-        )
-        if val_tok:
+        print(f"total_tokens={len(tokens)}", flush=True)
+        print(f"train_tokens={len(train_tok)}", flush=True)
+        print(f"val_tokens={len(val_tok)}", flush=True)
+        print(f"train_windows={n_train_win}", flush=True)
+        print(f"val_windows={n_val_win}", flush=True)
+        if args.val_fraction > 0 and val_tok:
             print(
-                f"  train/val tokens: {len(train_tok)} / {len(val_tok)} "
-                f"(val_fraction={args.val_fraction:g})",
+                f"final val_fraction={stream_val_fraction_effective:.6g} "
+                f"(requested --val-fraction={args.val_fraction:g})",
                 flush=True,
             )
-        val_dataset = build_dataset_from_token_ids(val_tok, window_size)
-        if val_tok and n_val_win < MIN_VAL_WINDOWS_RELIABLE:
+        elif args.val_fraction > 0 and not val_tok:
+            print("final val_fraction=0 (hold-out could not be formed)", flush=True)
+        elif args.val_fraction <= 0:
+            print("final val_fraction=0 (validation off)", flush=True)
+        if val_tok and n_val_win < MIN_VAL_WINDOWS:
+            print("WARNING: validation unreliable", flush=True)
             val_metrics_unreliable = True
             print(
-                f"Warning: val_windows={n_val_win} < {MIN_VAL_WINDOWS_RELIABLE} — "
+                f"Warning: val_windows={n_val_win} < {MIN_VAL_WINDOWS} — "
                 "treat val CE / perplexity as unreliable. Prefer --val-fraction 0.3 or more text. "
                 "Tiny corpora: loss deltas (e.g. GOAT on/off) reflect integration noise, not real gains.",
                 flush=True,
             )
-        if len(tokens) < 5000:
+        print(
+            f"Loaded corpus (stream): {stream_source_path}",
+            flush=True,
+        )
+        print(
+            f"  window_size={window_size}  "
+            f"(train/val gap={window_size} tokens, no window leakage)",
+            flush=True,
+        )
+        val_dataset = build_dataset_from_token_ids(val_tok, window_size)
+        if len(tokens) < 5000 and _synthetic_corpus_cleanup is None:
             print(
                 "Note: very small corpus — use training for integration checks only; "
                 "do not interpret val metrics or A/B deltas as model quality.",
@@ -1673,10 +1750,10 @@ def main() -> None:
             )
         val_dataset = build_dataset_from_sentences(val_sents, model, window_size)
         n_val_win_line = len(val_dataset)
-        if val_sents and n_val_win_line < MIN_VAL_WINDOWS_RELIABLE:
+        if val_sents and n_val_win_line < MIN_VAL_WINDOWS:
             val_metrics_unreliable = True
             print(
-                f"Warning: val_windows={n_val_win_line} < {MIN_VAL_WINDOWS_RELIABLE} — "
+                f"Warning: val_windows={n_val_win_line} < {MIN_VAL_WINDOWS} — "
                 "treat val CE / perplexity as unreliable. Prefer --val-fraction 0.3 or more text.",
                 flush=True,
             )
@@ -1696,7 +1773,7 @@ def main() -> None:
         from data_pipeline import AttractorDataPipeline  # type: ignore[import]
         if streaming_dataset:
             pipeline = AttractorDataPipeline(
-                sources=[corpus_path],
+                sources=[stream_source_path],
                 model=model,
                 batch_size=traj_batch_size,
                 window_size=window_size,
@@ -2080,10 +2157,15 @@ def main() -> None:
         last_epoch_sec = ep_sec
         last_epoch_num = epoch + 1
 
-    # Clean up temp file (line-based mode only)
+    # Clean up temp files (line-based train list, synthetic corpus fallback)
     if _tmp_train_path is not None:
         try:
             os.unlink(_tmp_train_path)
+        except OSError:
+            pass
+    if _synthetic_corpus_cleanup is not None:
+        try:
+            os.unlink(_synthetic_corpus_cleanup)
         except OSError:
             pass
 
@@ -2108,6 +2190,9 @@ def main() -> None:
         corpus_path=corpus_path,
         seed=args.seed,
         val_fraction=args.val_fraction,
+        effective_stream_val_fraction=stream_val_fraction_effective
+        if streaming_dataset
+        else None,
         epoch_copies=args.epoch_copies,
         num_epochs=num_epochs,
         window_size=window_size,
