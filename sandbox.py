@@ -1,7 +1,11 @@
+import argparse
+import datetime
 import math
 import random
+import subprocess
 import time
 from collections import Counter
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -99,13 +103,40 @@ _CORPUS_LINES = [
     "the quick brown fox jumps over the lazy dog and then the pattern flows into the future",
 ]
 
-_corpus_words = set()
+_REPO_ROOT = Path(__file__).resolve().parent
+DEFAULT_CORPUS_PATH = _REPO_ROOT / "data" / "corpus.txt"
+
+
+def _unique_words_from_corpus_file(path: Path) -> set[str]:
+    """Words from a line-oriented corpus file (same rules as load_corpus). Missing file → empty."""
+    if not path.is_file():
+        return set()
+    words: set[str] = set()
+    with path.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            words.update(line.lower().split())
+    return words
+
+
+_corpus_words: set[str] = set()
 for line in _CORPUS_LINES:
     _corpus_words.update(line.lower().split())
+_corpus_words.update(_unique_words_from_corpus_file(DEFAULT_CORPUS_PATH))
 
 _seen: set[str] = set()
 BASE_VOCAB: list[str] = []
-for w in sorted(_corpus_words):
+sorted_corpus = sorted(_corpus_words)
+if len(sorted_corpus) > 512:
+    print(
+        f"Warning: {len(sorted_corpus)} unique words in legacy + default corpus files; "
+        "keeping the first 512 alphabetically (raise vocab cap or shrink corpus to include more).",
+        flush=True,
+    )
+    sorted_corpus = sorted_corpus[:512]
+for w in sorted_corpus:
     BASE_VOCAB.append(w)
     _seen.add(w)
 for w in _VOCAB_BLOB.split():
@@ -120,7 +151,6 @@ for w in _VOCAB_BLOB.split():
 assert len(BASE_VOCAB) == 512, len(BASE_VOCAB)
 
 FULL_VOCAB = sorted(set(BASE_VOCAB))
-print(f"Vocab size: {len(FULL_VOCAB)}")
 
 # Anti-collapse: trajectory drift in readout; entropy floor for sampling / training logits.
 DRIFT_MIN = 0.008
@@ -137,6 +167,16 @@ GEN_NO_REPEAT_LAST_EXTRA = 5.0
 # Training: bigram bias scale (too high pulls logits toward embedding self-similarity loops).
 BIGRAM_TRAIN_WEIGHT = 0.025
 LABEL_SMOOTHING = 0.06
+
+# --- GOAT-TS-style tension (adaptive dynamics + symplectic readout) ---
+# T ≈ |ΔE_state| + λ(1 - cos(fast,slow)) + μ·H(logits); used to adapt inner steps and modulate noise.
+TENSION_LAMBDA = 0.35
+TENSION_MU = 0.08
+TENSION_TOL = 0.85
+MAX_CONVERGENCE_STEPS = 12
+TENSION_BREAK_THRESH = 2.5
+TENSION_NOISE_GAIN = 0.15
+GEN_TENSION_TEMP_SCALE = 0.035
 
 
 def sample_next_token_id(
@@ -177,6 +217,7 @@ class TorchAttractorLanguageModel(nn.Module):
         w_slow=0.3,
         gamma_init=0.2,
         generation_temperature=1.02,
+        max_convergence_steps=MAX_CONVERGENCE_STEPS,
     ):
         super().__init__()
         self.vocab = vocab
@@ -184,16 +225,17 @@ class TorchAttractorLanguageModel(nn.Module):
         self.state_dim = state_dim
         # Partial updates per token (path-dependent evolution; not full relaxation).
         self.convergence_steps = convergence_steps
+        self.max_convergence_steps = max_convergence_steps
         # Slow memory: slow = (1 - slow_decay) * slow + slow_lr * fast (decay prevents unbounded growth).
         self.register_buffer("slow_decay", torch.tensor(float(slow_decay)))
-        self.register_buffer("slow_lr", torch.tensor(float(slow_lr)))
-        # Decode / context mix: avoid slow memory overpowering fast transients.
+        self.slow_lr = nn.Parameter(torch.tensor(float(slow_lr)))
+        self.gamma = nn.Parameter(torch.tensor(float(gamma_init)))
+        # Decode / context mix: symplectic half-step uses w_fast/w_slow on midpoint fast + slow.
         self.register_buffer("w_fast", torch.tensor(float(w_fast)))
         self.register_buffer("w_slow", torch.tensor(float(w_slow)))
         # Extra temperature at generation time (escapes shallow attractors in sampling).
         self.register_buffer("generation_temperature", torch.tensor(float(generation_temperature)))
         # Context-dependent signal injection strength (trajectory sensitivity).
-        self.gamma = nn.Parameter(torch.tensor(float(gamma_init)))
         self.register_buffer("signal_eps", torch.tensor(1e-6))
         self.dynamics = SimpleAttractorDynamics(state_dim)
         self.embedder = nn.Embedding(self.vocab_size, state_dim)
@@ -203,6 +245,19 @@ class TorchAttractorLanguageModel(nn.Module):
         # Unconstrained raw; effective temperature = softplus(raw) > 0 (learnable temp can hit 0 otherwise -> inf logits).
         t0 = 0.12
         self.temperature_raw = nn.Parameter(torch.tensor(math.log(math.exp(t0) - 1.0)))
+        # Tension coefficients (buffers; can tune without breaking checkpoints if names stable).
+        self.register_buffer("tension_lambda", torch.tensor(float(TENSION_LAMBDA)))
+        self.register_buffer("tension_mu", torch.tensor(float(TENSION_MU)))
+        self.register_buffer("tension_tol", torch.tensor(float(TENSION_TOL)))
+        self.register_buffer("tension_break_thresh", torch.tensor(float(TENSION_BREAK_THRESH)))
+        self.tension_noise_gain = nn.Parameter(torch.tensor(float(TENSION_NOISE_GAIN)))
+        self.agent_blend_weight = nn.Parameter(torch.tensor(-0.4))
+        # Last inner-step tension (float) for generation temperature adaptation.
+        self._last_tension_val = 0.0
+        # Symplectic readout: fast at start of token vs end (midpoint).
+        self._fast_start_snapshot: torch.Tensor | None = None
+        # Multi-agent light: recent token signals (normalized embedding directions).
+        self._context_ring: list[torch.Tensor] = []
         # Debug: attractor keys and last-step metrics (set by evolve_token when track_attractors=True).
         self.track_attractors = False
         self._attractor_counts: Counter = Counter()
@@ -216,13 +271,51 @@ class TorchAttractorLanguageModel(nn.Module):
     def reset_readout_trajectory(self):
         """Clear stored combined state for drift pressure (call once per training window / at generate start)."""
         self._prev_combined = None
+        self._context_ring = []
+        self._fast_start_snapshot = None
+        self._last_tension_val = 0.0
+
+    def _state_energy(self, fast: torch.Tensor) -> torch.Tensor:
+        return torch.sum(fast * fast)
+
+    def compute_tension(
+        self,
+        fast: torch.Tensor,
+        slow: torch.Tensor,
+        logits: torch.Tensor,
+        prev_energy: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Scalar tension T and components; logits are vocab logits for entropy term."""
+        e = self._state_energy(fast)
+        de = torch.abs(e - prev_energy)
+        cos_fs = F.cosine_similarity(fast.unsqueeze(0), slow.unsqueeze(0), dim=1).clamp(-1.0, 1.0)
+        div = 1.0 - cos_fs.squeeze(0)
+        probs = F.softmax(logits, dim=-1)
+        H = -(probs * (probs.clamp(min=1e-9)).log()).sum(dim=-1)
+        T = de + self.tension_lambda * div + self.tension_mu * H
+        return T, de, div, H
+
+    def _symplectic_combined(self, fast: torch.Tensor, slow: torch.Tensor) -> torch.Tensor:
+        """Half-step (Störmer-style) blend: midpoint in fast, static slow for this sub-step."""
+        fast, slow = self._init_dual_state(fast, slow)
+        fs = self._fast_start_snapshot
+        if fs is None:
+            fs = fast
+        fast_mid = 0.5 * (fast + fs)
+        return self.w_fast * fast_mid + self.w_slow * slow
+
+    def _logits_for_tension(self, fast: torch.Tensor, slow: torch.Tensor) -> torch.Tensor:
+        combined = self._symplectic_combined(fast, slow)
+        state = combined / (torch.linalg.vector_norm(combined) + 1e-8)
+        logits = self.readout(state) / self.effective_temperature()
+        return torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=-1e4)
 
     def effective_temperature(self) -> torch.Tensor:
         return F.softplus(self.temperature_raw).clamp(min=1e-6)
 
     def _context_vector(self, fast_state, slow_state):
         """Unit direction from fast (or weighted combined) for context injection; expects inited dual state."""
-        combined = self.w_fast * fast_state + self.w_slow * slow_state
+        combined = self._symplectic_combined(fast_state, slow_state)
         fast_norm = torch.linalg.vector_norm(fast_state)
         eps = self.signal_eps
         device = fast_state.device
@@ -237,12 +330,20 @@ class TorchAttractorLanguageModel(nn.Module):
     def get_signal(self, token_id: int, fast_state=None, slow_state=None) -> torch.Tensor:
         """Context-sensitive input: base embedding + gamma * normalized context; then unit-scale signal."""
         fast_state, slow_state = self._init_dual_state(fast_state, slow_state)
+        self._fast_start_snapshot = fast_state.detach().clone()
         device = fast_state.device
         dtype = fast_state.dtype
         emb = self.embedder(torch.tensor([token_id], device=device, dtype=torch.long))
         emb = self.norm(emb)
         n0 = torch.linalg.vector_norm(emb, dim=-1, keepdim=True).clamp(min=1e-12)
         base_signal = (emb / n0).squeeze(0)
+        if len(self._context_ring) >= 2:
+            w = torch.sigmoid(self.agent_blend_weight)
+            ring_mean = torch.stack(self._context_ring).mean(0)
+            base_signal = (1.0 - w) * base_signal + w * ring_mean
+        self._context_ring.append(base_signal.detach().clone())
+        if len(self._context_ring) > 4:
+            self._context_ring.pop(0)
         context_vector = self._context_vector(fast_state, slow_state)
         signal = base_signal + self.gamma * context_vector
         sn = torch.linalg.vector_norm(signal)
@@ -269,24 +370,47 @@ class TorchAttractorLanguageModel(nn.Module):
         return fast_state, slow_state
 
     def evolve_token(self, fast_state, slow_state, signal, num_steps=None):
-        """Apply a few dynamics steps on fast_state, then blend slow memory; decode uses fast + slow."""
+        """Tension-adaptive inner steps on fast_state, then slow memory; symplectic readout uses token start/end fast."""
         fast_state, slow_state = self._init_dual_state(fast_state, slow_state)
-        n = num_steps if num_steps is not None else self.convergence_steps
-        for _ in range(n):
+        if self._fast_start_snapshot is None:
+            self._fast_start_snapshot = fast_state.detach().clone()
+        base = int(num_steps) if num_steps is not None else self.convergence_steps
+        max_steps = self.max_convergence_steps
+        prev_energy = self._state_energy(fast_state)
+        prev_fast = fast_state.detach()
+        i = 0
+        while i < max_steps:
             prev_fast = fast_state.detach()
-            fast_state = self.dynamics(fast_state, signal)
+            t_prev = self._last_tension_val
+            noise_mul = (1.0 + F.softplus(self.tension_noise_gain) * min(t_prev, 3.0)).detach()
+            fast_state = self.dynamics(fast_state, signal, noise_scale_mul=noise_mul)
+            logits_t = self._logits_for_tension(fast_state, slow_state)
+            T, _de, _div, _H = self.compute_tension(
+                fast_state, slow_state, logits_t, prev_energy
+            )
+            prev_energy = self._state_energy(fast_state)
+            self._last_tension_val = float(T.detach())
+            if float(T.detach()) > float(self.tension_break_thresh):
+                fast_state = fast_state + 0.02 * torch.randn_like(fast_state)
+                nrm = torch.linalg.vector_norm(fast_state)
+                fast_state = fast_state / (nrm + 1e-8)
             self._last_state_norm = float(torch.linalg.vector_norm(fast_state.detach()))
-            self._last_state_delta = float(torch.linalg.vector_norm((fast_state - prev_fast).detach()))
+            self._last_state_delta = float(
+                torch.linalg.vector_norm((fast_state - prev_fast).detach())
+            )
             if self.track_attractors:
                 print(
                     f"  [dyn] ||fast||={self._last_state_norm:.4f}  "
-                    f"||Δfast||={self._last_state_delta:.4f}"
+                    f"||Δfast||={self._last_state_delta:.4f}  T={float(T.detach()):.4f}"
                 )
+            i += 1
+            if i >= base and float(T.detach()) < float(self.tension_tol):
+                break
         slow_state = (1.0 - self.slow_decay) * slow_state + self.slow_lr * fast_state
         sn_slow = torch.linalg.vector_norm(slow_state)
         if float(sn_slow.detach()) > 0.5:
             slow_state = slow_state * (0.5 / (sn_slow + 1e-12))
-        combined = self.w_fast * fast_state + self.w_slow * slow_state
+        combined = self._symplectic_combined(fast_state, slow_state)
         self._last_slow_norm = float(torch.linalg.vector_norm(slow_state.detach()))
         self._last_combined_norm = float(torch.linalg.vector_norm(combined.detach()))
         if self.track_attractors:
@@ -305,7 +429,7 @@ class TorchAttractorLanguageModel(nn.Module):
 
     def combined_state(self, fast_state, slow_state):
         fast_state, slow_state = self._init_dual_state(fast_state, slow_state)
-        return self.w_fast * fast_state + self.w_slow * slow_state
+        return self._symplectic_combined(fast_state, slow_state)
 
     def next_token_logits(self, fast_state, slow_state):
         combined = self.combined_state(fast_state, slow_state)
@@ -334,6 +458,7 @@ class TorchAttractorLanguageModel(nn.Module):
 
     def encode_prompt(self, prompt: str):
         """Run dynamics on prompt tokens only; return (fast_state, slow_state)."""
+        self.reset_readout_trajectory()
         tokens = [w for w in prompt.lower().split() if w in self.vocab] or ["the"]
         input_ids = [self.vocab.index(w) for w in tokens]
         fast_state, slow_state = None, None
@@ -378,11 +503,16 @@ class TorchAttractorLanguageModel(nn.Module):
 
             generated = tokens[:]
             generated_ids = list(input_ids)
-            gen_temp = self.generation_temperature
-            if torch.is_tensor(gen_temp):
-                gen_temp = float(gen_temp.detach())
+            base_gen_temp = self.generation_temperature
+            if torch.is_tensor(base_gen_temp):
+                base_gen_temp = float(base_gen_temp.detach())
             for _ in range(max_tokens):
                 logits = self.next_token_logits(fast_state, slow_state)
+                gen_temp = base_gen_temp * (
+                    1.0
+                    + GEN_TENSION_TEMP_SCALE
+                    * max(0.0, self._last_tension_val - float(self.tension_tol))
+                )
                 next_id = sample_next_token_id(
                     logits,
                     gen_temp,
@@ -433,7 +563,8 @@ class SimpleAttractorDynamics(nn.Module):
         self.register_buffer("signal_scale", torch.tensor(float(signal_scale)))
         self.register_buffer("state_norm_eps", torch.tensor(float(state_norm_eps)))
 
-    def forward(self, state, signal):
+    def forward(self, state, signal, noise_scale_mul=1.0):
+        ns = self.noise_scale * noise_scale_mul
         return step_state(
             state,
             self.diffusion,
@@ -441,7 +572,7 @@ class SimpleAttractorDynamics(nn.Module):
             self.dt,
             self.cubic_scale,
             beta=self.beta,
-            noise_scale=self.noise_scale,
+            noise_scale=ns,
             lambda_decay=self.lambda_decay,
             signal_scale=self.signal_scale,
             state_norm_eps=self.state_norm_eps,
@@ -490,7 +621,7 @@ def step_state(
     scaled_signal = signal_scale * applied_signal
     drift = state @ diffusion.T + nonlinear + beta * scaled_signal - lambda_decay * state
     s = state + dt * drift
-    if noise_scale and float(noise_scale) > 0:
+    if noise_scale is not None and float(noise_scale) > 0:
         s = s + noise_scale * torch.randn_like(s)
     s = torch.nan_to_num(s, nan=0.0, posinf=0.0, neginf=0.0)
     nrm = torch.linalg.vector_norm(s)
@@ -532,90 +663,110 @@ def build_sequence_dataset(tokens, window_size=6):
     return data
 
 
-# ==================== RUN (pre-training + generation) ====================
-model = TorchAttractorLanguageModel(FULL_VOCAB)
-optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
+def load_corpus(path: Path) -> list[str]:
+    """Load non-empty lines from a UTF-8 text file; skip blank lines and #-comments."""
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"Corpus file not found: {path}\n"
+            "Create it or pass --corpus /path/to/file.txt (one sentence per line)."
+        )
+    out: list[str] = []
+    with path.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            out.append(line)
+    return out
 
-corpus = [
-    "the quick brown fox jumps over the lazy dog",
-    "mind reason cause effect system pattern flow",
-    "a clear solution exists in the mind of reason",
-    "the dog runs through the system of cause and effect",
-    "reason creates a clear pattern in the mind",
-    "effect flows into cause and the system responds",
-    "the lazy dog understands the quick brown pattern",
-    "mind and reason together build the future effect",
-    "clear cause leads to strong system effect",
-    "the pattern of mind flows into clear reason",
-    "a system of reason creates powerful effect",
-    "the quick fox sees the pattern in the effect",
-    "lazy dog rests in the mind of the system",
-    "cause and effect dance inside the reason",
-    "clear mind produces strong pattern and flow",
-    "the brown fox jumps into the system of reason",
-    "effect creates new pattern in the lazy dog",
-    "reason flows through the mind like quick effect",
-    "the dog follows the clear path of cause",
-    "system and pattern exist inside every mind",
-    "quick brown thoughts jump over lazy doubt",
-    "reason builds the bridge between cause and effect",
-    "a clear solution appears in the system of mind",
-    "the fox and dog represent cause and effect",
-    "mind understands the pattern of every effect",
-    "strong reason creates lasting system change",
-    "the lazy pattern breaks when quick mind acts",
-    "cause flows naturally into clear effect",
-    "the system of reason holds every pattern",
-    "dog and fox move through the mind of effect",
-    "clear thinking produces strong cause and effect",
-    "reason exists inside the pattern of the system",
-    "the quick mind jumps over the lazy effect",
-    "brown fox discovers the system of pure reason",
-    "effect and cause create beautiful mind patterns",
-    "lazy dog learns the flow of clear reason",
-    "mind reason and system work as one pattern",
-    "the future effect lives inside present cause",
-    "clear solution emerges from deep system reason",
-    "pattern recognition happens in the mind of effect",
-    "the dog jumps when the system demands action",
-    "reason turns cause into powerful lasting effect",
-    "quick brown fox runs through fields of mind",
-    "every effect has its root in clear cause",
-    "the system reveals pattern to the ready mind",
-    "lazy thoughts dissolve in strong active reason",
-    "mind flows into reason and reason into effect",
-    "the pattern remains stable through every cause",
-    "clear effect shows the true nature of the system",
-    "the quick brown fox and lazy dog share one mind",
-    "cause meets effect inside the flow of reason",
-]
 
-WINDOW_SIZE = 6
-NUM_EPOCHS = 25
-ENTROPY_WEIGHT = 0.03  # subtracted from CE; keep small vs CE scale or the objective chases flat distributions
-print(f"Pre-training ({NUM_EPOCHS} epochs, sliding window size={WINDOW_SIZE})...")
-t_train0 = time.perf_counter()
-for epoch in range(NUM_EPOCHS):
-    # Shuffle at sentence level only; duplicate corpus for more windows per epoch without new text.
-    training_sentences = list(corpus * 2)
-    random.shuffle(training_sentences)
+def corpus_coverage_report(
+    sentences: list[str],
+    vocab: set[str],
+    window_size: int,
+) -> None:
+    """Print token OOV rate and how many lines yield at least one training window."""
+    n_lines = len(sentences)
+    raw_tokens = 0
+    kept_tokens = 0
+    oov_tokens = 0
+    n_too_short = 0
+    n_usable = 0
+    for s in sentences:
+        words_raw = s.lower().split()
+        raw_tokens += len(words_raw)
+        words_in = [w for w in words_raw if w in vocab]
+        oov_tokens += len(words_raw) - len(words_in)
+        kept_tokens += len(words_in)
+        if len(words_in) < window_size + 1:
+            n_too_short += 1
+        else:
+            n_usable += 1
+    oov_rate = oov_tokens / raw_tokens if raw_tokens else 0.0
+    print(
+        f"Corpus coverage: {n_lines} lines  |  {n_usable} usable (≥{window_size + 1} in-vocab tokens)  "
+        f"|  {n_too_short} too short after OOV drop  |  OOV tokens={oov_tokens}/{raw_tokens} "
+        f"({100.0 * oov_rate:.1f}%)",
+        flush=True,
+    )
+
+
+def train_val_split(
+    sentences: list[str],
+    val_fraction: float,
+    seed: int,
+) -> tuple[list[str], list[str]]:
+    if val_fraction <= 0 or len(sentences) < 2:
+        return list(sentences), []
+    rng = random.Random(seed)
+    s = list(sentences)
+    rng.shuffle(s)
+    n_val = max(1, int(len(s) * val_fraction))
+    n_val = min(n_val, len(s) - 1)
+    return s[:-n_val], s[-n_val:]
+
+
+def sentences_with_training_windows(
+    sentences: list[str],
+    vocab: set[str],
+    window_size: int,
+) -> list[str]:
+    """Lines that yield at least one (context, target) pair after OOV removal."""
+    out: list[str] = []
+    for s in sentences:
+        words = [w for w in s.lower().split() if w in vocab]
+        if len(words) >= window_size + 1:
+            out.append(s)
+    return out
+
+
+def build_dataset_from_sentences(
+    sentences: list[str],
+    model: TorchAttractorLanguageModel,
+    window_size: int,
+) -> list:
     dataset = []
-    for sentence in training_sentences:
+    for sentence in sentences:
         words = [w for w in sentence.split() if w in model.vocab]
-        if len(words) < WINDOW_SIZE + 1:
+        if len(words) < window_size + 1:
             continue
         ids = [model.vocab.index(w) for w in words]
-        dataset.extend(build_sequence_dataset(ids, window_size=WINDOW_SIZE))
-    random.shuffle(dataset)
+        dataset.extend(build_sequence_dataset(ids, window_size=window_size))
+    return dataset
 
-    n = len(dataset)
-    t_ep0 = time.perf_counter()
-    print(f"  epoch {epoch + 1}/{NUM_EPOCHS}  |  {n} windows", flush=True)
-    loss_sum = 0.0
-    report_every = max(1, n // 10)
 
-    for step, (context, target_id) in enumerate(dataset):
-        # One reset per (context, target): evolve through full window without resetting mid-context.
+@torch.no_grad()
+def mean_cross_entropy_eval(
+    model: TorchAttractorLanguageModel,
+    dataset: list,
+) -> float:
+    """Validation CE: same logit shaping as training, without noise or entropy-floor branch."""
+    if not dataset:
+        return float("nan")
+    was_training = model.training
+    model.eval()
+    total = 0.0
+    for context, target_id in dataset:
         model.reset_readout_trajectory()
         fast_state, slow_state = None, None
         for t_id in context:
@@ -629,56 +780,290 @@ for epoch in range(NUM_EPOCHS):
         logits[prev_id] -= 2.0
         for t in context[-3:]:
             logits[t] -= 1.0
-        logits = logits + TRAIN_LOGIT_NOISE * torch.randn_like(logits)
-        probs_floor = F.softmax(logits, dim=-1)
-        ent_s = -(probs_floor * torch.log(probs_floor + 1e-9)).sum()
-        if float(ent_s.detach()) < ENTROPY_FLOOR:
-            logits = logits + torch.randn_like(logits) * ENTROPY_FLOOR_NOISE
-            probs_for_entropy = F.softmax(logits, dim=-1)
-        else:
-            probs_for_entropy = probs_floor
         target = torch.tensor([target_id], device=logits.device, dtype=torch.long)
         loss_ce = F.cross_entropy(
             logits.unsqueeze(0), target, label_smoothing=LABEL_SMOOTHING
         )
-        entropy = -(probs_for_entropy * torch.log(probs_for_entropy + 1e-8)).sum()
-        loss = loss_ce - ENTROPY_WEIGHT * entropy
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        loss_sum += float(loss.detach())
-        if step % report_every == 0 or step == n - 1:
-            pct = 100.0 * (step + 1) / max(n, 1)
-            print(
-                f"    [{step + 1}/{n}] {pct:5.1f}%  loss={loss.item():.4f}",
-                flush=True,
-            )
+        total += float(loss_ce)
+    if was_training:
+        model.train()
+    return total / len(dataset)
 
-    ep_sec = time.perf_counter() - t_ep0
-    mean_loss = loss_sum / max(n, 1)
-    print(
-        f"  epoch {epoch + 1} done  |  {ep_sec:.1f}s  |  mean loss={mean_loss:.4f}",
-        flush=True,
+
+WINDOW_SIZE = 6
+NUM_EPOCHS = 25
+ENTROPY_WEIGHT = 0.03  # subtracted from CE; keep small vs CE scale or the objective chases flat distributions
+CORPUS_EPOCH_COPIES = 2  # duplicate sentence list per epoch for more windows
+
+# Phase 0: fixed prompts for comparable generations across runs (see docs/BASELINE.md).
+BASELINE_PROMPT_1 = (
+    "the quick brown fox jumps over the lazy dog and then what happens in the system of mind and reason"
+)
+BASELINE_PROMPT_2 = "mind reason cause effect system"
+BASELINE_PROMPT_3 = "effect cause reason mind system"
+
+
+def _git_short_hash() -> str:
+    try:
+        out = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=Path(__file__).resolve().parent,
+            stderr=subprocess.DEVNULL,
+        )
+        return out.decode().strip()
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
+
+
+def _format_phase0_baseline_block(
+    *,
+    corpus_path: Path,
+    seed: int,
+    val_fraction: float,
+    epoch_copies: int,
+    last_epoch: int,
+    last_mean_loss: float,
+    last_train_ce: float,
+    last_val_ce: float | None,
+    last_n_windows: int,
+    last_epoch_sec: float,
+    train_sec_total: float,
+    gen1: str,
+    gen2: str,
+    gen3: str,
+) -> str:
+    val_s = f"{last_val_ce:.4f}" if last_val_ce is not None else "n/a (no val)"
+    return (
+        f"--- Phase 0 baseline (copy into docs/BASELINE.md) ---\n"
+        f"time_utc: {datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat()}\n"
+        f"git: {_git_short_hash()}\n"
+        f"corpus: {corpus_path}\n"
+        f"seed: {seed}  val_fraction: {val_fraction}  epoch_copies: {epoch_copies}\n"
+        f"window_size: {WINDOW_SIZE}  num_epochs: {NUM_EPOCHS}\n"
+        f"last_epoch: {last_epoch}/{NUM_EPOCHS}  windows: {last_n_windows}  epoch_sec: {last_epoch_sec:.1f}\n"
+        f"train_sec_total: {train_sec_total:.1f}\n"
+        f"mean_loss (objective): {last_mean_loss:.4f}\n"
+        f"train_CE: {last_train_ce:.4f}  val_CE: {val_s}\n"
+        f"\n--- generation baseline prompt 1 ---\n{gen1}\n"
+        f"\n--- generation baseline prompt 2 ---\n{gen2}\n"
+        f"\n--- generation baseline prompt 3 ---\n{gen3}\n"
+        f"--- end baseline ---\n"
     )
 
-print(f"Pre-training done in {time.perf_counter() - t_train0:.1f}s total.")
 
-print("\nPrompt 1:")
-print(model.generate("the quick brown fox jumps over the lazy dog and then what happens in the system of mind and reason"))
-print("\nPrompt 2:")
-print(model.generate("mind reason cause effect system"))
-print("\n(Order sensitivity check — same words, different order:)")
-print(model.generate("effect cause reason mind system"))
-print("\nDebug attractor tracking (one prompt):")
-model.generate("the system stays stable because the reason is clear", max_tokens=12, debug_track=True)
-print("\nTrajectory sensitivity (compare_prompts):")
-compare_prompts(
-    model,
-    "mind reason cause effect system",
-    "effect cause reason mind system",
-)
-compare_prompts(
-    model,
-    "the quick brown fox jumps over the lazy dog",
-    "the lazy dog jumps over the quick brown fox",
-)
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Attractor dynamics language model (see README)."
+    )
+    parser.add_argument(
+        "--corpus",
+        type=Path,
+        default=None,
+        help=f"Training text: one sentence per line; lines starting with # ignored. "
+        f"Default: {DEFAULT_CORPUS_PATH}",
+    )
+    parser.add_argument(
+        "--val-fraction",
+        type=float,
+        default=0.05,
+        help="Hold out this fraction of lines for validation CE each epoch (0 disables).",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="RNG seed for shuffling and train/val split.",
+    )
+    parser.add_argument(
+        "--epoch-copies",
+        type=int,
+        default=CORPUS_EPOCH_COPIES,
+        help="Repeat the training sentence list this many times per epoch before shuffling.",
+    )
+    parser.add_argument(
+        "--baseline-out",
+        type=Path,
+        default=None,
+        help="Write Phase 0 baseline snapshot (metrics + fixed generations) to this file (UTF-8).",
+    )
+    args = parser.parse_args()
+    corpus_path = args.corpus if args.corpus is not None else DEFAULT_CORPUS_PATH
+    random.seed(args.seed)
+
+    print(f"Vocab size: {len(FULL_VOCAB)}", flush=True)
+    model = TorchAttractorLanguageModel(FULL_VOCAB)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
+    vocab_set = set(model.vocab)
+
+    sentences = load_corpus(corpus_path)
+    print(f"Loaded corpus: {corpus_path}  ({len(sentences)} lines)", flush=True)
+    corpus_coverage_report(sentences, vocab_set, WINDOW_SIZE)
+
+    usable = sentences_with_training_windows(sentences, vocab_set, WINDOW_SIZE)
+    if not usable:
+        raise RuntimeError(
+            "No corpus lines have enough in-vocabulary tokens to form a training window. "
+            "Add text using words from the model vocab, or lower WINDOW_SIZE."
+        )
+    n_skip = len(sentences) - len(usable)
+    if n_skip:
+        print(
+            f"Training/validation use only lines with ≥{WINDOW_SIZE + 1} in-vocab tokens "
+            f"({len(usable)} lines; {n_skip} lines skipped).",
+            flush=True,
+        )
+
+    train_sents, val_sents = train_val_split(usable, args.val_fraction, args.seed)
+    if val_sents:
+        print(
+            f"Train/val split: {len(train_sents)} train lines, {len(val_sents)} val lines "
+            f"(fraction={args.val_fraction:g}, seed={args.seed})",
+            flush=True,
+        )
+    val_dataset = build_dataset_from_sentences(val_sents, model, WINDOW_SIZE)
+
+    print(
+        f"Pre-training ({NUM_EPOCHS} epochs, sliding window size={WINDOW_SIZE}, "
+        f"epoch_copies={args.epoch_copies})...",
+        flush=True,
+    )
+    t_train0 = time.perf_counter()
+    last_mean_loss = 0.0
+    last_train_ce = 0.0
+    last_val_ce: float | None = None
+    last_n_windows = 0
+    last_epoch_sec = 0.0
+    last_epoch_num = 0
+    for epoch in range(NUM_EPOCHS):
+        training_sentences = list(train_sents * args.epoch_copies)
+        random.shuffle(training_sentences)
+        dataset = []
+        for sentence in training_sentences:
+            words = [w for w in sentence.split() if w in model.vocab]
+            if len(words) < WINDOW_SIZE + 1:
+                continue
+            ids = [model.vocab.index(w) for w in words]
+            dataset.extend(build_sequence_dataset(ids, window_size=WINDOW_SIZE))
+        random.shuffle(dataset)
+
+        n = len(dataset)
+        t_ep0 = time.perf_counter()
+        print(f"  epoch {epoch + 1}/{NUM_EPOCHS}  |  {n} windows", flush=True)
+        loss_sum = 0.0
+        report_every = max(1, n // 10)
+
+        for step, (context, target_id) in enumerate(dataset):
+            # One reset per (context, target): evolve through full window without resetting mid-context.
+            model.reset_readout_trajectory()
+            fast_state, slow_state = None, None
+            for t_id in context:
+                sig = model.get_signal(t_id, fast_state, slow_state)
+                fast_state, slow_state = model.evolve_token(fast_state, slow_state, sig)
+            logits = model.next_token_logits(fast_state, slow_state)
+            prev_id = context[-1]
+            logits = logits + BIGRAM_TRAIN_WEIGHT * torch.matmul(
+                model.embedder.weight, model.embedder.weight[prev_id]
+            )
+            logits[prev_id] -= 2.0
+            for t in context[-3:]:
+                logits[t] -= 1.0
+            logits = logits + TRAIN_LOGIT_NOISE * torch.randn_like(logits)
+            probs_floor = F.softmax(logits, dim=-1)
+            ent_s = -(probs_floor * torch.log(probs_floor + 1e-9)).sum()
+            if float(ent_s.detach()) < ENTROPY_FLOOR:
+                logits = logits + torch.randn_like(logits) * ENTROPY_FLOOR_NOISE
+                probs_for_entropy = F.softmax(logits, dim=-1)
+            else:
+                probs_for_entropy = probs_floor
+            target = torch.tensor([target_id], device=logits.device, dtype=torch.long)
+            loss_ce = F.cross_entropy(
+                logits.unsqueeze(0), target, label_smoothing=LABEL_SMOOTHING
+            )
+            entropy = -(probs_for_entropy * torch.log(probs_for_entropy + 1e-8)).sum()
+            loss = loss_ce - ENTROPY_WEIGHT * entropy
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            loss_sum += float(loss.detach())
+            if step % report_every == 0 or step == n - 1:
+                pct = 100.0 * (step + 1) / max(n, 1)
+                print(
+                    f"    [{step + 1}/{n}] {pct:5.1f}%  loss={loss.item():.4f}",
+                    flush=True,
+                )
+
+        ep_sec = time.perf_counter() - t_ep0
+        mean_loss = loss_sum / max(n, 1)
+        # Same CE as val (no logit noise): comparable to val CE. mean_loss above is CE - ENTROPY_WEIGHT*H.
+        train_ce = mean_cross_entropy_eval(model, dataset)
+        val_msg = ""
+        if val_dataset:
+            vce = mean_cross_entropy_eval(model, val_dataset)
+            val_msg = f"  |  val CE={vce:.4f}"
+        print(
+            f"  epoch {epoch + 1} done  |  {ep_sec:.1f}s  |  "
+            f"mean loss={mean_loss:.4f}  |  train CE={train_ce:.4f}{val_msg}",
+            flush=True,
+        )
+        last_mean_loss = mean_loss
+        last_train_ce = train_ce
+        last_val_ce = float(vce) if val_dataset else None
+        last_n_windows = n
+        last_epoch_sec = ep_sec
+        last_epoch_num = epoch + 1
+
+    train_sec_total = time.perf_counter() - t_train0
+    print(f"Pre-training done in {train_sec_total:.1f}s total.")
+
+    print("\nPrompt 1:")
+    gen_baseline_1 = model.generate(BASELINE_PROMPT_1)
+    print(gen_baseline_1)
+    print("\nPrompt 2:")
+    gen_baseline_2 = model.generate(BASELINE_PROMPT_2)
+    print(gen_baseline_2)
+    print("\n(Order sensitivity check — same words, different order:)")
+    gen_baseline_3 = model.generate(BASELINE_PROMPT_3)
+    print(gen_baseline_3)
+
+    baseline_block = _format_phase0_baseline_block(
+        corpus_path=corpus_path,
+        seed=args.seed,
+        val_fraction=args.val_fraction,
+        epoch_copies=args.epoch_copies,
+        last_epoch=last_epoch_num,
+        last_mean_loss=last_mean_loss,
+        last_train_ce=last_train_ce,
+        last_val_ce=last_val_ce,
+        last_n_windows=last_n_windows,
+        last_epoch_sec=last_epoch_sec,
+        train_sec_total=train_sec_total,
+        gen1=gen_baseline_1,
+        gen2=gen_baseline_2,
+        gen3=gen_baseline_3,
+    )
+    print("\n" + baseline_block, flush=True)
+    if args.baseline_out is not None:
+        args.baseline_out.parent.mkdir(parents=True, exist_ok=True)
+        args.baseline_out.write_text(baseline_block, encoding="utf-8")
+        print(f"Wrote baseline snapshot to {args.baseline_out}", flush=True)
+    print("\nDebug attractor tracking (one prompt):")
+    model.generate(
+        "the system stays stable because the reason is clear",
+        max_tokens=12,
+        debug_track=True,
+    )
+    print("\nTrajectory sensitivity (compare_prompts):")
+    compare_prompts(
+        model,
+        "mind reason cause effect system",
+        "effect cause reason mind system",
+    )
+    compare_prompts(
+        model,
+        "the quick brown fox jumps over the lazy dog",
+        "the lazy dog jumps over the quick brown fox",
+    )
+
+
+if __name__ == "__main__":
+    main()
