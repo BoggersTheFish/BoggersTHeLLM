@@ -1,4 +1,6 @@
 import math
+import random
+import time
 from collections import Counter
 
 import torch
@@ -120,6 +122,10 @@ assert len(BASE_VOCAB) == 512, len(BASE_VOCAB)
 FULL_VOCAB = sorted(set(BASE_VOCAB))
 print(f"Vocab size: {len(FULL_VOCAB)}")
 
+# Anti-collapse: trajectory drift in readout; entropy floor for sampling / training logits.
+DRIFT_MIN = 0.05
+ENTROPY_FLOOR = 2.5
+
 # ==================== FIXED TORCH MODEL (shape bugs corrected) ====================
 class TorchAttractorLanguageModel(nn.Module):
     def __init__(
@@ -127,10 +133,12 @@ class TorchAttractorLanguageModel(nn.Module):
         vocab,
         state_dim=512,
         convergence_steps=4,
-        alpha=0.97,
+        slow_decay=0.05,
+        slow_lr=0.05,
         w_fast=1.0,
-        w_slow=0.5,
+        w_slow=0.3,
         gamma_init=0.2,
+        generation_temperature=0.8,
     ):
         super().__init__()
         self.vocab = vocab
@@ -138,17 +146,21 @@ class TorchAttractorLanguageModel(nn.Module):
         self.state_dim = state_dim
         # Partial updates per token (path-dependent evolution; not full relaxation).
         self.convergence_steps = convergence_steps
-        # Slow memory blend: slow = alpha * slow + (1 - alpha) * fast
-        self.register_buffer("alpha", torch.tensor(float(alpha)))
+        # Slow memory: slow = (1 - slow_decay) * slow + slow_lr * fast (decay prevents unbounded growth).
+        self.register_buffer("slow_decay", torch.tensor(float(slow_decay)))
+        self.register_buffer("slow_lr", torch.tensor(float(slow_lr)))
         # Decode / context mix: avoid slow memory overpowering fast transients.
         self.register_buffer("w_fast", torch.tensor(float(w_fast)))
         self.register_buffer("w_slow", torch.tensor(float(w_slow)))
+        # Extra temperature at generation time (escapes shallow attractors in sampling).
+        self.register_buffer("generation_temperature", torch.tensor(float(generation_temperature)))
         # Context-dependent signal injection strength (trajectory sensitivity).
         self.gamma = nn.Parameter(torch.tensor(float(gamma_init)))
         self.register_buffer("signal_eps", torch.tensor(1e-6))
         self.dynamics = SimpleAttractorDynamics(state_dim)
         self.embedder = nn.Embedding(self.vocab_size, state_dim)
         self.norm = nn.LayerNorm(state_dim, elementwise_affine=False)
+        self.readout = nn.Linear(self.state_dim, self.vocab_size, bias=False)
         # Unconstrained raw; effective temperature = softplus(raw) > 0 (learnable temp can hit 0 otherwise -> inf logits).
         t0 = 0.12
         self.temperature_raw = nn.Parameter(torch.tensor(math.log(math.exp(t0) - 1.0)))
@@ -158,39 +170,59 @@ class TorchAttractorLanguageModel(nn.Module):
         self._last_state_norm = 0.0
         self._last_state_delta = 0.0
         self._last_combined_norm = 0.0
+        self._last_slow_norm = 0.0
+        # Trajectory drift pressure in readout (reset at each new sequence via reset_readout_trajectory).
+        self._prev_combined = None
+
+    def reset_readout_trajectory(self):
+        """Clear stored combined state for drift pressure (call once per training window / at generate start)."""
+        self._prev_combined = None
 
     def effective_temperature(self) -> torch.Tensor:
         return F.softplus(self.temperature_raw).clamp(min=1e-6)
 
+    def _context_vector(self, fast_state, slow_state):
+        """Unit direction from fast (or weighted combined) for context injection; expects inited dual state."""
+        combined = self.w_fast * fast_state + self.w_slow * slow_state
+        fast_norm = torch.linalg.vector_norm(fast_state)
+        eps = self.signal_eps
+        device = fast_state.device
+        dtype = fast_state.dtype
+        if float(fast_norm.detach()) > 1e-8:
+            return fast_state / (fast_norm + eps)
+        cn = torch.linalg.vector_norm(combined)
+        if float(cn.detach()) > 1e-8:
+            return combined / (cn + eps)
+        return torch.zeros(self.state_dim, device=device, dtype=dtype)
+
     def get_signal(self, token_id: int, fast_state=None, slow_state=None) -> torch.Tensor:
         """Context-sensitive input: base embedding + gamma * normalized context; then unit-scale signal."""
-        device = self.embedder.weight.device
-        dtype = self.embedder.weight.dtype
-        if fast_state is not None:
-            device = fast_state.device
-            dtype = fast_state.dtype
+        fast_state, slow_state = self._init_dual_state(fast_state, slow_state)
+        device = fast_state.device
+        dtype = fast_state.dtype
         emb = self.embedder(torch.tensor([token_id], device=device, dtype=torch.long))
         emb = self.norm(emb)
         n0 = torch.linalg.vector_norm(emb, dim=-1, keepdim=True).clamp(min=1e-12)
         base_signal = (emb / n0).squeeze(0)
-
-        fast_state, slow_state = self._init_dual_state(fast_state, slow_state)
-        combined = self.w_fast * fast_state + self.w_slow * slow_state
-        fast_norm = torch.linalg.vector_norm(fast_state)
-        eps = self.signal_eps
-        if float(fast_norm.detach()) > 1e-8:
-            context_vector = fast_state / (fast_norm + eps)
-        else:
-            cn = torch.linalg.vector_norm(combined)
-            if float(cn.detach()) > 1e-8:
-                context_vector = combined / (cn + eps)
-            else:
-                context_vector = torch.zeros(self.state_dim, device=device, dtype=dtype)
-
+        context_vector = self._context_vector(fast_state, slow_state)
         signal = base_signal + self.gamma * context_vector
         sn = torch.linalg.vector_norm(signal)
-        signal = signal / (sn + eps)
+        signal = signal / (sn + self.signal_eps)
         return signal
+
+    def all_signals(self, fast_state, slow_state):
+        """All vocab signals in one batched pass (avoids 512× Python loop and duplicate graphs)."""
+        fast_state, slow_state = self._init_dual_state(fast_state, slow_state)
+        device = fast_state.device
+        dtype = fast_state.dtype
+        ids = torch.arange(self.vocab_size, device=device, dtype=torch.long)
+        emb = self.norm(self.embedder(ids))
+        n0 = torch.linalg.vector_norm(emb, dim=-1, keepdim=True).clamp(min=1e-12)
+        base_signals = emb / n0
+        ctx = self._context_vector(fast_state, slow_state)
+        signals = base_signals + self.gamma * ctx
+        sn = torch.linalg.vector_norm(signals, dim=-1, keepdim=True).clamp(min=1e-12)
+        return signals / (sn + self.signal_eps)
 
     def _init_dual_state(self, fast_state, slow_state):
         if fast_state is None:
@@ -206,23 +238,27 @@ class TorchAttractorLanguageModel(nn.Module):
         for _ in range(n):
             prev_fast = fast_state.detach().clone()
             fast_state = self.dynamics(fast_state, signal)
-            self._last_state_norm = float(torch.linalg.vector_norm(fast_state))
-            self._last_state_delta = float(torch.linalg.vector_norm(fast_state - prev_fast))
+            self._last_state_norm = float(torch.linalg.vector_norm(fast_state.detach()))
+            self._last_state_delta = float(torch.linalg.vector_norm((fast_state - prev_fast).detach()))
             if self.track_attractors:
                 print(
                     f"  [dyn] ||fast||={self._last_state_norm:.4f}  "
                     f"||Δfast||={self._last_state_delta:.4f}"
                 )
-        slow_state = self.alpha * slow_state + (1.0 - self.alpha) * fast_state
+        slow_state = (1.0 - self.slow_decay) * slow_state + self.slow_lr * fast_state
+        sn_slow = torch.linalg.vector_norm(slow_state)
+        if float(sn_slow.detach()) > 0.5:
+            slow_state = slow_state * (0.5 / (sn_slow + 1e-12))
         combined = self.w_fast * fast_state + self.w_slow * slow_state
-        self._last_combined_norm = float(torch.linalg.vector_norm(combined))
+        self._last_slow_norm = float(torch.linalg.vector_norm(slow_state.detach()))
+        self._last_combined_norm = float(torch.linalg.vector_norm(combined.detach()))
         if self.track_attractors:
             aid = torch.round(combined, decimals=2)
             key = aid.detach().cpu().numpy().tobytes()
             self._attractor_counts[key] += 1
             print(
-                f"  [token] ||combined||={self._last_combined_norm:.4f}  "
-                f"attractor_id[:4]={aid[:4].tolist()}"
+                f"  [token] ||fast||={self._last_state_norm:.4f}  ||slow||={self._last_slow_norm:.4f}  "
+                f"||combined||={self._last_combined_norm:.4f}  attractor_id[:4]={aid[:4].tolist()}"
             )
         return fast_state, slow_state
 
@@ -235,11 +271,26 @@ class TorchAttractorLanguageModel(nn.Module):
         return self.w_fast * fast_state + self.w_slow * slow_state
 
     def next_token_logits(self, fast_state, slow_state):
+        combined = self.combined_state(fast_state, slow_state)
+        if self._prev_combined is not None:
+            prev = self._prev_combined.to(device=combined.device, dtype=combined.dtype)
+            drift = torch.linalg.vector_norm(combined - prev)
+            if float(drift.detach()) < DRIFT_MIN:
+                combined = combined + torch.randn_like(combined) * 0.05
+        if not self.training:
+            combined = combined + torch.randn_like(combined) * 0.01
+        state = combined / (torch.linalg.vector_norm(combined) + 1e-8)
+        logits = self.readout(state)
+        logits = logits / self.effective_temperature()
+        logits = torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=-1e4)
+        self._prev_combined = combined.detach().clone()
+        return logits
+
+    def next_token_logits_distance(self, fast_state, slow_state):
+        """Distance-to-embedding decoding (baseline / comparison experiments)."""
         state = self.combined_state(fast_state, slow_state)
-        all_signals = torch.stack(
-            [self.get_signal(i, fast_state, slow_state) for i in range(self.vocab_size)]
-        )
-        dists = torch.cdist(state.unsqueeze(0), all_signals).squeeze(0)
+        all_signals = self.all_signals(fast_state, slow_state)
+        dists = torch.linalg.vector_norm(all_signals - state.unsqueeze(0), dim=-1)
         logits = -dists / self.effective_temperature()
         logits = torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=-1e4)
         return logits
@@ -279,6 +330,9 @@ class TorchAttractorLanguageModel(nn.Module):
         if debug_track:
             self._attractor_counts = Counter()
 
+        was_training = self.training
+        self.eval()
+        self.reset_readout_trajectory()
         fast_state, slow_state = None, None
         with torch.no_grad():
             for tid in input_ids:
@@ -286,8 +340,16 @@ class TorchAttractorLanguageModel(nn.Module):
                 fast_state, slow_state = self.evolve_token(fast_state, slow_state, sig)
 
             generated = tokens[:]
+            gen_temp = self.generation_temperature
+            if torch.is_tensor(gen_temp):
+                gen_temp = float(gen_temp.detach())
             for _ in range(max_tokens):
                 logits = self.next_token_logits(fast_state, slow_state)
+                probs_ent = F.softmax(logits, dim=-1)
+                entropy = -(probs_ent * torch.log(probs_ent + 1e-9)).sum()
+                if float(entropy.detach()) < ENTROPY_FLOOR:
+                    logits = logits + torch.randn_like(logits) * 0.5
+                logits = logits / gen_temp
                 logits = logits - logits.max()
                 probs = F.softmax(logits, dim=-1)
                 if not torch.isfinite(probs).all() or float(probs.sum()) <= 0:
@@ -300,16 +362,29 @@ class TorchAttractorLanguageModel(nn.Module):
 
         if debug_track:
             print(
-                f"[attractors] last||combined||={self._last_combined_norm:.4f}"
+                f"[norms] last ||fast||={self._last_state_norm:.4f}  ||slow||={self._last_slow_norm:.4f}  "
+                f"||combined||={self._last_combined_norm:.4f}"
             )
             self._print_attractor_diversity(top_k=5)
             self.track_attractors = False
 
+        if was_training:
+            self.train()
         return " ".join(generated)
 
 
 class SimpleAttractorDynamics(nn.Module):
-    def __init__(self, dim=512, dt=0.04, cubic_scale=0.008, beta_init=0.75, noise_scale=1e-3):
+    def __init__(
+        self,
+        dim=512,
+        dt=0.04,
+        cubic_scale=0.008,
+        beta_init=0.75,
+        noise_scale=1e-3,
+        lambda_decay=0.1,
+        signal_scale=0.5,
+        state_norm_eps=1e-8,
+    ):
         super().__init__()
         self.dim = dim
         self.dt = dt
@@ -317,6 +392,9 @@ class SimpleAttractorDynamics(nn.Module):
         self.diffusion = nn.Parameter(make_diffusion_matrix(dim))
         self.beta = nn.Parameter(torch.tensor(float(beta_init)))
         self.register_buffer("noise_scale", torch.tensor(float(noise_scale)))
+        self.register_buffer("lambda_decay", torch.tensor(float(lambda_decay)))
+        self.register_buffer("signal_scale", torch.tensor(float(signal_scale)))
+        self.register_buffer("state_norm_eps", torch.tensor(float(state_norm_eps)))
 
     def forward(self, state, signal):
         return step_state(
@@ -327,6 +405,9 @@ class SimpleAttractorDynamics(nn.Module):
             self.cubic_scale,
             beta=self.beta,
             noise_scale=self.noise_scale,
+            lambda_decay=self.lambda_decay,
+            signal_scale=self.signal_scale,
+            state_norm_eps=self.state_norm_eps,
         )
 
 
@@ -354,47 +435,156 @@ def compare_prompts(model: "TorchAttractorLanguageModel", prompt1: str, prompt2:
     )
 
 
-def step_state(state, diffusion, applied_signal, dt, cubic_scale, beta=1.0, noise_scale=0.0):
+def step_state(
+    state,
+    diffusion,
+    applied_signal,
+    dt,
+    cubic_scale,
+    beta=1.0,
+    noise_scale=0.0,
+    lambda_decay=0.1,
+    signal_scale=0.5,
+    state_norm_eps=1e-8,
+):
     c = state - state.mean()
-    nonlinear = cubic_scale * (c ** 3)
-    drift = state @ diffusion.T + nonlinear + beta * applied_signal
+    # Bounded nonlinearity (avoids cubic blow-up at large |c|).
+    nonlinear = cubic_scale * torch.tanh(c)
+    scaled_signal = signal_scale * applied_signal
+    drift = state @ diffusion.T + nonlinear + beta * scaled_signal - lambda_decay * state
     s = state + dt * drift
     if noise_scale and float(noise_scale) > 0:
         s = s + noise_scale * torch.randn_like(s)
-    return torch.clamp(torch.nan_to_num(s, nan=0.0, posinf=0.0, neginf=0.0), -80.0, 80.0)
+    s = torch.nan_to_num(s, nan=0.0, posinf=0.0, neginf=0.0)
+    nrm = torch.linalg.vector_norm(s)
+    eps = state_norm_eps
+    if torch.is_tensor(eps):
+        eps = eps.to(device=s.device, dtype=s.dtype)
+    s = s / (nrm + eps)
+    return torch.clamp(s, -10.0, 10.0)
+
+
+def _sequence_is_weak_or_repetitive(token_ids):
+    """True if all tokens are identical or one token accounts for >50% of the span (anti-repetition training)."""
+    if not token_ids:
+        return True
+    n = len(token_ids)
+    counts = Counter(token_ids)
+    max_freq = max(counts.values())
+    if max_freq / n > 0.5:
+        return True
+    return False
+
+
+def build_sequence_dataset(tokens, window_size=6):
+    """
+    tokens: List[int] (single sentence, order preserved)
+    returns: List of (context, target)
+    context: List[int] of length window_size
+    target: int (next token)
+    Skips windows where the (context + target) span is all-one-token or >50% one token.
+    """
+    data = []
+    for i in range(len(tokens) - window_size):
+        context = tokens[i : i + window_size]
+        target = tokens[i + window_size]
+        span = list(context) + [target]
+        if _sequence_is_weak_or_repetitive(span):
+            continue
+        data.append((context, target))
+    return data
 
 
 # ==================== RUN (pre-training + generation) ====================
 model = TorchAttractorLanguageModel(FULL_VOCAB)
-optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
 
-corpus = [
+corpus_base = [
     "the problem appears but the solution exists because the reason is clear therefore the system stays stable",
     "mind understands the cause and the effect creates a stable system",
     "the quick brown fox jumps over the lazy dog and then the pattern flows into the future",
 ] * 20
 
-print("Pre-training (3 epochs)...")
-for epoch in range(3):
-    for sentence in corpus:
+STRUCTURED_SENTENCES = [
+    "the system learns from patterns and predicts the future",
+    "cause and effect drive the evolution of stable systems",
+    "the mind builds structure through repeated interactions",
+    "a stable system resists change unless energy is applied",
+    "patterns emerge from the interaction of simple rules",
+]
+
+# Weight structured lines higher (duplicated) while keeping sentences intact; sliding windows are per sentence only.
+corpus = corpus_base + STRUCTURED_SENTENCES * 3
+
+WINDOW_SIZE = 6
+NUM_EPOCHS = 10
+ENTROPY_WEIGHT = 0.03  # subtracted from CE to reward higher prediction entropy (anti-collapse)
+print(f"Pre-training ({NUM_EPOCHS} epochs, sliding window size={WINDOW_SIZE})...")
+t_train0 = time.perf_counter()
+for epoch in range(NUM_EPOCHS):
+    # Shuffle at sentence level only; each sentence is windowed in order before examples are pooled.
+    training_sentences = list(corpus)
+    random.shuffle(training_sentences)
+    dataset = []
+    for sentence in training_sentences:
         words = [w for w in sentence.split() if w in model.vocab]
-        if len(words) < 3:
+        if len(words) < WINDOW_SIZE + 1:
             continue
         ids = [model.vocab.index(w) for w in words]
-        fast_state, slow_state = None, None
-        loss = 0.0
-        for i in range(len(ids) - 1):
-            sig = model.get_signal(ids[i], fast_state, slow_state)
-            fast_state, slow_state = model.evolve_token(fast_state, slow_state, sig)
-            logits = model.next_token_logits(fast_state, slow_state)
-            target = torch.tensor([ids[i + 1]])
-            loss += F.cross_entropy(logits.unsqueeze(0), target)
-        if loss > 0:
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+        dataset.extend(build_sequence_dataset(ids, window_size=WINDOW_SIZE))
+    random.shuffle(dataset)
 
-print("Pre-training done.")
+    n = len(dataset)
+    t_ep0 = time.perf_counter()
+    print(f"  epoch {epoch + 1}/{NUM_EPOCHS}  |  {n} windows", flush=True)
+    loss_sum = 0.0
+    report_every = max(1, n // 10)
+
+    for step, (context, target_id) in enumerate(dataset):
+        # One reset per (context, target): evolve through full window without resetting mid-context.
+        model.reset_readout_trajectory()
+        fast_state, slow_state = None, None
+        for t_id in context:
+            sig = model.get_signal(t_id, fast_state, slow_state)
+            fast_state, slow_state = model.evolve_token(fast_state, slow_state, sig)
+        logits = model.next_token_logits(fast_state, slow_state)
+        prev_id = context[-1]
+        logits = logits + 0.05 * torch.matmul(
+            model.embedder.weight, model.embedder.weight[prev_id]
+        )
+        last_token = context[-1]
+        logits[last_token] -= 2.0
+        for t in context[-3:]:
+            logits[t] -= 1.0
+        logits = logits + 0.01 * torch.randn_like(logits)
+        probs_floor = F.softmax(logits, dim=-1)
+        ent_s = -(probs_floor * torch.log(probs_floor + 1e-9)).sum()
+        if float(ent_s.detach()) < ENTROPY_FLOOR:
+            logits = logits + torch.randn_like(logits) * 0.5
+        target = torch.tensor([target_id], device=logits.device, dtype=torch.long)
+        loss_ce = F.cross_entropy(logits.unsqueeze(0), target)
+        probs = F.softmax(logits, dim=-1)
+        entropy = -(probs * torch.log(probs + 1e-8)).sum()
+        loss = loss_ce - ENTROPY_WEIGHT * entropy
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        loss_sum += float(loss.detach())
+        if step % report_every == 0 or step == n - 1:
+            pct = 100.0 * (step + 1) / max(n, 1)
+            print(
+                f"    [{step + 1}/{n}] {pct:5.1f}%  loss={loss.item():.4f}",
+                flush=True,
+            )
+
+    ep_sec = time.perf_counter() - t_ep0
+    mean_loss = loss_sum / max(n, 1)
+    print(
+        f"  epoch {epoch + 1} done  |  {ep_sec:.1f}s  |  mean loss={mean_loss:.4f}",
+        flush=True,
+    )
+
+print(f"Pre-training done in {time.perf_counter() - t_train0:.1f}s total.")
 
 print("\nPrompt 1:")
 print(model.generate("the quick brown fox jumps over the lazy dog and then what happens in the system of mind and reason"))
