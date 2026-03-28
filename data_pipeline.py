@@ -25,7 +25,7 @@ Usage
     )
 
     for epoch in range(NUM_EPOCHS):
-        for contexts, targets in pipe.epoch_batches():
+        for contexts, targets in pipe.epoch_batches(epoch_index=0):
             loss, _ = model.trajectory_contrastive_loss_and_logits(contexts, targets)
             ...
 
@@ -242,18 +242,22 @@ class AttractorDataPipeline:
 
     def epoch_batches(
         self,
+        epoch_index: int = 0,
     ) -> Generator[tuple[list[list[int]], list[int]], None, None]:
         """
         Yield (contexts, targets) mini-batches for one epoch.
 
-        Stream mode: shuffles window start indices each epoch, then batches.
+        Stream mode: shuffles window start indices, then batches. Uses
+        ``random.Random(self.seed + epoch_index)`` so each epoch gets a
+        deterministic but distinct order (reproducible when base ``seed`` fixed).
+
         Line mode: shuffle-buffer refill over the line stream (legacy).
         """
         if self._stream_tokens is not None:
-            yield from self._epoch_batches_stream()
+            yield from self._epoch_batches_stream(epoch_index=epoch_index)
             return
 
-        rng = random.Random(self.seed)
+        rng = random.Random(self.seed + int(epoch_index))
         buf: deque[tuple[list[int], int]] = deque()
         stream = self._window_stream()
 
@@ -285,9 +289,11 @@ class AttractorDataPipeline:
             buf_list = list(buf)
             buf.clear()
 
-    def _epoch_batches_stream(self) -> Generator[tuple[list[list[int]], list[int]], None, None]:
+    def _epoch_batches_stream(
+        self, *, epoch_index: int = 0
+    ) -> Generator[tuple[list[list[int]], list[int]], None, None]:
         """One full pass over all sliding windows with shuffled order."""
-        rng = random.Random(self.seed)
+        rng = random.Random(self.seed + int(epoch_index))
         toks = self._stream_tokens
         assert toks is not None
         W = self.window_size
@@ -350,7 +356,7 @@ if __name__ == "__main__":
 
     count = 0
     total_contexts = 0
-    for contexts, targets in pipe.epoch_batches():
+    for contexts, targets in pipe.epoch_batches(epoch_index=0):
         assert len(contexts) == len(targets), "contexts/targets length mismatch"
         assert len(contexts) >= 2, "batch too small for trajectory contrastive loss"
         total_contexts += len(contexts)
@@ -378,7 +384,7 @@ if __name__ == "__main__":
             batch_size=2,
             shuffle_buffer=32,
         )
-        batches = list(pipe2.epoch_batches())
+        batches = list(pipe2.epoch_batches(epoch_index=0))
         assert len(batches) >= 1, "JSONL pipeline yielded no batches"
         print(f"  test 3 PASS — JSONL: {len(batches)} batches", flush=True)
     finally:

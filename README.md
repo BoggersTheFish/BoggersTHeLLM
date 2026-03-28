@@ -209,7 +209,9 @@ text = generate_with_cache(model, cache, prompt="the cat sat", max_tokens=30)
 `data_pipeline.py` feeds training with **stream-based tokenization by default** (no dependence on individual lines being long enough):
 
 - **Stream mode (default):** the corpus is read as **full text** (whole `.txt` files; `.jsonl` records concatenated), then `tokenizer.encode(full_text)` produces **one continuous token sequence**. Sliding windows `(context, target)` use `tokens[i : i+W]` → target `tokens[i+W]`. Each epoch shuffles all window start indices, then batches.
-- **`train_token_ids=`** — sandbox passes the train split after **token-level** train/val cut; validation windows are built separately in `sandbox.py`.
+- **`train_token_ids=`** — sandbox passes the train split after **token-level** train/val cut with a **gap of `window_size` tokens** between train and val so no sliding window shares context across the split.
+- **Shuffle:** `epoch_batches(epoch_index=epoch)` uses `Random(seed + epoch_index)` so each epoch has a **deterministic but different** batch order (reproducible runs).
+- **Stream mode** ignores **`--epoch-copies`** (use **`--max-epochs`** instead); duplicating the token stream is not applied.
 - **Legacy line mode:** `streaming_dataset=False` keeps per-line encoding (short lines dropped); `shuffle_buffer` refills between batch groups.
 - Multi-shard round-robin (`shard_id` / `num_shards`) for data-parallel workers
 - Too few tokens (`len < window_size + 1`) raises a clear **“Corpus too small after tokenization”** error.
@@ -375,7 +377,7 @@ python3 sandbox.py [options]    # or: source .venv/bin/activate && python sandbo
 Data & tokenizer:
   --corpus PATH              Training text (default: data/corpus.txt)
   --dataset-path PATH        Alias for --corpus (takes precedence if set)
-  --val-fraction FLOAT       Held-out fraction for val CE / traj eval (default: 0.05; use 0 to disable)
+  --val-fraction FLOAT       Token-level val hold-out in stream mode (default: 0.05). Use ~0.3 if you need many val windows; 0 = off.
   --tokenizer {tiktoken,fallback}   BPE mode (default: fallback)
   --vocab-cap INT            Max BPE vocab when using tiktoken mode (default: 32768)
   --seq-len INT              Alias for --window-size
@@ -425,12 +427,14 @@ When `--epoch-metrics-csv` is set, each row includes: `epoch`, `loss_mode`, `mea
 
 Use the same `--seed`, corpus, and hyperparameters; only add `--use-goat-memory` for the treatment run. Log with `--epoch-metrics-csv` and compare `val_ce` / `mean_loss` curves (or `exp(val_ce)` for val perplexity).
 
+On **tiny corpora** (under a few thousand tokens), val CE and GOAT A/B deltas are **integration checks only**, not evidence of real model quality.
+
 ```bash
 mkdir -p experiments/goat_ab
 # Baseline
 python3 sandbox.py \
   --corpus data/corpus.txt \
-  --val-fraction 0.15 \
+  --val-fraction 0.3 \
   --seed 42 \
   --device cpu \
   --tokenizer fallback \
@@ -439,7 +443,7 @@ python3 sandbox.py \
 # +GOAT
 python3 sandbox.py \
   --corpus data/corpus.txt \
-  --val-fraction 0.15 \
+  --val-fraction 0.3 \
   --seed 42 \
   --device cpu \
   --tokenizer fallback \

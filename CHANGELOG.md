@@ -14,6 +14,7 @@ The project is documented as **BoggersTheLanguageModel**; canonical source is [g
 - **`AttractorDataPipeline`:** `streaming_dataset=True` (default), optional `train_token_ids` from sandbox; `epoch_batches` shuffles window indices per epoch.
 - **`--no-streaming-dataset`:** restores legacy per-line filtering.
 - Logging: `total_tokens`, `train_windows`, `val_windows` instead of “usable lines”.
+- Train/val **gap** of `window_size` tokens (no cross-split window leakage). **`epoch_batches(epoch_index)`** shuffles with `seed + epoch_index`. Stream mode **ignores `--epoch-copies`**. Warn when **`val_windows < 50`** (unreliable metrics); tiny-corpus note for GOAT A/B interpretation.
 
 ## Phase 0 — Substrate Initialisation (Mar 2026)
 

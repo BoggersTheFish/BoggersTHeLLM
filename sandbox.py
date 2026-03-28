@@ -96,6 +96,8 @@ WINDOW_TENSION_HIGH_GEOMETRY = 0.22
 WINDOW_TENSION_TOL_ENTROPY = 0.75
 WINDOW_TENSION_HIGH_ENTROPY = 0.92
 TRAJECTORY_BATCH_SIZE_DEFAULT = 16
+# Below this many val windows, val CE / PPL are not statistically reliable.
+MIN_VAL_WINDOWS_RELIABLE = 50
 # Larger outer step → more movement per iteration (target mean_cos(step) ~0.98–0.995 vs ~0.997+).
 WINDOW_INTERACTION_DT_INIT = 0.09
 # Sharper distance decay → less mixing of far positions (reduces over-smoothing vs nonlinearity).
@@ -1073,17 +1075,28 @@ def split_tokens_train_val(
     """
     Split a token sequence into train / val at token boundaries.
 
+    Inserts a **gap** of ``window_size`` tokens between train and val so no
+    sliding window straddles the boundary (avoids train/val leakage).
+
     Each side must be able to form at least one window (len >= window_size + 1),
     or val is empty.
     """
     n = len(tokens)
     min_need = window_size + 1
-    if val_fraction <= 0 or n < 2 * min_need:
+    gap = window_size
+    if val_fraction <= 0:
+        return list(tokens), []
+    # train segment, gap, val segment — each of train and val needs min_need tokens
+    min_n = min_need + gap + min_need
+    if n < min_n:
         return list(tokens), []
     split_idx = int(n * (1 - val_fraction))
-    split_idx = max(min_need, split_idx)
+    split_idx = max(min_need + gap, split_idx)
     split_idx = min(split_idx, n - min_need)
-    return tokens[:split_idx], tokens[split_idx:]
+    train_end = split_idx - gap
+    if train_end < min_need or (n - split_idx) < min_need:
+        return list(tokens), []
+    return tokens[:train_end], tokens[split_idx:]
 
 
 def corpus_coverage_report(
@@ -1392,7 +1405,8 @@ def main() -> None:
     parser.add_argument("--corpus", type=Path, default=None,
         help=f"Training text (one sentence/line). Default: {DEFAULT_CORPUS_PATH}")
     parser.add_argument("--val-fraction", type=float, default=0.05,
-        help="Hold-out fraction for validation CE each epoch (0 = off).")
+        help="Hold-out fraction for validation (token-level in stream mode). "
+        f"Use ~0.3 if you need ≥{MIN_VAL_WINDOWS_RELIABLE} val windows; 0 = off.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--epoch-copies", type=int, default=CORPUS_EPOCH_COPIES,
         help="Repeat training sentence list N times per epoch.")
@@ -1569,6 +1583,7 @@ def main() -> None:
     stream_train_ids: list[int] | None = None
     train_sents: list[str] = []
     _tmp_train_path: Path | None = None
+    val_metrics_unreliable = False
 
     if streaming_dataset:
         full_text = load_corpus_text_stream(corpus_path)
@@ -1583,8 +1598,10 @@ def main() -> None:
             tokens, args.val_fraction, window_size
         )
         if args.val_fraction > 0 and not val_tok:
+            _min_stream = (window_size + 1) + window_size + (window_size + 1)
             print(
-                "Warning: token-level val split skipped (need ≥ 2×(window_size+1) tokens); "
+                f"Warning: token-level val split skipped (need ≥ {_min_stream} tokens "
+                f"for window_size={window_size}, including train/val gap); "
                 "using all tokens for training.",
                 flush=True,
             )
@@ -1596,7 +1613,8 @@ def main() -> None:
         )
         print(
             f"  total_tokens={len(tokens)}  train_windows={n_train_win}  "
-            f"val_windows={n_val_win}  window_size={window_size}",
+            f"val_windows={n_val_win}  window_size={window_size}  "
+            f"(train/val gap={window_size} tokens, no window leakage)",
             flush=True,
         )
         if val_tok:
@@ -1606,12 +1624,26 @@ def main() -> None:
                 flush=True,
             )
         val_dataset = build_dataset_from_token_ids(val_tok, window_size)
-        if val_tok and len(val_dataset) < 32:
+        if val_tok and n_val_win < MIN_VAL_WINDOWS_RELIABLE:
+            val_metrics_unreliable = True
             print(
-                f"Warning: validation set tiny ({len(val_dataset)} windows); val CE is noisy.",
+                f"Warning: val_windows={n_val_win} < {MIN_VAL_WINDOWS_RELIABLE} — "
+                "treat val CE / perplexity as unreliable. Prefer --val-fraction 0.3 or more text. "
+                "Tiny corpora: loss deltas (e.g. GOAT on/off) reflect integration noise, not real gains.",
                 flush=True,
             )
-        stream_train_ids = train_tok * args.epoch_copies
+        if len(tokens) < 5000:
+            print(
+                "Note: very small corpus — use training for integration checks only; "
+                "do not interpret val metrics or A/B deltas as model quality.",
+                flush=True,
+            )
+        stream_train_ids = train_tok
+        if args.epoch_copies > 1:
+            print(
+                "Note: --epoch-copies is ignored in stream mode; use --max-epochs for more passes.",
+                flush=True,
+            )
     else:
         sentences = load_corpus(corpus_path)
         print(f"Loaded corpus (line mode): {corpus_path}  ({len(sentences)} lines)", flush=True)
@@ -1640,9 +1672,12 @@ def main() -> None:
                 flush=True,
             )
         val_dataset = build_dataset_from_sentences(val_sents, model, window_size)
-        if val_sents and len(val_dataset) < 32:
+        n_val_win_line = len(val_dataset)
+        if val_sents and n_val_win_line < MIN_VAL_WINDOWS_RELIABLE:
+            val_metrics_unreliable = True
             print(
-                f"Warning: validation set tiny ({len(val_dataset)} windows); val CE is noisy.",
+                f"Warning: val_windows={n_val_win_line} < {MIN_VAL_WINDOWS_RELIABLE} — "
+                "treat val CE / perplexity as unreliable. Prefer --val-fraction 0.3 or more text.",
                 flush=True,
             )
 
@@ -1725,24 +1760,24 @@ def main() -> None:
 
         if pipeline is not None:
             # ---- Phase 2: streaming data pipeline ----
-            pipeline.seed = args.seed + epoch
-            batch_iter = pipeline.epoch_batches()
+            batch_iter = pipeline.epoch_batches(epoch_index=epoch)
             n_est = max(1, pipeline.epoch_count_estimate())
             report_every = max(1, n_est // 10)
         else:
             # Legacy in-memory fallback (keeps working if data_pipeline unavailable).
             legacy_dataset: list = []
+            _rng_ep = random.Random(args.seed + epoch)
             if stream_train_ids is not None:
                 legacy_dataset = build_sequence_dataset(stream_train_ids, window_size)
-                random.shuffle(legacy_dataset)
+                _rng_ep.shuffle(legacy_dataset)
             else:
                 training_sentences = list(train_sents * args.epoch_copies)
-                random.shuffle(training_sentences)
+                _rng_ep.shuffle(training_sentences)
                 for _s in training_sentences:
                     _ids = tok.encode(_s)
                     if len(_ids) >= window_size + 1:
                         legacy_dataset.extend(build_sequence_dataset(_ids, window_size))
-                random.shuffle(legacy_dataset)
+                _rng_ep.shuffle(legacy_dataset)
             _bs = max(2, traj_batch_size)
 
             def _legacy_batch_iter():
@@ -1933,6 +1968,8 @@ def main() -> None:
         if val_dataset:
             vce = mean_cross_entropy_eval(model, val_dataset)
             val_msg = f"  |  val CE={vce:.4f}"
+            if val_metrics_unreliable:
+                val_msg += "  [val unreliable]"
 
         # Bug 3: compute val_traj_contrast (on held-out val data) and
         # train_traj_contrast (on last training batch, no extra eval pass).
