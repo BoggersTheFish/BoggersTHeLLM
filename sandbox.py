@@ -222,6 +222,8 @@ class TorchAttractorLanguageModel(nn.Module):
         super().__init__()
         self.vocab = vocab
         self.vocab_size = len(vocab)
+        # O(1) word → index (list.index is O(V) and dominated training/data prep).
+        self._word_to_idx: dict[str, int] = {w: i for i, w in enumerate(vocab)}
         self.state_dim = state_dim
         # Partial updates per token (path-dependent evolution; not full relaxation).
         self.convergence_steps = convergence_steps
@@ -278,6 +280,13 @@ class TorchAttractorLanguageModel(nn.Module):
     def _state_energy(self, fast: torch.Tensor) -> torch.Tensor:
         return torch.sum(fast * fast)
 
+    def _normalized_token_embedding(self, token_id: int) -> torch.Tensor:
+        """Single-token path: LayerNorm row + unit direction (matches batched embed + norm)."""
+        row = self.embedder.weight[token_id].unsqueeze(0)
+        emb = self.norm(row).squeeze(0)
+        n0 = torch.linalg.vector_norm(emb).clamp(min=1e-12)
+        return emb / n0
+
     def compute_tension(
         self,
         fast: torch.Tensor,
@@ -288,8 +297,10 @@ class TorchAttractorLanguageModel(nn.Module):
         """Scalar tension T and components; logits are vocab logits for entropy term."""
         e = self._state_energy(fast)
         de = torch.abs(e - prev_energy)
-        cos_fs = F.cosine_similarity(fast.unsqueeze(0), slow.unsqueeze(0), dim=1).clamp(-1.0, 1.0)
-        div = 1.0 - cos_fs.squeeze(0)
+        fnf = torch.linalg.vector_norm(fast)
+        fns = torch.linalg.vector_norm(slow)
+        cos_fs = ((fast * slow).sum() / (fnf * fns + 1e-12)).clamp(-1.0, 1.0)
+        div = 1.0 - cos_fs
         probs = F.softmax(logits, dim=-1)
         H = -(probs * (probs.clamp(min=1e-9)).log()).sum(dim=-1)
         T = de + self.tension_lambda * div + self.tension_mu * H
@@ -331,12 +342,7 @@ class TorchAttractorLanguageModel(nn.Module):
         """Context-sensitive input: base embedding + gamma * normalized context; then unit-scale signal."""
         fast_state, slow_state = self._init_dual_state(fast_state, slow_state)
         self._fast_start_snapshot = fast_state.detach().clone()
-        device = fast_state.device
-        dtype = fast_state.dtype
-        emb = self.embedder(torch.tensor([token_id], device=device, dtype=torch.long))
-        emb = self.norm(emb)
-        n0 = torch.linalg.vector_norm(emb, dim=-1, keepdim=True).clamp(min=1e-12)
-        base_signal = (emb / n0).squeeze(0)
+        base_signal = self._normalized_token_embedding(token_id)
         if len(self._context_ring) >= 2:
             w = torch.sigmoid(self.agent_blend_weight)
             ring_mean = torch.stack(self._context_ring).mean(0)
@@ -377,7 +383,8 @@ class TorchAttractorLanguageModel(nn.Module):
         base = int(num_steps) if num_steps is not None else self.convergence_steps
         max_steps = self.max_convergence_steps
         prev_energy = self._state_energy(fast_state)
-        prev_fast = fast_state.detach()
+        brk = float(self.tension_break_thresh)
+        tol = float(self.tension_tol)
         i = 0
         while i < max_steps:
             prev_fast = fast_state.detach()
@@ -389,8 +396,9 @@ class TorchAttractorLanguageModel(nn.Module):
                 fast_state, slow_state, logits_t, prev_energy
             )
             prev_energy = self._state_energy(fast_state)
-            self._last_tension_val = float(T.detach())
-            if float(T.detach()) > float(self.tension_break_thresh):
+            t_item = T.detach().item()
+            self._last_tension_val = t_item
+            if t_item > brk:
                 fast_state = fast_state + 0.02 * torch.randn_like(fast_state)
                 nrm = torch.linalg.vector_norm(fast_state)
                 fast_state = fast_state / (nrm + 1e-8)
@@ -401,10 +409,10 @@ class TorchAttractorLanguageModel(nn.Module):
             if self.track_attractors:
                 print(
                     f"  [dyn] ||fast||={self._last_state_norm:.4f}  "
-                    f"||Δfast||={self._last_state_delta:.4f}  T={float(T.detach()):.4f}"
+                    f"||Δfast||={self._last_state_delta:.4f}  T={t_item:.4f}"
                 )
             i += 1
-            if i >= base and float(T.detach()) < float(self.tension_tol):
+            if i >= base and t_item < tol:
                 break
         slow_state = (1.0 - self.slow_decay) * slow_state + self.slow_lr * fast_state
         sn_slow = torch.linalg.vector_norm(slow_state)
@@ -459,8 +467,9 @@ class TorchAttractorLanguageModel(nn.Module):
     def encode_prompt(self, prompt: str):
         """Run dynamics on prompt tokens only; return (fast_state, slow_state)."""
         self.reset_readout_trajectory()
-        tokens = [w for w in prompt.lower().split() if w in self.vocab] or ["the"]
-        input_ids = [self.vocab.index(w) for w in tokens]
+        w2i = self._word_to_idx
+        tokens = [w for w in prompt.lower().split() if w in w2i] or ["the"]
+        input_ids = [w2i[w] for w in tokens]
         fast_state, slow_state = None, None
         for tid in input_ids:
             sig = self.get_signal(tid, fast_state, slow_state)
@@ -485,8 +494,9 @@ class TorchAttractorLanguageModel(nn.Module):
         print(f"[diversity] top-{top_k} raw counts: {[c for _, c in top]}")
 
     def generate(self, prompt: str, max_tokens=40, debug_track=False):
-        tokens = [w for w in prompt.lower().split() if w in self.vocab] or ["the"]
-        input_ids = [self.vocab.index(w) for w in tokens]
+        w2i = self._word_to_idx
+        tokens = [w for w in prompt.lower().split() if w in w2i] or ["the"]
+        input_ids = [w2i[w] for w in tokens]
 
         self.track_attractors = debug_track
         if debug_track:
@@ -506,12 +516,11 @@ class TorchAttractorLanguageModel(nn.Module):
             base_gen_temp = self.generation_temperature
             if torch.is_tensor(base_gen_temp):
                 base_gen_temp = float(base_gen_temp.detach())
+            tol_f = float(self.tension_tol)
             for _ in range(max_tokens):
                 logits = self.next_token_logits(fast_state, slow_state)
                 gen_temp = base_gen_temp * (
-                    1.0
-                    + GEN_TENSION_TEMP_SCALE
-                    * max(0.0, self._last_tension_val - float(self.tension_tol))
+                    1.0 + GEN_TENSION_TEMP_SCALE * max(0.0, self._last_tension_val - tol_f)
                 )
                 next_id = sample_next_token_id(
                     logits,
@@ -745,12 +754,13 @@ def build_dataset_from_sentences(
     model: TorchAttractorLanguageModel,
     window_size: int,
 ) -> list:
+    w2i = model._word_to_idx
     dataset = []
     for sentence in sentences:
-        words = [w for w in sentence.split() if w in model.vocab]
+        words = [w for w in sentence.split() if w in w2i]
         if len(words) < window_size + 1:
             continue
-        ids = [model.vocab.index(w) for w in words]
+        ids = [w2i[w] for w in words]
         dataset.extend(build_sequence_dataset(ids, window_size=window_size))
     return dataset
 
@@ -938,11 +948,12 @@ def main() -> None:
         training_sentences = list(train_sents * args.epoch_copies)
         random.shuffle(training_sentences)
         dataset = []
+        w2i = model._word_to_idx
         for sentence in training_sentences:
-            words = [w for w in sentence.split() if w in model.vocab]
+            words = [w for w in sentence.split() if w in w2i]
             if len(words) < WINDOW_SIZE + 1:
                 continue
-            ids = [model.vocab.index(w) for w in words]
+            ids = [w2i[w] for w in words]
             dataset.extend(build_sequence_dataset(ids, window_size=WINDOW_SIZE))
         random.shuffle(dataset)
 
@@ -981,7 +992,7 @@ def main() -> None:
             )
             entropy = -(probs_for_entropy * torch.log(probs_for_entropy + 1e-8)).sum()
             loss = loss_ce - ENTROPY_WEIGHT * entropy
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
             loss_sum += float(loss.detach())
@@ -997,6 +1008,7 @@ def main() -> None:
         # Same CE as val (no logit noise): comparable to val CE. mean_loss above is CE - ENTROPY_WEIGHT*H.
         train_ce = mean_cross_entropy_eval(model, dataset)
         val_msg = ""
+        vce: float | None = None
         if val_dataset:
             vce = mean_cross_entropy_eval(model, val_dataset)
             val_msg = f"  |  val CE={vce:.4f}"
@@ -1007,7 +1019,7 @@ def main() -> None:
         )
         last_mean_loss = mean_loss
         last_train_ce = train_ce
-        last_val_ce = float(vce) if val_dataset else None
+        last_val_ce = vce
         last_n_windows = n
         last_epoch_sec = ep_sec
         last_epoch_num = epoch + 1

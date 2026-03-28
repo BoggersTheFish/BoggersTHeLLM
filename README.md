@@ -58,6 +58,16 @@ On startup the script prints **corpus coverage**: how many lines are long enough
 
 This runs pre-training (epochs, sliding windows, progress lines), then sample generations, attractor debug, and prompt comparisons. Training is **CPU-heavy**; adjust epochs or corpus size if needed.
 
+## Performance notes
+
+The script is tuned for **CPU** research runs, not large-batch GPU training.
+
+- **Vocabulary lookup** uses an internal **`word → index` dict** (`O(1)` per token). Avoid `list.index` on the vocab list in hot paths (the bundled code does not).
+- **Single-token signals** use a direct **embedding row + LayerNorm** path instead of allocating a new index tensor every time.
+- **Tension** uses a compact **dot-product cosine** instead of `cosine_similarity` on stacked vectors.
+- **Optimizer** uses `zero_grad(set_to_none=True)` to reduce overhead per step.
+- **Threading**: for multi-core CPU matrix work you can set `OMP_NUM_THREADS` / `MKL_NUM_THREADS` in the environment (values depend on your machine; often matches physical cores).
+
 ## Main knobs (in `sandbox.py`)
 
 | Idea | Where |
