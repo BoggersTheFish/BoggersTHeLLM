@@ -123,8 +123,46 @@ FULL_VOCAB = sorted(set(BASE_VOCAB))
 print(f"Vocab size: {len(FULL_VOCAB)}")
 
 # Anti-collapse: trajectory drift in readout; entropy floor for sampling / training logits.
-DRIFT_MIN = 0.05
-ENTROPY_FLOOR = 2.5
+DRIFT_MIN = 0.008
+# Min entropy (nats) before extra logit noise; ~log(V) is max. Too low (e.g. 0.02) fires on every confident step.
+ENTROPY_FLOOR = 2.0
+# Training: lighter exploratory noise when floor triggers (large σ destroys the CE signal).
+ENTROPY_FLOOR_NOISE = 0.12
+TRAIN_LOGIT_NOISE = 0.005
+# Generation: top-k caps tail mass; repeat penalties reduce "effect effect" / same-token loops.
+GEN_TOP_K = 28
+GEN_REPEAT_LOGIT_PENALTY = 1.35
+# Extra penalty on the single most recent token (blocks immediate repeats harder).
+GEN_NO_REPEAT_LAST_EXTRA = 5.0
+# Training: bigram bias scale (too high pulls logits toward embedding self-similarity loops).
+BIGRAM_TRAIN_WEIGHT = 0.025
+LABEL_SMOOTHING = 0.06
+
+
+def sample_next_token_id(
+    logits: torch.Tensor,
+    temperature: float,
+    top_k: int,
+    recent_token_ids: list,
+    repeat_penalty: float,
+    no_repeat_last_extra: float,
+) -> int:
+    """Apply repetition penalty, optional top-k, temperature, multinomial sample."""
+    lo = logits.clone()
+    for tid in recent_token_ids[-4:]:
+        lo[tid] -= repeat_penalty
+    if recent_token_ids:
+        lo[recent_token_ids[-1]] -= no_repeat_last_extra
+    if top_k > 0 and top_k < lo.numel():
+        tk_logits, tk_idx = torch.topk(lo, top_k)
+        scaled = (tk_logits - tk_logits.max()) / temperature
+        probs = F.softmax(scaled, dim=-1)
+        j = torch.multinomial(probs, 1).item()
+        return int(tk_idx[j].item())
+    scaled = (lo - lo.max()) / temperature
+    probs = F.softmax(scaled, dim=-1)
+    return int(torch.multinomial(probs, 1).item())
+
 
 # ==================== FIXED TORCH MODEL (shape bugs corrected) ====================
 class TorchAttractorLanguageModel(nn.Module):
@@ -138,7 +176,7 @@ class TorchAttractorLanguageModel(nn.Module):
         w_fast=1.0,
         w_slow=0.3,
         gamma_init=0.2,
-        generation_temperature=0.8,
+        generation_temperature=1.02,
     ):
         super().__init__()
         self.vocab = vocab
@@ -161,6 +199,7 @@ class TorchAttractorLanguageModel(nn.Module):
         self.embedder = nn.Embedding(self.vocab_size, state_dim)
         self.norm = nn.LayerNorm(state_dim, elementwise_affine=False)
         self.readout = nn.Linear(self.state_dim, self.vocab_size, bias=False)
+        self.register_buffer("_vocab_ids", torch.arange(self.vocab_size, dtype=torch.long))
         # Unconstrained raw; effective temperature = softplus(raw) > 0 (learnable temp can hit 0 otherwise -> inf logits).
         t0 = 0.12
         self.temperature_raw = nn.Parameter(torch.tensor(math.log(math.exp(t0) - 1.0)))
@@ -213,9 +252,7 @@ class TorchAttractorLanguageModel(nn.Module):
     def all_signals(self, fast_state, slow_state):
         """All vocab signals in one batched pass (avoids 512× Python loop and duplicate graphs)."""
         fast_state, slow_state = self._init_dual_state(fast_state, slow_state)
-        device = fast_state.device
-        dtype = fast_state.dtype
-        ids = torch.arange(self.vocab_size, device=device, dtype=torch.long)
+        ids = self._vocab_ids.to(device=fast_state.device)
         emb = self.norm(self.embedder(ids))
         n0 = torch.linalg.vector_norm(emb, dim=-1, keepdim=True).clamp(min=1e-12)
         base_signals = emb / n0
@@ -236,7 +273,7 @@ class TorchAttractorLanguageModel(nn.Module):
         fast_state, slow_state = self._init_dual_state(fast_state, slow_state)
         n = num_steps if num_steps is not None else self.convergence_steps
         for _ in range(n):
-            prev_fast = fast_state.detach().clone()
+            prev_fast = fast_state.detach()
             fast_state = self.dynamics(fast_state, signal)
             self._last_state_norm = float(torch.linalg.vector_norm(fast_state.detach()))
             self._last_state_delta = float(torch.linalg.vector_norm((fast_state - prev_fast).detach()))
@@ -334,29 +371,29 @@ class TorchAttractorLanguageModel(nn.Module):
         self.eval()
         self.reset_readout_trajectory()
         fast_state, slow_state = None, None
-        with torch.no_grad():
+        with torch.inference_mode():
             for tid in input_ids:
                 sig = self.get_signal(tid, fast_state, slow_state)
                 fast_state, slow_state = self.evolve_token(fast_state, slow_state, sig)
 
             generated = tokens[:]
+            generated_ids = list(input_ids)
             gen_temp = self.generation_temperature
             if torch.is_tensor(gen_temp):
                 gen_temp = float(gen_temp.detach())
             for _ in range(max_tokens):
                 logits = self.next_token_logits(fast_state, slow_state)
-                probs_ent = F.softmax(logits, dim=-1)
-                entropy = -(probs_ent * torch.log(probs_ent + 1e-9)).sum()
-                if float(entropy.detach()) < ENTROPY_FLOOR:
-                    logits = logits + torch.randn_like(logits) * 0.5
-                logits = logits / gen_temp
-                logits = logits - logits.max()
-                probs = F.softmax(logits, dim=-1)
-                if not torch.isfinite(probs).all() or float(probs.sum()) <= 0:
-                    probs = torch.ones_like(probs) / self.vocab_size
-                next_id = torch.multinomial(probs, 1).item()
+                next_id = sample_next_token_id(
+                    logits,
+                    gen_temp,
+                    GEN_TOP_K,
+                    generated_ids,
+                    GEN_REPEAT_LOGIT_PENALTY,
+                    GEN_NO_REPEAT_LAST_EXTRA,
+                )
                 next_word = self.vocab[next_id]
                 generated.append(next_word)
+                generated_ids.append(next_id)
                 sig = self.get_signal(next_id, fast_state, slow_state)
                 fast_state, slow_state = self.evolve_token(fast_state, slow_state, sig)
 
@@ -422,7 +459,7 @@ def make_diffusion_matrix(dim):
 def compare_prompts(model: "TorchAttractorLanguageModel", prompt1: str, prompt2: str):
     """Encode two prompts and report distance between final weighted combined states (path dependence)."""
     model.eval()
-    with torch.no_grad():
+    with torch.inference_mode():
         f1, s1 = model.encode_prompt(prompt1)
         f2, s2 = model.encode_prompt(prompt2)
     c1 = model.combined_state(f1, s1)
@@ -499,31 +536,68 @@ def build_sequence_dataset(tokens, window_size=6):
 model = TorchAttractorLanguageModel(FULL_VOCAB)
 optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
 
-corpus_base = [
-    "the problem appears but the solution exists because the reason is clear therefore the system stays stable",
-    "mind understands the cause and the effect creates a stable system",
-    "the quick brown fox jumps over the lazy dog and then the pattern flows into the future",
-] * 20
-
-STRUCTURED_SENTENCES = [
-    "the system learns from patterns and predicts the future",
-    "cause and effect drive the evolution of stable systems",
-    "the mind builds structure through repeated interactions",
-    "a stable system resists change unless energy is applied",
-    "patterns emerge from the interaction of simple rules",
+corpus = [
+    "the quick brown fox jumps over the lazy dog",
+    "mind reason cause effect system pattern flow",
+    "a clear solution exists in the mind of reason",
+    "the dog runs through the system of cause and effect",
+    "reason creates a clear pattern in the mind",
+    "effect flows into cause and the system responds",
+    "the lazy dog understands the quick brown pattern",
+    "mind and reason together build the future effect",
+    "clear cause leads to strong system effect",
+    "the pattern of mind flows into clear reason",
+    "a system of reason creates powerful effect",
+    "the quick fox sees the pattern in the effect",
+    "lazy dog rests in the mind of the system",
+    "cause and effect dance inside the reason",
+    "clear mind produces strong pattern and flow",
+    "the brown fox jumps into the system of reason",
+    "effect creates new pattern in the lazy dog",
+    "reason flows through the mind like quick effect",
+    "the dog follows the clear path of cause",
+    "system and pattern exist inside every mind",
+    "quick brown thoughts jump over lazy doubt",
+    "reason builds the bridge between cause and effect",
+    "a clear solution appears in the system of mind",
+    "the fox and dog represent cause and effect",
+    "mind understands the pattern of every effect",
+    "strong reason creates lasting system change",
+    "the lazy pattern breaks when quick mind acts",
+    "cause flows naturally into clear effect",
+    "the system of reason holds every pattern",
+    "dog and fox move through the mind of effect",
+    "clear thinking produces strong cause and effect",
+    "reason exists inside the pattern of the system",
+    "the quick mind jumps over the lazy effect",
+    "brown fox discovers the system of pure reason",
+    "effect and cause create beautiful mind patterns",
+    "lazy dog learns the flow of clear reason",
+    "mind reason and system work as one pattern",
+    "the future effect lives inside present cause",
+    "clear solution emerges from deep system reason",
+    "pattern recognition happens in the mind of effect",
+    "the dog jumps when the system demands action",
+    "reason turns cause into powerful lasting effect",
+    "quick brown fox runs through fields of mind",
+    "every effect has its root in clear cause",
+    "the system reveals pattern to the ready mind",
+    "lazy thoughts dissolve in strong active reason",
+    "mind flows into reason and reason into effect",
+    "the pattern remains stable through every cause",
+    "clear effect shows the true nature of the system",
+    "the quick brown fox and lazy dog share one mind",
+    "cause meets effect inside the flow of reason",
 ]
 
-# Weight structured lines higher (duplicated) while keeping sentences intact; sliding windows are per sentence only.
-corpus = corpus_base + STRUCTURED_SENTENCES * 3
-
 WINDOW_SIZE = 6
-NUM_EPOCHS = 10
-ENTROPY_WEIGHT = 0.03  # subtracted from CE to reward higher prediction entropy (anti-collapse)
+NUM_EPOCHS = 25
+ENTROPY_WEIGHT = 0.03  # subtracted from CE; keep small vs CE scale or the objective chases flat distributions
 print(f"Pre-training ({NUM_EPOCHS} epochs, sliding window size={WINDOW_SIZE})...")
 t_train0 = time.perf_counter()
 for epoch in range(NUM_EPOCHS):
-    # Shuffle at sentence level only; each sentence is windowed in order before examples are pooled.
-    training_sentences = list(corpus)
+    # Shuffle at sentence level only; duplicate corpus for more windows per epoch without new text.
+    training_sentences = list(corpus * 2)
     random.shuffle(training_sentences)
     dataset = []
     for sentence in training_sentences:
@@ -549,22 +623,25 @@ for epoch in range(NUM_EPOCHS):
             fast_state, slow_state = model.evolve_token(fast_state, slow_state, sig)
         logits = model.next_token_logits(fast_state, slow_state)
         prev_id = context[-1]
-        logits = logits + 0.05 * torch.matmul(
+        logits = logits + BIGRAM_TRAIN_WEIGHT * torch.matmul(
             model.embedder.weight, model.embedder.weight[prev_id]
         )
-        last_token = context[-1]
-        logits[last_token] -= 2.0
+        logits[prev_id] -= 2.0
         for t in context[-3:]:
             logits[t] -= 1.0
-        logits = logits + 0.01 * torch.randn_like(logits)
+        logits = logits + TRAIN_LOGIT_NOISE * torch.randn_like(logits)
         probs_floor = F.softmax(logits, dim=-1)
         ent_s = -(probs_floor * torch.log(probs_floor + 1e-9)).sum()
         if float(ent_s.detach()) < ENTROPY_FLOOR:
-            logits = logits + torch.randn_like(logits) * 0.5
+            logits = logits + torch.randn_like(logits) * ENTROPY_FLOOR_NOISE
+            probs_for_entropy = F.softmax(logits, dim=-1)
+        else:
+            probs_for_entropy = probs_floor
         target = torch.tensor([target_id], device=logits.device, dtype=torch.long)
-        loss_ce = F.cross_entropy(logits.unsqueeze(0), target)
-        probs = F.softmax(logits, dim=-1)
-        entropy = -(probs * torch.log(probs + 1e-8)).sum()
+        loss_ce = F.cross_entropy(
+            logits.unsqueeze(0), target, label_smoothing=LABEL_SMOOTHING
+        )
+        entropy = -(probs_for_entropy * torch.log(probs_for_entropy + 1e-8)).sum()
         loss = loss_ce - ENTROPY_WEIGHT * entropy
         optimizer.zero_grad()
         loss.backward()

@@ -11,10 +11,20 @@ Repository: [github.com/BoggersTheFish/woke-baby-llm](https://github.com/Boggers
 - **Partial convergence** per token (several dynamics steps per symbol), so the system does not fully relax on every token.
 - **Dynamics** (stable): learned diffusion, **tanh**-bounded nonlinearity, **damping** on the state, **β-scaled** input signal, small Gaussian noise, then **unit normalization** of the fast state after each step.
 - **Decoding**: primary path is a **linear readout** from a **normalized combined state** (`w_fast·fast + w_slow·slow`, defaults include reduced slow weight). A **`next_token_logits_distance`** helper keeps the older distance-to-embedding baseline for experiments.
-- **Training**: **sliding-window** sequences (configurable window, e.g. 6 tokens of context → predict next), optional **repetition filtering** on windows, **sentence-level shuffling** plus structured lines in the corpus, **cross-entropy minus entropy bonus**, bigram-style and anti-repetition **logit shaping**, and **entropy floor** / trajectory **drift pressure** in the readout path to reduce attractor collapse.
-- **Generation**: sampling temperature, readout jitter, entropy floor, and optional **debug** attractor / diversity metrics plus **`compare_prompts()`** for trajectory distance between prompts.
+- **Training**: **sliding-window** sequences (default **6** tokens of context → predict next), **~50** short themed sentences in the corpus (duplicated and shuffled per epoch), **cross-entropy with label smoothing**, minus entropy bonus, **light bigram logit bias** on embeddings, **anti-repetition** logit shaping on the training context, and **entropy floor** (nats) when logits are too peaked.
+- **Generation**: **temperature** sampling, **top-k** truncation, **repetition penalties** on recent token ids (including an extra penalty on the immediate last token), optional **debug** attractor / diversity metrics, and **`compare_prompts()`** for trajectory distance between prompts.
 
 There is **no** attention, no transformer blocks, and no external model—only **`sandbox.py`** plus **`requirements.txt`**.
+
+## Limitations and what needs work
+
+This repo is a **research sandbox**, not a production language model.
+
+- **Data vs vocabulary**: The model is trained on **dozens of short sentences** against a **512-word** vocabulary. That is far too little signal for fluent text; the network tends toward **phrase-level templates** (“system / effect / mind / dog …”) even when decoding penalties remove **immediate** duplicate-token loops.
+- **Coherence**: Do not expect topic continuity, factual answers, or long-range syntax. Improvements here need **more and more varied training text**, **longer windows**, **more epochs or capacity**, and/or **different objectives**—not only stronger sampling penalties.
+- **Throughput**: The bundled script runs **on CPU** by default; **pre-training is slow** at full epoch counts. Reduce `NUM_EPOCHS` or corpus size while iterating.
+
+Contributions are welcome if you want to extend the experiment (data pipeline, evaluation, or architecture).
 
 ## Requirements
 
@@ -42,11 +52,12 @@ This runs bundled pre-training (epochs, sliding windows, progress lines), then s
 | Idea | Where |
 |------|--------|
 | Window length / epochs / entropy bonus | `WINDOW_SIZE`, `NUM_EPOCHS`, `ENTROPY_WEIGHT`, `ENTROPY_FLOOR`, `DRIFT_MIN` |
+| Training regularization | `LABEL_SMOOTHING`, `BIGRAM_TRAIN_WEIGHT`, `TRAIN_LOGIT_NOISE` |
+| Generation sampling | `GEN_TOP_K`, `GEN_REPEAT_LOGIT_PENALTY`, `GEN_NO_REPEAT_LAST_EXTRA`, `generation_temperature` (constructor arg) |
 | Slow memory | `slow_decay`, `slow_lr`; combined readout `w_fast`, `w_slow` |
 | Steps per token | `convergence_steps`; `step_token()` for one step |
 | Context in the signal | `gamma` (learnable) |
 | Dynamics | `beta`, `noise_scale`, `lambda_decay`, `signal_scale` in `SimpleAttractorDynamics` |
-| Sampling | `generation_temperature` |
 
 ## API sketch
 
