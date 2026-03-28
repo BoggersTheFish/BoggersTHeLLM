@@ -944,11 +944,11 @@ def main() -> None:
     last_n_windows = 0
     last_epoch_sec = 0.0
     last_epoch_num = 0
+    w2i = model._word_to_idx
     for epoch in range(NUM_EPOCHS):
         training_sentences = list(train_sents * args.epoch_copies)
         random.shuffle(training_sentences)
         dataset = []
-        w2i = model._word_to_idx
         for sentence in training_sentences:
             words = [w for w in sentence.split() if w in w2i]
             if len(words) < WINDOW_SIZE + 1:
