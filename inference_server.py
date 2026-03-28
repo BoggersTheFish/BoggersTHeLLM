@@ -150,7 +150,7 @@ def create_app(state: AppState) -> "FastAPI":
         raise ImportError("FastAPI and uvicorn are required: pip install fastapi uvicorn")
 
     app = FastAPI(
-        title="woke-baby-llm inference server",
+        title="idekatp inference server",
         description="Attractor LM inference via FastAPI (Wave G)",
         version="0.0.1",
     )
@@ -257,7 +257,7 @@ def create_app(state: AppState) -> "FastAPI":
 # --------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="woke-baby-llm inference server (Wave G)")
+    parser = argparse.ArgumentParser(description="idekatp inference server (Wave G)")
     parser.add_argument("--model-checkpoint", default=None, help="Path to .pt checkpoint file")
     parser.add_argument("--tokenizer", choices=("tiktoken", "fallback"), default="fallback")
     parser.add_argument("--vocab-cap", type=int, default=32768)

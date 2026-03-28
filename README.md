@@ -1,8 +1,8 @@
-# woke-baby-llm — Thinking System Language Substrate
+# idekatp — Thinking System Language Substrate
 
 A production-grade continuous attractor language model built without attention, transformers, or traditional LLM methods. State follows a physical **trajectory**; meaning is **path-dependent**. The architecture is driven by the **Propagate → Relax → Break → Evolve** cycle that powers the TS-OS.
 
-**Repository:** [github.com/BoggersTheFish/woke-baby-llm](https://github.com/BoggersTheFish/woke-baby-llm)
+**Repository:** [github.com/BoggersTheFish/idekatp](https://github.com/BoggersTheFish/idekatp)
 
 ---
 
@@ -80,8 +80,8 @@ The network contains only:
 - [PyTorch](https://pytorch.org/) (CPU or CUDA)
 
 ```bash
-git clone --recurse-submodules https://github.com/BoggersTheFish/woke-baby-llm.git
-cd woke-baby-llm
+git clone --recurse-submodules https://github.com/BoggersTheFish/idekatp.git
+cd idekatp
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -424,7 +424,7 @@ Use the same `--seed`, corpus, and hyperparameters; only add `--use-goat-memory`
 Clone with:
 
 ```bash
-git clone --recurse-submodules https://github.com/BoggersTheFish/woke-baby-llm.git
+git clone --recurse-submodules https://github.com/BoggersTheFish/idekatp.git
 ```
 
 If already cloned:
