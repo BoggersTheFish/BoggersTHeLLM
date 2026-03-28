@@ -1046,6 +1046,46 @@ def load_corpus(path: Path) -> list[str]:
     return out
 
 
+def load_corpus_text_stream(path: Path) -> str:
+    """
+    Load the full corpus as one string (no per-line tokenization).
+
+    Uses ``data_pipeline`` file discovery: single .txt is read whole; .jsonl
+    concatenates ``text`` / ``content`` / ``sentence`` fields; directories
+    merge all ``.txt`` / ``.jsonl`` files.
+    """
+    from data_pipeline import _collect_text_files, load_concatenated_corpus_text  # type: ignore[import]
+
+    files = _collect_text_files(path)
+    if not files:
+        raise FileNotFoundError(
+            f"No text files found for corpus path: {path}\n"
+            "Pass a .txt file, .jsonl file, or a directory of text/JSONL."
+        )
+    return load_concatenated_corpus_text(files)
+
+
+def split_tokens_train_val(
+    tokens: list[int],
+    val_fraction: float,
+    window_size: int,
+) -> tuple[list[int], list[int]]:
+    """
+    Split a token sequence into train / val at token boundaries.
+
+    Each side must be able to form at least one window (len >= window_size + 1),
+    or val is empty.
+    """
+    n = len(tokens)
+    min_need = window_size + 1
+    if val_fraction <= 0 or n < 2 * min_need:
+        return list(tokens), []
+    split_idx = int(n * (1 - val_fraction))
+    split_idx = max(min_need, split_idx)
+    split_idx = min(split_idx, n - min_need)
+    return tokens[:split_idx], tokens[split_idx:]
+
+
 def corpus_coverage_report(
     sentences: list[str],
     tokenizer,
@@ -1113,6 +1153,13 @@ def build_dataset_from_sentences(
             continue
         dataset.extend(build_sequence_dataset(ids, window_size=window_size))
     return dataset
+
+
+def build_dataset_from_token_ids(token_ids: list[int], window_size: int) -> list:
+    """Sliding-window (context, target) pairs from one continuous token sequence."""
+    if len(token_ids) < window_size + 1:
+        return []
+    return build_sequence_dataset(token_ids, window_size=window_size)
 
 
 @torch.no_grad()
@@ -1389,7 +1436,13 @@ def main() -> None:
     parser.add_argument("--batch-size", "--batch_size", type=int, default=None,
         dest="batch_size", help="Alias for --trajectory-batch-size.")
     parser.add_argument("--shuffle-buffer", type=int, default=2048,
-        help="AttractorDataPipeline shuffle buffer size.")
+        help="AttractorDataPipeline shuffle buffer size (line-based mode only).")
+    parser.add_argument(
+        "--no-streaming-dataset",
+        action="store_true",
+        help="Legacy: filter corpus line-by-line (short lines dropped). "
+        "Default is stream-based: whole corpus → one token sequence → sliding windows.",
+    )
     # ---- Phase 3: device ----
     parser.add_argument("--device", default="auto",
         help="'auto' | 'cpu' | 'cuda' | 'cuda:N'.")
@@ -1511,62 +1564,125 @@ def main() -> None:
     # ---- checkpoint dir ----
     ckpt_dir = args.checkpoint_dir or (_REPO_ROOT / "checkpoints")
 
-    # ---- Phase 2: data pipeline ----
-    sentences = load_corpus(corpus_path)
-    print(f"Loaded corpus: {corpus_path}  ({len(sentences)} lines)", flush=True)
-    corpus_coverage_report(sentences, tok, window_size)
+    # ---- Phase 2: data pipeline (stream-based by default) ----
+    streaming_dataset = not args.no_streaming_dataset
+    stream_train_ids: list[int] | None = None
+    train_sents: list[str] = []
+    _tmp_train_path: Path | None = None
 
-    usable = sentences_with_training_windows(sentences, tok, window_size)
-    if not usable:
-        raise RuntimeError(
-            "No corpus lines have enough tokens to form a training window. "
-            "Add more text or lower --window-size / --seq-len."
+    if streaming_dataset:
+        full_text = load_corpus_text_stream(corpus_path)
+        tokens = tok.encode(full_text)
+        need = window_size + 1
+        if len(tokens) < need:
+            raise RuntimeError(
+                "Corpus too small after tokenization: need at least "
+                f"{need} tokens for window_size={window_size}, got {len(tokens)}."
+            )
+        train_tok, val_tok = split_tokens_train_val(
+            tokens, args.val_fraction, window_size
         )
-    n_skip = len(sentences) - len(usable)
-    if n_skip:
+        if args.val_fraction > 0 and not val_tok:
+            print(
+                "Warning: token-level val split skipped (need ≥ 2×(window_size+1) tokens); "
+                "using all tokens for training.",
+                flush=True,
+            )
+        n_train_win = max(0, len(train_tok) - window_size)
+        n_val_win = max(0, len(val_tok) - window_size)
         print(
-            f"Training uses only {len(usable)} of {len(sentences)} lines "
-            f"({n_skip} too short for window_size={window_size}).",
+            f"Loaded corpus (stream): {corpus_path}",
             flush=True,
         )
-
-    train_sents, val_sents = train_val_split(usable, args.val_fraction, args.seed)
-    if val_sents:
         print(
-            f"Train/val split: {len(train_sents)} train, {len(val_sents)} val "
-            f"(fraction={args.val_fraction:g})",
+            f"  total_tokens={len(tokens)}  train_windows={n_train_win}  "
+            f"val_windows={n_val_win}  window_size={window_size}",
             flush=True,
         )
-    val_dataset = build_dataset_from_sentences(val_sents, model, window_size)
-    if val_sents and len(val_dataset) < 32:
-        print(
-            f"Warning: validation set tiny ({len(val_dataset)} windows); val CE is noisy.",
-            flush=True,
+        if val_tok:
+            print(
+                f"  train/val tokens: {len(train_tok)} / {len(val_tok)} "
+                f"(val_fraction={args.val_fraction:g})",
+                flush=True,
+            )
+        val_dataset = build_dataset_from_token_ids(val_tok, window_size)
+        if val_tok and len(val_dataset) < 32:
+            print(
+                f"Warning: validation set tiny ({len(val_dataset)} windows); val CE is noisy.",
+                flush=True,
+            )
+        stream_train_ids = train_tok * args.epoch_copies
+    else:
+        sentences = load_corpus(corpus_path)
+        print(f"Loaded corpus (line mode): {corpus_path}  ({len(sentences)} lines)", flush=True)
+        corpus_coverage_report(sentences, tok, window_size)
+
+        usable = sentences_with_training_windows(sentences, tok, window_size)
+        if not usable:
+            raise RuntimeError(
+                "No corpus lines have enough tokens to form a training window. "
+                "Add more text, lower --window-size, or remove --no-streaming-dataset "
+                "to use stream-based tokenization."
+            )
+        n_skip = len(sentences) - len(usable)
+        if n_skip:
+            print(
+                f"Training uses only {len(usable)} of {len(sentences)} lines "
+                f"({n_skip} too short for window_size={window_size}).",
+                flush=True,
+            )
+
+        train_sents, val_sents = train_val_split(usable, args.val_fraction, args.seed)
+        if val_sents:
+            print(
+                f"Train/val split: {len(train_sents)} train, {len(val_sents)} val "
+                f"(fraction={args.val_fraction:g})",
+                flush=True,
+            )
+        val_dataset = build_dataset_from_sentences(val_sents, model, window_size)
+        if val_sents and len(val_dataset) < 32:
+            print(
+                f"Warning: validation set tiny ({len(val_dataset)} windows); val CE is noisy.",
+                flush=True,
+            )
+
+        import tempfile as _tempfile
+
+        _tmp_f = _tempfile.NamedTemporaryFile(
+            mode="w", suffix=".txt", delete=False, encoding="utf-8"
         )
-
-    # Write training sentences to a temp file for AttractorDataPipeline.
-    import tempfile as _tempfile
-
-    _tmp_f = _tempfile.NamedTemporaryFile(
-        mode="w", suffix=".txt", delete=False, encoding="utf-8"
-    )
-    for _s in train_sents * args.epoch_copies:
-        _tmp_f.write(_s + "\n")
-    _tmp_f.close()
-    _tmp_train_path = Path(_tmp_f.name)
+        for _s in train_sents * args.epoch_copies:
+            _tmp_f.write(_s + "\n")
+        _tmp_f.close()
+        _tmp_train_path = Path(_tmp_f.name)
 
     pipeline = None
     try:
         from data_pipeline import AttractorDataPipeline  # type: ignore[import]
-        pipeline = AttractorDataPipeline(
-            sources=[_tmp_train_path],
-            model=model,
-            batch_size=traj_batch_size,
-            window_size=window_size,
-            shuffle_buffer=args.shuffle_buffer,
-            tokenizer=tok,
-            seed=args.seed,
-        )
+        if streaming_dataset:
+            pipeline = AttractorDataPipeline(
+                sources=[corpus_path],
+                model=model,
+                batch_size=traj_batch_size,
+                window_size=window_size,
+                shuffle_buffer=args.shuffle_buffer,
+                tokenizer=tok,
+                seed=args.seed,
+                streaming_dataset=True,
+                train_token_ids=stream_train_ids,
+            )
+        else:
+            assert _tmp_train_path is not None
+            pipeline = AttractorDataPipeline(
+                sources=[_tmp_train_path],
+                model=model,
+                batch_size=traj_batch_size,
+                window_size=window_size,
+                shuffle_buffer=args.shuffle_buffer,
+                tokenizer=tok,
+                seed=args.seed,
+                streaming_dataset=False,
+            )
     except Exception as _pipe_err:
         print(
             f"Warning: data pipeline unavailable ({_pipe_err}), "
@@ -1615,14 +1731,18 @@ def main() -> None:
             report_every = max(1, n_est // 10)
         else:
             # Legacy in-memory fallback (keeps working if data_pipeline unavailable).
-            training_sentences = list(train_sents * args.epoch_copies)
-            random.shuffle(training_sentences)
             legacy_dataset: list = []
-            for _s in training_sentences:
-                _ids = tok.encode(_s)
-                if len(_ids) >= window_size + 1:
-                    legacy_dataset.extend(build_sequence_dataset(_ids, window_size))
-            random.shuffle(legacy_dataset)
+            if stream_train_ids is not None:
+                legacy_dataset = build_sequence_dataset(stream_train_ids, window_size)
+                random.shuffle(legacy_dataset)
+            else:
+                training_sentences = list(train_sents * args.epoch_copies)
+                random.shuffle(training_sentences)
+                for _s in training_sentences:
+                    _ids = tok.encode(_s)
+                    if len(_ids) >= window_size + 1:
+                        legacy_dataset.extend(build_sequence_dataset(_ids, window_size))
+                random.shuffle(legacy_dataset)
             _bs = max(2, traj_batch_size)
 
             def _legacy_batch_iter():
@@ -1923,11 +2043,12 @@ def main() -> None:
         last_epoch_sec = ep_sec
         last_epoch_num = epoch + 1
 
-    # Clean up temp file
-    try:
-        os.unlink(_tmp_train_path)
-    except OSError:
-        pass
+    # Clean up temp file (line-based mode only)
+    if _tmp_train_path is not None:
+        try:
+            os.unlink(_tmp_train_path)
+        except OSError:
+            pass
 
     train_sec_total = time.perf_counter() - t_train0
     print(f"Pre-training done in {train_sec_total:.1f}s total.", flush=True)

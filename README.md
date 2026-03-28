@@ -206,17 +206,19 @@ text = generate_with_cache(model, cache, prompt="the cat sat", max_tokens=30)
 
 ### Wave D — Data pipeline
 
-`data_pipeline.py` replaces the in-memory shuffle with a streaming loader:
+`data_pipeline.py` feeds training with **stream-based tokenization by default** (no dependence on individual lines being long enough):
 
-- Accepts lists of `.txt` / `.jsonl` files or directories; parses JSONL `{"text": "..."}` automatically
-- Sliding-window `(context, target)` pair builder on token id streams
-- Shuffle buffer (in-memory random shuffle of `shuffle_buffer` pairs)
+- **Stream mode (default):** the corpus is read as **full text** (whole `.txt` files; `.jsonl` records concatenated), then `tokenizer.encode(full_text)` produces **one continuous token sequence**. Sliding windows `(context, target)` use `tokens[i : i+W]` → target `tokens[i+W]`. Each epoch shuffles all window start indices, then batches.
+- **`train_token_ids=`** — sandbox passes the train split after **token-level** train/val cut; validation windows are built separately in `sandbox.py`.
+- **Legacy line mode:** `streaming_dataset=False` keeps per-line encoding (short lines dropped); `shuffle_buffer` refills between batch groups.
 - Multi-shard round-robin (`shard_id` / `num_shards`) for data-parallel workers
-- `epoch_batches()` yields `(contexts, targets)` directly compatible with `trajectory_contrastive_loss_and_logits`
+- Too few tokens (`len < window_size + 1`) raises a clear **“Corpus too small after tokenization”** error.
 
 ```python
 from data_pipeline import AttractorDataPipeline
-pipe = AttractorDataPipeline(sources=["data/corpus.txt"], model=model, batch_size=16)
+pipe = AttractorDataPipeline(
+    sources=["data/corpus.txt"], model=model, batch_size=16, streaming_dataset=True
+)
 for contexts, targets in pipe.epoch_batches():
     loss, _ = model.trajectory_contrastive_loss_and_logits(contexts, targets)
 ```
@@ -378,7 +380,8 @@ Data & tokenizer:
   --vocab-cap INT            Max BPE vocab when using tiktoken mode (default: 32768)
   --seq-len INT              Alias for --window-size
   --batch-size INT           Alias for --trajectory-batch-size
-  --shuffle-buffer INT       Pipeline shuffle buffer (default: 2048)
+  --shuffle-buffer INT       Pipeline shuffle buffer (line-based mode only; default: 2048)
+  --no-streaming-dataset     Legacy line-based corpus (short lines dropped). Default: stream whole file as tokens.
 
 Training:
   --window-size INT          Context window W (default: 6)

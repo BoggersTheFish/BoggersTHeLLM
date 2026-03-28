@@ -99,6 +99,29 @@ def _iter_lines(path: Path) -> Generator[str, None, None]:
                 yield line
 
 
+def _load_full_text_from_file(path: Path) -> str:
+    """
+    Load entire file as one string (no per-line tokenization).
+
+    - .txt / .md / plain: raw read (newlines preserved).
+    - .jsonl: concatenate extracted text fields, newline-separated.
+    """
+    if path.suffix == ".jsonl":
+        parts: list[str] = []
+        for line in _iter_lines(path):
+            parts.append(line)
+        return "\n".join(parts)
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
+def load_concatenated_corpus_text(files: list[Path]) -> str:
+    """Concatenate all shard files into one corpus string (blank line between files)."""
+    chunks: list[str] = []
+    for path in files:
+        chunks.append(_load_full_text_from_file(path))
+    return "\n\n".join(chunks)
+
+
 # --------------------------------------------------------------------------
 # Sliding-window pair builder
 # --------------------------------------------------------------------------
@@ -126,8 +149,12 @@ class AttractorDataPipeline:
     model : TorchAttractorLanguageModel — provides vocab + window_size
     batch_size : mini-batch width (≥ 2 for trajectory contrastive loss)
     window_size : overrides model.train_window_size when set
-    shuffle_buffer : number of windows to hold in memory for in-batch shuffle
+    shuffle_buffer : (line mode only) pairs held for shuffle between refills
     tokenizer : optional; if None, uses the model word list
+    streaming_dataset : if True (default), corpus is one continuous token stream
+        (full-file read + encode); ignores line boundaries for windowing.
+    train_token_ids : optional pre-tokenized train split; if set, ``sources``
+        are not read for training windows (useful when sandbox splits tokens).
     shard_id / num_shards : for multi-worker data parallelism (each worker
         receives every num_shards-th file starting from shard_id)
     seed : random seed for shuffle
@@ -141,6 +168,8 @@ class AttractorDataPipeline:
         window_size: Optional[int] = None,
         shuffle_buffer: int = 1024,
         tokenizer: Optional[object] = None,
+        streaming_dataset: bool = True,
+        train_token_ids: Optional[list[int]] = None,
         shard_id: int = 0,
         num_shards: int = 1,
         seed: int = 42,
@@ -150,6 +179,7 @@ class AttractorDataPipeline:
         self.window_size = window_size or model.train_window_size
         self.shuffle_buffer = shuffle_buffer
         self.tokenizer = tokenizer or _WordListTokenizer(model)
+        self.streaming_dataset = streaming_dataset
         self.shard_id = shard_id
         self.num_shards = num_shards
         self.seed = seed
@@ -161,21 +191,53 @@ class AttractorDataPipeline:
         self.files: list[Path] = [
             f for i, f in enumerate(all_files) if i % num_shards == shard_id
         ]
-        if not self.files:
-            raise ValueError(
-                f"No text files found under sources={sources} for "
-                f"shard_id={shard_id}/{num_shards}"
-            )
+
+        self._stream_tokens: Optional[list[int]] = None
+        self._line_mode = False
+
+        if train_token_ids is not None:
+            self._stream_tokens = list(train_token_ids)
+            self._line_mode = False
+        elif streaming_dataset:
+            if not self.files:
+                raise ValueError(
+                    f"No text files found under sources={sources} for "
+                    f"shard_id={shard_id}/{num_shards}"
+                )
+            full_text = load_concatenated_corpus_text(self.files)
+            self._stream_tokens = self.tokenizer.encode(full_text)
+            self._line_mode = False
+        else:
+            if not self.files:
+                raise ValueError(
+                    f"No text files found under sources={sources} for "
+                    f"shard_id={shard_id}/{num_shards}"
+                )
+            self._line_mode = True
+
+        if self._stream_tokens is not None:
+            need = self.window_size + 1
+            if len(self._stream_tokens) < need:
+                raise ValueError(
+                    "Corpus too small after tokenization: need at least "
+                    f"{need} tokens for window_size={self.window_size}, "
+                    f"got {len(self._stream_tokens)}."
+                )
 
     # ------------------------------------------------------------------
+    def _num_stream_windows(self) -> int:
+        assert self._stream_tokens is not None
+        return max(0, len(self._stream_tokens) - self.window_size)
+
     def _window_stream(self) -> Generator[tuple[list[int], int], None, None]:
-        """Yield (context, target) pairs by streaming all shard files."""
+        """Line-based mode: yield (context, target) pairs by streaming lines."""
+        W = self.window_size
         for path in self.files:
             for line in _iter_lines(path):
                 ids = self.tokenizer.encode(line)
-                if len(ids) < self.window_size + 1:
+                if len(ids) < W + 1:
                     continue
-                for pair in _make_windows(ids, self.window_size):
+                for pair in _make_windows(ids, W):
                     yield pair
 
     def epoch_batches(
@@ -184,9 +246,13 @@ class AttractorDataPipeline:
         """
         Yield (contexts, targets) mini-batches for one epoch.
 
-        Uses a shuffle buffer: fills `shuffle_buffer` pairs, shuffles, then
-        yields batches until the buffer is below batch_size, then refills.
+        Stream mode: shuffles window start indices each epoch, then batches.
+        Line mode: shuffle-buffer refill over the line stream (legacy).
         """
+        if self._stream_tokens is not None:
+            yield from self._epoch_batches_stream()
+            return
+
         rng = random.Random(self.seed)
         buf: deque[tuple[list[int], int]] = deque()
         stream = self._window_stream()
@@ -200,7 +266,6 @@ class AttractorDataPipeline:
                     return True
             return False
 
-        # Prime the buffer
         _fill(self.shuffle_buffer)
         buf_list = list(buf)
         buf.clear()
@@ -210,7 +275,6 @@ class AttractorDataPipeline:
             for i in range(0, len(buf_list), self.batch_size):
                 chunk = buf_list[i : i + self.batch_size]
                 if len(chunk) < 2:
-                    # Pad to minimum batch size
                     chunk = chunk * 2
                 contexts = [c for c, _t in chunk]
                 targets = [_t for _c, _t in chunk]
@@ -221,15 +285,39 @@ class AttractorDataPipeline:
             buf_list = list(buf)
             buf.clear()
 
+    def _epoch_batches_stream(self) -> Generator[tuple[list[list[int]], list[int]], None, None]:
+        """One full pass over all sliding windows with shuffled order."""
+        rng = random.Random(self.seed)
+        toks = self._stream_tokens
+        assert toks is not None
+        W = self.window_size
+        n_win = len(toks) - W
+        if n_win <= 0:
+            return
+        idxs = list(range(n_win))
+        rng.shuffle(idxs)
+        bs = self.batch_size
+        for i in range(0, len(idxs), bs):
+            batch_i = idxs[i : i + bs]
+            contexts = [toks[j : j + W] for j in batch_i]
+            targets = [toks[j + W] for j in batch_i]
+            if len(contexts) < 2:
+                contexts = contexts * 2
+                targets = targets * 2
+            yield contexts, targets
+
     def epoch_count_estimate(self) -> int:
-        """Estimate number of batches per epoch (single pass, no refill)."""
+        """Approximate batches per epoch."""
+        if self._stream_tokens is not None:
+            n_win = self._num_stream_windows()
+            return max(1, (n_win + self.batch_size - 1) // self.batch_size)
         total = 0
         for path in self.files:
             for line in _iter_lines(path):
                 ids = self.tokenizer.encode(line)
                 if len(ids) >= self.window_size + 1:
                     total += max(0, len(ids) - self.window_size)
-        return max(0, total // self.batch_size)
+        return max(1, max(0, total) // self.batch_size)
 
 
 # --------------------------------------------------------------------------

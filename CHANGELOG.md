@@ -7,6 +7,14 @@ The project is documented as **BoggersTheLanguageModel**; canonical source is [g
 
 ---
 
+## Data — Stream corpus (Mar 2026)
+
+- **Default training path:** entire corpus file(s) → one token stream → sliding windows; line boundaries no longer gate training.
+- **Validation:** token-level split (`train_tokens` / `val_tokens`); `build_dataset_from_token_ids` for val windows.
+- **`AttractorDataPipeline`:** `streaming_dataset=True` (default), optional `train_token_ids` from sandbox; `epoch_batches` shuffles window indices per epoch.
+- **`--no-streaming-dataset`:** restores legacy per-line filtering.
+- Logging: `total_tokens`, `train_windows`, `val_windows` instead of “usable lines”.
+
 ## Phase 0 — Substrate Initialisation (Mar 2026)
 
 - Synced workspace to `origin/main`; tagged `phase-0-baseline`

@@ -47,23 +47,30 @@ model.eval()
 
 W = model.train_window_size
 
-# Tiny corpus: sentences from data/corpus.txt or fallback
+# Corpus: full-file stream (same as training default), else line-based fallback
 corpus_path = REPO / "data" / "corpus.txt"
-sentences = sb.load_corpus(corpus_path) if corpus_path.is_file() else sb._FALLBACK_SENTENCES
-print(f"[smoke] corpus lines: {len(sentences)}", flush=True)
-
-# Filter to sentences that yield at least one training window
-usable = sb.sentences_with_training_windows(sentences, tok, W)
-assert usable, "No usable training windows in corpus — check tokenization."
-print(f"[smoke] usable sentences: {len(usable)}", flush=True)
+full_stream: list[int] = []
+if corpus_path.is_file():
+    try:
+        full_stream = tok.encode(sb.load_corpus_text_stream(corpus_path))
+        print(f"[smoke] corpus stream tokens: {len(full_stream)}", flush=True)
+    except OSError:
+        pass
+if len(full_stream) >= W + 1:
+    window_source_ids = full_stream
+else:
+    sentences = sb.load_corpus(corpus_path) if corpus_path.is_file() else sb._FALLBACK_SENTENCES
+    print(f"[smoke] corpus lines: {len(sentences)} (stream too short)", flush=True)
+    usable = sb.sentences_with_training_windows(sentences, tok, W)
+    assert usable, "No usable training windows in corpus — check tokenization."
+    print(f"[smoke] usable sentences: {len(usable)}", flush=True)
+    window_source_ids = tok.encode(usable[0])
+assert len(window_source_ids) >= W + 1, "Corpus too short for window after tokenization."
 
 # --------------------------------------------------------------------------
 # 3. One wave cycle: single forward pass through run_window_dynamics
 # --------------------------------------------------------------------------
-ids = tok.encode(usable[0])
-assert len(ids) >= W + 1, "First usable sentence too short after tokenization."
-
-window_ids = model.window_ids_from_sequence(ids)
+window_ids = model.window_ids_from_sequence(window_source_ids)
 S0 = model.embed_window(window_ids)
 
 print("[smoke] running window dynamics ...", flush=True)
@@ -97,7 +104,12 @@ print(f"[smoke] tension below ceiling {SMOKE_TENSION_CEILING:.4f} ✓", flush=Tr
 # --------------------------------------------------------------------------
 model.train()
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-dataset = sb.build_dataset_from_sentences(usable[:10], model, window_size=W)
+if len(full_stream) >= W + 1:
+    dataset = sb.build_dataset_from_token_ids(full_stream, window_size=W)[:64]
+else:
+    sentences = sb.load_corpus(corpus_path) if corpus_path.is_file() else sb._FALLBACK_SENTENCES
+    usable = sb.sentences_with_training_windows(sentences, tok, W)
+    dataset = sb.build_dataset_from_sentences(usable[:10], model, window_size=W)
 if len(dataset) >= 2:
     batch = dataset[:2]
     # dataset items are (context: list[int], target_id: int)
