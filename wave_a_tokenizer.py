@@ -86,20 +86,14 @@ def make_vocab_and_tokenizer(
     )
 
     if tok.uses_tiktoken:
-        # Build a vocab list: integer range as string tokens (e.g. "0", "1", …)
-        # for API compatibility with TorchAttractorLanguageModel(vocab=list[str]).
-        # The actual decoding is done via tok.decode(); the string labels are
-        # only used for display / corpus-coverage reporting.
         vocab_list = [str(i) for i in range(tok.n_vocab)]
         mode = TokenizerMode.TIKTOKEN
     else:
-        # Word-list mode: fall back to provided or sandbox FULL_VOCAB
+        # Word-list mode: use provided fallback_vocab or generate numeric labels.
         if fallback_vocab is not None:
             vocab_list = list(fallback_vocab)
         else:
-            _import_sandbox_vocab()
-            import sandbox as _sb  # type: ignore[import]
-            vocab_list = list(_sb.FULL_VOCAB)
+            vocab_list = [str(i) for i in range(tok.n_vocab or 512)]
         mode = TokenizerMode.WORDLIST
         tok._words = vocab_list
         tok._word2id = {w: i for i, w in enumerate(vocab_list)}

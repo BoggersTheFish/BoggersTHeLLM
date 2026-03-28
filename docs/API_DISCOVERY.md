@@ -5,6 +5,18 @@ Last verified: March 2026.
 
 ---
 
+## This repository — `sandbox.py` integration surface
+
+| Entry | Role |
+|-------|------|
+| `_build_tokenizer(mode, vocab_cap)` | Loads `AttractorTokenizer` from `vendor/ts-llm` (`tiktoken` or `fallback` cap). |
+| `TorchAttractorLanguageModel(vocab_size, …)` | Core model; set `model.tokenizer` for encode/decode in training and generation. |
+| `run_window_dynamics(..., context_ids=…)` | Window loop; GOAT bonuses use `context_ids` when `--use-goat-memory` is enabled. |
+| `model.dynamics.step(S, signal)` | Unified step API on **`SimpleAttractorDynamics`** or **`VectorizedWindowDynamics`** (`--dynamics vectorized`). |
+| `AttractorDataPipeline` (`data_pipeline.py`) | Streaming train batches when import succeeds; else legacy in-memory shuffle. |
+
+---
+
 ## GOAT-TS
 
 Python-only. Import root: `vendor/GOAT-TS/src/`.

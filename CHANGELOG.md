@@ -64,3 +64,12 @@ Format: [Wave / Phase] — description — date.
 - `run_wave_cycle()`: feeds language batches into TSCore, runs 11-tick `run_until_stable()`
 - Phase 0 results (untrained model): TSCore tension 0.149 → 0.0005 after 11 ticks; 5 Evolve events
 - Results written to `eval_results.json`
+- CLI prefers `--max-ticks`; `--wave-cycles` kept as a deprecated alias
+
+## Integration hardening — training / dynamics / metrics (Mar 2026)
+
+- **GOAT memory:** `activation_bonus` is injected in `_single_window_step` as a per-position `(B, W, D)` signal during window dynamics (not only the legacy `get_signal` path).
+- **Dynamics swap:** `SimpleAttractorDynamics` and `VectorizedWindowDynamics` both implement **`step(S, signal)`**; training no longer reaches into `dyn.diffusion` / `dyn.dt` on the model object.
+- **Metrics:** `train_ce` in epoch CSV is the mean **training-batch** CE from `readout_window` logits; `val_ce` is held-out eval. **`val_traj_contrast`** is computed on the validation split; **`train_traj_contrast`** is a last-batch trajectory snapshot.
+- **TSCore logging:** With `--use-substrate`, each epoch prints evolve delta, `last_ts_tension`, active/idle batch counts; one warning if the substrate never engaged. CSV gains **`tscore_evolves`** and **`tscore_last_tension`**.
+- **Docs:** README and this changelog updated to match the above.

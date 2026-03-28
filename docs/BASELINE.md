@@ -33,11 +33,13 @@ Phase 0 locks a **reproducible reference** before scaling data, windows, or mode
 
 | Metric | Meaning |
 |--------|--------|
-| **train_CE** (last epoch) | Cross-entropy from readout on training windows, eval-style. Compare across runs. |
-| **val_CE** (last epoch) | Held-out lines. **Ignore absolute value** when the validation split is tiny (e.g. 2 lines); use trend after scale-up. |
-| **mean_loss** (last epoch) | With `--loss-mode trajectory` (default): training step objective (trajectory contrastive + optional aux CE), **not** `CE − entropy`. |
-| **train_traj_contrast** / **val_traj_contrast** | Mean trajectory contrastive term; auxiliary signal for geometry. |
-| **mean_final_T** | Mean window tension at the **last** adaptive dynamics step each epoch—track drift vs epoch via `--epoch-metrics-csv`. |
+| **train_ce** (CSV / log) | Mean **per-batch** CE on `readout_window` logits vs targets during training (trajectory mode). **Not** the same as `val_ce`. |
+| **val_ce** (CSV / log) | Held-out **`mean_cross_entropy_eval`**. **Ignore absolute value** when the val set is tiny; use trend after scale-up. **Val PPL** ≈ `exp(val_ce)`. |
+| **mean_loss** (last epoch) | With `--loss-mode trajectory` (default): full step objective (trajectory contrastive + token aux CE + readout aux weights). |
+| **train_traj_contrast** | Trajectory contrastive loss on the **last training batch** of the epoch (diagnostic). |
+| **val_traj_contrast** | Mean trajectory contrastive loss over the **full validation** set (when val exists). |
+| **mean_final_T** | Mean window tension at the **last** adaptive dynamics step each epoch—track drift via `--epoch-metrics-csv`. |
+| **tscore_evolves** / **tscore_last_tension** | With `--use-substrate`: per-epoch evolve delta and last TSCore tension. |
 
 Architecture changes will change absolute numbers—re-record baseline after major `sandbox.py` updates.
 
@@ -45,7 +47,7 @@ Architecture changes will change absolute numbers—re-record baseline after maj
 
 Treat a change as **successful for v1** when **both** hold:
 
-1. **Calibration:** **val_CE** is **lower than this baseline** (same seed/split settings), or at least not worse while **train_CE** improves — i.e. no clear collapse to memorized noise. Only meaningful once the val set has **enough windows**.
+1. **Calibration:** **val_ce** is **lower than this baseline** (same seed/split settings), or at least not worse while **train_ce** improves — i.e. no clear collapse to memorized noise. Only meaningful once the val set has **enough windows**.
 2. **Subjective quality:** On the **three fixed prompts**, text shows **less pointless repetition** than the baseline generations, without becoming random gibberish.
 
 Optional: note wall time and epoch count if you change data size or model size.

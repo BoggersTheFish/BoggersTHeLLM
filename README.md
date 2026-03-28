@@ -19,7 +19,9 @@ Corpus / Token stream
 │         │                                               │
 │         ▼                                               │
 │  run_window_dynamics()  ← tension-adaptive Euler loop   │
-│    ┌─ step_state_batch  (diffusion + tanh + damping)    │
+│    ┌─ positional coupling + dynamics.step(S, signal)    │
+│    │     (SimpleAttractorDynamics or VectorizedWindow)  │
+│    ├─ optional GOAT activation_bonus → per-position signal│
 │    ├─ compute_window_tension  (geometry or entropy)     │
 │    └─ early-exit / noise / break on tension threshold   │
 │         │                                               │
@@ -52,7 +54,7 @@ The network contains only:
 |---|---|---|
 | `sandbox.py` | Phase 0 | Single-file reference model: training, generation, all dynamics |
 | `smoke_test.py` | Phase 0 | 5-assertion integration test (dynamics + TSCore wave cycle) |
-| `wave_a_tokenizer.py` | A | tiktoken BPE tokenizer (32k+ vocab) with word-list fallback |
+| `wave_a_tokenizer.py` | A | tiktoken BPE helpers; training uses `sandbox._build_tokenizer()` |
 | `dynamics_vectorized.py` | B | Vectorized `MultiHeadDynamics` window step; `torch.compile` wrapper |
 | `state_cache.py` | C | Rolling attractor state cache — O(1) per token at inference |
 | `data_pipeline.py` | D | Streaming sharded DataLoader (txt / JSONL, multi-worker) |
@@ -113,8 +115,10 @@ python smoke_test.py
 ### Run the evaluation harness
 
 ```bash
-python eval_harness.py --val-fraction 0.2 --wave-cycles 11 --output eval_results.json
+python eval_harness.py --val-fraction 0.2 --max-ticks 11 --output eval_results.json
 ```
+
+(`--wave-cycles` is a deprecated alias for `--max-ticks`.)
 
 ### Start the inference server
 
@@ -153,29 +157,32 @@ Endpoints:
 
 ### Wave A — Tokenizer
 
-`wave_a_tokenizer.py` replaces the hard-coded `_VOCAB_BLOB` with:
+Training and inference use **`sandbox._build_tokenizer(mode, vocab_cap)`**, which loads `AttractorTokenizer` from `vendor/ts-llm`:
 
-- **tiktoken BPE** (default: gpt2 encoding, `vocab_cap=32768`) — real subword tokens
-- **Word-list fallback** (offline, deterministic) — uses existing `FULL_VOCAB`
-- `recommended_state_dim(vocab_cap)` — scaling table: 512→512, 32k→2048, 64k→4096
-- `encode_corpus(sentences, tok)` — lazy encoding for the data pipeline
+- **`--tokenizer tiktoken`** — gpt2 BPE up to `--vocab-cap` (default 32768)
+- **`--tokenizer fallback`** — same BPE, vocab capped at 512 for fast iteration
+
+The model is constructed with **`vocab_size = tok.n_vocab`**; `model.tokenizer` is set for `encode` / `decode`. `sandbox.FULL_VOCAB` remains an empty legacy shim for old imports.
+
+`wave_a_tokenizer.py` still exposes `make_vocab_and_tokenizer()` for scripts that want a standalone helper.
 
 ```python
-from wave_a_tokenizer import make_vocab_and_tokenizer
-vocab_list, tok = make_vocab_and_tokenizer(vocab_cap=32768)
-ids = tok.encode("the quick brown fox")
-text = tok.decode(ids)
+import sandbox as sb
+tok = sb._build_tokenizer("tiktoken", 32768)
+model = sb.TorchAttractorLanguageModel(tok.n_vocab, train_window_size=6)
+model.tokenizer = tok
 ```
 
 ### Wave B — Vectorized dynamics
 
-`dynamics_vectorized.py` provides `VectorizedWindowDynamics` — a drop-in for `model.run_window_dynamics()`:
+`dynamics_vectorized.py` provides `VectorizedWindowDynamics`, swappable with **`--dynamics vectorized`** (replaces `model.dynamics` after construction).
+
+Both **`SimpleAttractorDynamics`** and **`VectorizedWindowDynamics`** implement the same **`step(S, signal) → S`** interface used inside `_single_window_step` (positional coupling first, then one dynamics step with the optional GOAT signal tensor).
 
 - Wraps `MultiHeadDynamics` from `vendor/ts-llm` (low-rank diffusion per head + cross-head coupling)
-- Reshapes `(B, W, D)` → `(B·W, D)` for a single batched matrix multiply per step — no Python loop
+- `run_window_dynamics_vectorized(S, model, vec_dyn)` remains available for alternate call sites
 - `torch.compile` wrapper via `get_compiled()` (cached by shape key)
-- `run_window_dynamics_vectorized(S, model, vec_dyn)` writes to `model._last_window_tension_curve` for API compatibility
-- Parity tests confirm both paths produce finite outputs; cosine similarity reported (different equations → intentional divergence)
+- Parity tests: both paths produce finite outputs; equations differ by design
 
 ### Wave C — State cache
 
@@ -215,9 +222,10 @@ for contexts, targets in pipe.epoch_batches():
 `llm_substrate_node.py` closes the language → TS-OS feedback loop:
 
 - Registers `"llm_substrate"` as a native node in `TSCore` with an edge from `"ts_native"`
-- `on_batch(model)` — reads `_last_window_tension_curve`, normalises to `[0,1]`, pushes to node activation, calls `ts.propagate_wave()`
+- `on_batch(model)` — reads `_last_window_tension_curve`, normalises to `[0,1]`, pushes to node activation, calls `ts.propagate_wave()` (skips when language tension is below `high_tension_threshold`)
 - When TSCore tension exceeds `evolve_threshold`, calls `ts.factory_evolve()` (appends a stability node — self-improvement tick)
 - Optional HTTP POST to `LLM_HOOK_URL` (BoggersTheAI Evolve endpoint) — fire-and-forget, never blocks training
+- With **`--use-substrate`**, each epoch logs **`evolves`**, **`last_ts_tension`**, and active vs idle batch counts; if TSCore never fired (all batches below threshold), a **single** per-epoch warning is printed. The same substrate fields are appended to **`--epoch-metrics-csv`** as `tscore_evolves` and `tscore_last_tension`.
 
 ```python
 from llm_substrate_node import LLMSubstrateNode
@@ -228,12 +236,12 @@ substrate.on_batch(model)
 
 ### Wave F — GOAT-TS memory transitions
 
-`goat_memory_transitions.py` wires GOAT-TS `memory_manager` into per-token activation tracking:
+`goat_memory_transitions.py` wires GOAT-TS-style per-token memory into training when you pass **`--use-goat-memory`**:
 
-- One `Node(activation, state: MemoryState)` per vocabulary token
-- `tick(contexts)` — boosts usage-proportional activation for seen tokens, then applies exponential decay + ACTIVE / DORMANT / DEEP state transitions
-- `activation_bonus(token_id)` — returns a `[0, bonus_scale]` float for ACTIVE tokens (signal injection boost)
-- `sweep_config()` — returns tunable knobs (`decay_rate`, `active_threshold`, `dormant_threshold`, `ticks_to_deep`, `bonus_scale`) for automated Wave F hyperparameter sweeps
+- One `Node` per vocabulary index (`vocab_size`); labels are string token IDs
+- After each batch, `GoatMemoryManager.tick(contexts)` updates activations and ACTIVE / DORMANT / DEEP transitions
+- During **window dynamics**, `_single_window_step` builds a `(B, W, D)` signal from **`activation_bonus(token_id)`** at each position (broadcast across `D`), so GOAT affects the actual forward pass—not only `get_signal()` on the legacy single-token path
+- `sweep_config()` — tunable knobs for automated sweeps
 
 ```
 State machine (per token):
@@ -285,18 +293,20 @@ TSCore converges cleanly. High PPL is expected for an untrained model — the ha
 ```python
 import sandbox as sb
 
+tok = sb._build_tokenizer("fallback", 512)  # or "tiktoken", 32768
 model = sb.TorchAttractorLanguageModel(
-    vocab=sb.FULL_VOCAB,      # list[str] — 512 words (baseline) or tiktoken ids
-    state_dim=512,            # D — embedding / state dimension
-    train_window_size=6,      # W — context window
-    max_window_steps=16,      # max tension-adaptive steps per window
+    vocab_size=tok.n_vocab,
+    state_dim=512,
+    train_window_size=6,
+    max_window_steps=16,
 )
+model.tokenizer = tok
 
 # Training path
-wids = model.window_ids_from_sequence(token_ids)    # list[int] → list[int]
-S = model.embed_window(wids)                         # (W, D)
-S, logs = model.run_window_dynamics(S)               # (W, D), metrics
-logits = model.readout_window(S.reshape(1, -1))      # (V,)
+wids = model.window_ids_from_sequence(token_ids)
+S = model.embed_window(wids)
+S, logs = model.run_window_dynamics(S, context_ids=wids)  # GOAT uses token ids if enabled
+logits = model.readout_window(S.reshape(1, -1))
 
 # Batched trajectory contrastive loss
 loss, logits = model.trajectory_contrastive_loss_and_logits(contexts, targets)
@@ -312,20 +322,21 @@ sb.compare_prompts(model, "cats eat fish", "fish eat cats")
 
 ## Training objective
 
-Default: **trajectory contrastive loss** with optional auxiliary cross-entropy.
+Default: **trajectory contrastive loss** with optional auxiliary terms.
 
 ```
-L = L_traj + α · L_ce_aux
+L = L_traj + w_token · L_token_aux + α · L_readout_aux
 
 L_traj = mean(ReLU(0.2 − cos(pred, teacher) + cos(pred, negative)))
   pred   = evolved(context window)
   teacher = evolved(shifted window [x2…xW, next_token])
   negative = shuffled teacher in batch
 
-L_ce_aux = cross-entropy on readout_window(pred)  (keeps readout trainable)
+L_token_aux = CE on readout_window(flattened pred window) vs target  (--token-aux-ce, default 0.2)
+L_readout_aux = CE on readout(final token row of pred) vs target     (--readout-aux-alpha, default 0.15)
 ```
 
-Use `--loss-mode ce` for classic next-token CE only.
+The single-state **`readout`** head is what inference and `AttractorStateCache` use; **`readout_window`** is the primary training readout. Use `--loss-mode ce` for classic next-token CE only.
 
 ---
 
@@ -355,29 +366,56 @@ T_window = 1 − mean_cos(token_states, mean_direction)
 ```
 python sandbox.py [options]
 
+Data & tokenizer:
+  --corpus PATH              Training text (default: data/corpus.txt)
+  --dataset-path PATH        Alias for --corpus (takes precedence if set)
+  --val-fraction FLOAT       Held-out fraction for val CE / traj eval (default: 0.05; use 0 to disable)
+  --tokenizer {tiktoken,fallback}   BPE mode (default: fallback)
+  --vocab-cap INT            Max BPE vocab when using tiktoken mode (default: 32768)
+  --seq-len INT              Alias for --window-size
+  --batch-size INT           Alias for --trajectory-batch-size
+  --shuffle-buffer INT       Pipeline shuffle buffer (default: 2048)
+
 Training:
-  --corpus PATH              Training corpus file (default: data/corpus.txt)
-  --val-fraction FLOAT       Fraction held out for validation CE (default: 0)
-  --seed INT                 Random seed
-  --epoch-copies INT         Repeat corpus N times per epoch before shuffle
-  --window-size INT          Context window width W (default: 6)
-  --num-dynamics-steps INT   Max window dynamics steps (default: 16)
-  --trajectory-batch-size INT  Batch size for contrastive loss (default: 16)
-  --loss-mode {trajectory,ce}  Training objective (default: trajectory)
-  --token-aux-ce FLOAT       Weight of aux CE loss in trajectory mode (default: 0.2)
-  --lr FLOAT                 Learning rate (default: 0.001)
-  --lr-decay-every INT       Apply StepLR every N epochs (0 = disabled)
-  --lr-gamma FLOAT           StepLR gamma (default: 0.5)
+  --window-size INT          Context window W (default: 6)
+  --num-dynamics-steps INT   Max tension-adaptive steps per window (default: 16)
+  --trajectory-batch-size INT  Batch size for trajectory mode (default: 16, need ≥2)
+  --loss-mode {trajectory,ce}
+  --token-aux-ce FLOAT       Aux CE on readout_window in trajectory mode (default: 0.2)
+  --readout-aux-alpha FLOAT  Aux CE on single-state readout (default: 0.15; 0 = off)
+  --lr, --lr-decay-every, --lr-gamma
+  --epoch-copies INT         Repeat training lines per epoch
+  --seed INT
+
+Device & checkpointing:
+  --device auto|cpu|cuda|cuda:N
+  --resume-checkpoint PATH
+  --save-every N             Save every N optimizer steps (0 = final only)
+  --checkpoint-dir PATH      Default: ./checkpoints
+
+Integrations:
+  --use-substrate            TSCore LLMSubstrateNode after each batch
+  --use-goat-memory          GoatMemoryManager + window-path signal injection
+  --dynamics {simple,vectorized}
 
 Logging:
-  --epoch-metrics-csv PATH   Append per-epoch metrics to CSV
-  --log-hard-batch-loss-above FLOAT  Print context when batch loss exceeds threshold
-  --baseline-out PATH        Save Phase 0 baseline block to file
+  --epoch-metrics-csv PATH   Per-epoch CSV (see below)
+  --log-hard-batch-loss-above FLOAT
+  --baseline-out PATH        Phase-0 baseline snapshot text file
 
 Misc:
-  --quick-test               Run window sanity checks only (no training)
-  --baseline-out PATH        Record Phase 0 baseline snapshot
+  --quick-test               Window sanity checks, exit
 ```
+
+### Epoch metrics CSV columns
+
+When `--epoch-metrics-csv` is set, each row includes: `epoch`, `loss_mode`, `mean_loss`, **`train_ce`** (mean batch CE from `readout_window` logits during the epoch), **`val_ce`** (held-out `mean_cross_entropy_eval`, empty if no val), `train_traj_contrast` (last training batch trajectory loss snapshot), **`val_traj_contrast`** (full val-set mean when val exists), `mean_final_step_tension`, `max_batch_loss`, `lr`, `global_step`, **`tscore_evolves`**, **`tscore_last_tension`** (0 if substrate disabled).
+
+**Validation perplexity:** `PPL_val = exp(val_ce)` when `val_ce` is finite.
+
+### A/B example (GOAT on vs off)
+
+Use the same `--seed`, corpus, and hyperparameters; only add `--use-goat-memory` for the treatment run. Log with `--epoch-metrics-csv` and compare `val_ce` / `mean_loss` curves.
 
 ---
 

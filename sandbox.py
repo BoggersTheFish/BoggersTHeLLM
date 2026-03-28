@@ -2,9 +2,11 @@ import argparse
 import csv
 import datetime
 import math
+import os
 import random
 import statistics
 import subprocess
+import sys
 import time
 from collections import Counter
 from pathlib import Path
@@ -13,146 +15,46 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# ==================== BIGGER VOCAB (512 unique words) ====================
-_VOCAB_BLOB = """
-the quick brown fox jumps over lazy dog and then what happens in system of mind
-reason cause effect stable flow attractor signal pattern past present future problem solution question answer because
-therefore however although if but so understands creates builds dissolves reaches appears exists clear quickly time
-change cat bird tree house car computer science logic truth knowledge wisdom idea thought concept process
-result outcome a an as at be by do go he is it me my no
-on or to up us we act add age air all any arm art ask bad
-bag bar bat bed bet big bit box boy bus can cap cop cup cut dad
-dam day did die dig dry due ear eat egg end eye fan far fat fed
-few fig fit fix fly fog for fun gap gas get got gum gun guy had
-has hat her hid him hip his hit hot how hub hug hum ice ill ink
-its jam jar jaw jet job jog joy jug key kid kin lab lad lag law
-lay led leg let lid lie lip lit log lot low mad man map mat men
-met mix mob mom mud mug nap net new nod nor not now nut oak off
-oil old one out owe owl own pad pal pan pat paw pay pen pet pie
-pig pin pit pot pub put rag ram ran rap rat raw ray red rib rid
-rig rim rob rod rot row rub rug run rut sad sap sat saw say sea
-set sew she shy sin sip sir sit six ski sky sly sob sod son sow
-soy spy sub sum sun sup tab tag tan tap tar tax tea ten tie tin
-tip toe ton top tot tow toy try tub tug two use van vet vie vow
-wag war was wax way web wed wet who why wig win wit wok won wow
-yak yen yes yet you zap zip zone zoom able acid acre aged also area army
-atom aunt auto away baby back bake bald ball band bank bare barn base bath beam
-bean bear beat been beer bell belt bend bent best bike bill bind bite blow blue
-boat body boil bomb bone book boom boot bore born both bowl bulk burn bush busy
-cafe cage cake calf call calm camp card care cart case cash cast cave cell chap
-chat chef chin chip chop cite city clan clay clip club coal coat code coin cold
-come cook cool cope copy cord core corn cost crew crop crow cube cuff cult curb
-cure curl cute dale damp dark data dawn days dead deal dear debt deck deep deer
-deny desk dial dice diet dime dine dirt dish disk dive dock does done door dose
-down drag draw drew drop drum duck dull dumb dump dust duty each earn ease east
-easy edge edit else emit ends epic even ever evil exam exit face fact fade fail
-fair fake fall fame farm fast fate fear feed feel feet fell felt file fill film
-find fine fire firm fish five flag flat flaw flea flex flip float flock floor flour
-fluid flush focus force forge forth found frame fresh front frost fruit fully funny gains games
-gauge ghost giant given glass glide globe glove going goods grace grade grain grand grant grass
-grave great green greet grief grill grind groan group grown guard guess guest guide habit happy
-harsh harvest haste hasty hatch haven hazard heady heart heavy hedge hello helps hence herbs hitch
-hobby hoist holly honey honor horse hotel hover human humor humph hurry ideal image imply inner
-input issue ivory jelly joint judge juice jumpy jolly jumbo kneel knife knock label labor laden
-lager large laser later laugh layer learn lease least leave legal lemon level lever light limit
-linen liner liquid listen litter little liver lobby local loose lorry lover lower loyal lucky lunar
-lunch lunge lyric magic major maker march marry match maybe mayor medal media melon mercy merge
-merit merry metal meter micro might minor minus model moist money month moral motor mount mouse
-mouth movie music naive naked nappy nasty naval needy nerve never newly night ninja noble noise
-noisy north noted novel nurse nylon oasis occur ocean offer often olive onion opera order organ
-other ought ounce outer owner paint panel paper party paste patch pause peace peach pearl pedal
-penny perch peril petal phase phone photo piano piece pilot pinch pitch place plain plane plant
-plate plaza plead pluck point polar porch pound power press price pride prime print prior prism
-privy prize probe proof proud prove proxy pulse puppy purge quack quake qualm quart queen query
-quest queue quiet quilt quirk quota quote radar radio raise rally ranch range rapid ratio raven
-razor reach react ready realm rebel refer refit relax relay relic remit renew repel reply reset
-resin retro retry reuse revel rhyme rigid riled risk river roast robot rocky rogue roomy roots
-roost rough round route royal rugby ruler rumba rural rusty sadly safer saint salad salon salty
-sandy satin sauce sauna saved saver scale scalp scant scare scarf scene scent scoop scope score
-scour scout scrap scrub scuba sedan sense serve setup seven shade shady shaft shake shall shame
-shape share sharp shave shear sheet shelf shell shift shine shiny shirt shock shoot shore short
-shout shown shred shrug sight sigma silky silly since singe sinus siren sixth skate sketch skill
-skull slack slain slang slash slate slave sleek sleep slice slide sling sloop slope slosh sloth
-slug small smart smash smell smelt smile smirk smoke snack snail snake snare sneak snide sniff
-snore snort snowy sober solar solid solve sonic sorry sound south space spade spare spark speak
-speed spell spend spice spicy spike spill spine spiral spite split spoil spoke spoof spook spoon
-sport spray spree sprig squad squat stack staff stage stain stair stake stale stalk stall stamp
-stand stare stark start state stave steak steal steam steel steep steer stem stern stick stiff
-still stilt sting stink stock stoic stomp stone stool stoop store storm story stout strap straw
-stray streak stream street stress stretch strut stuck study stuff stump stung stunt style suave sugar
-suite sulky sunny super surer surge sushi swami swamp swarm swear sweat sweep sweet swell swift
-swing swirl sword syrup table tacky taffy taken taker tales tally tamer tangy taper tardy taste
-tasty teach tease teeth tempo tenet tenor tense tenth tepee tepid terms terra terse thank theft
-their theme there these thick thief thigh thing think third thirsty thorn those three threw thrive
-throw thumb thump tiara tidal tiger tight timer timid titan title toast today token tonal tonic
-tooth topaz topic torch total touch tough towel tower toxic trace track tract trade trail train
-trait tramp trans trash treat trend trial tribe trick tried tripe trite troll troop trout truce
-truck truer truly trunk trust tubal tulip tumor tuner tunic turbo tutor twang tweak tweed twice
-twine twist tying udder ultra uncle under undid unify union unite unity until upper upset urban
-usage usher usual utter vague valet valid valor value valve vapid vault vegan venom venue verge
-verse video vigor villa vinyl viola viper viral virus visit vista vital vivid vocal vodka voice
-vomit voter vouch vowel wacky waist waive waken waltz warty waste watch water waver weary weave
-wedge weedy weigh weird welch welsh wench whack whale wharf wheat wheel whelp where which whiff
-while whine whiny whirr whisk white whole whoop whose widen wider widow width wield wight wimpy
-wince winch windy wiser wispy witch witty woken woman women world worry worse worst worth would
-wound woven wrack wrap wrath wreak wreck wrest wring wrist write wrong wrote xerox yacht yearn
-yeast yield young youth zebra zesty zonal stays flows into
-"""
+# ---- repository root and default paths ----------------------------------------
+_REPO_ROOT = Path(__file__).resolve().parent
+DEFAULT_CORPUS_PATH = _REPO_ROOT / "data" / "corpus.txt"
 
-_CORPUS_LINES = [
+# Minimal built-in sentences used when no corpus file is found.
+_FALLBACK_SENTENCES = [
     "the problem appears but the solution exists because the reason is clear therefore the system stays stable",
     "mind understands the cause and the effect creates a stable system",
     "the quick brown fox jumps over the lazy dog and then the pattern flows into the future",
 ]
 
-_REPO_ROOT = Path(__file__).resolve().parent
-DEFAULT_CORPUS_PATH = _REPO_ROOT / "data" / "corpus.txt"
 
+def _build_tokenizer(mode: str = "fallback", vocab_cap: int = 32768):
+    """
+    Build an AttractorTokenizer from vendor/ts-llm.
 
-def _unique_words_from_corpus_file(path: Path) -> set[str]:
-    """Words from a line-oriented corpus file (same rules as load_corpus). Missing file → empty."""
-    if not path.is_file():
-        return set()
-    words: set[str] = set()
-    with path.open(encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            words.update(line.lower().split())
-    return words
-
-
-_corpus_words: set[str] = set()
-for line in _CORPUS_LINES:
-    _corpus_words.update(line.lower().split())
-_corpus_words.update(_unique_words_from_corpus_file(DEFAULT_CORPUS_PATH))
-
-_seen: set[str] = set()
-BASE_VOCAB: list[str] = []
-sorted_corpus = sorted(_corpus_words)
-if len(sorted_corpus) > 512:
-    print(
-        f"Warning: {len(sorted_corpus)} unique words in legacy + default corpus files; "
-        "keeping the first 512 alphabetically (raise vocab cap or shrink corpus to include more).",
-        flush=True,
+    mode='tiktoken'  — BPE gpt2 encoding, vocab_cap tokens (default 32768)
+    mode='fallback'  — same BPE but capped at 512 for fast prototyping
+    """
+    _ts_llm = _REPO_ROOT / "vendor" / "ts-llm"
+    if str(_ts_llm) not in sys.path:
+        sys.path.insert(0, str(_ts_llm))
+    try:
+        from attractor_llm.tokenizer import AttractorTokenizer  # type: ignore[import]
+    except ImportError as exc:
+        raise ImportError(
+            "vendor/ts-llm missing — run: git submodule update --init --recursive"
+        ) from exc
+    actual_cap = vocab_cap if mode == "tiktoken" else min(vocab_cap, 512)
+    return AttractorTokenizer(
+        encoding_name="gpt2",
+        vocab_cap=actual_cap,
+        use_tiktoken=True,
     )
-    sorted_corpus = sorted_corpus[:512]
-for w in sorted_corpus:
-    BASE_VOCAB.append(w)
-    _seen.add(w)
-for w in _VOCAB_BLOB.split():
-    wl = w.lower()
-    if wl in _seen:
-        continue
-    _seen.add(wl)
-    BASE_VOCAB.append(wl)
-    if len(BASE_VOCAB) >= 512:
-        break
 
-assert len(BASE_VOCAB) == 512, len(BASE_VOCAB)
 
-FULL_VOCAB = sorted(set(BASE_VOCAB))
+# Legacy shim so external scripts that import sandbox.FULL_VOCAB keep working.
+# This is a placeholder — real vocab comes from _build_tokenizer().
+FULL_VOCAB: list[str] = []
+
 
 # Anti-collapse: trajectory drift in readout; entropy floor for sampling / training logits.
 DRIFT_MIN = 0.008
@@ -235,7 +137,7 @@ def sample_next_token_id(
 class TorchAttractorLanguageModel(nn.Module):
     def __init__(
         self,
-        vocab,
+        vocab_size: int,
         state_dim=512,
         convergence_steps=4,
         slow_decay=0.05,
@@ -249,10 +151,7 @@ class TorchAttractorLanguageModel(nn.Module):
         max_window_steps: int = MAX_WINDOW_STEPS,
     ):
         super().__init__()
-        self.vocab = vocab
-        self.vocab_size = len(vocab)
-        # O(1) word → index (list.index is O(V) and dominated training/data prep).
-        self._word_to_idx: dict[str, int] = {w: i for i, w in enumerate(vocab)}
+        self.vocab_size = vocab_size
         self.state_dim = state_dim
         self.train_window_size = train_window_size
         self.max_window_steps = max_window_steps
@@ -334,6 +233,10 @@ class TorchAttractorLanguageModel(nn.Module):
         self._last_adaptive_window_steps: int = 0
         # Mean tension after each outer step (last run_window_dynamics with record_tension_log=True).
         self._last_window_tension_curve: list[float] = []
+        # Integration hooks — set by caller after construction.
+        self.tokenizer = None           # AttractorTokenizer for encode / decode
+        self._goat_mgr = None           # GoatMemoryManager for per-token activation bonuses
+        self._last_pred_final_state: torch.Tensor | None = None  # (B, D) after trajectory dynamics
 
     def reset_readout_trajectory(self):
         """Clear stored combined state for drift pressure (call once per training window / at generate start)."""
@@ -419,6 +322,13 @@ class TorchAttractorLanguageModel(nn.Module):
         signal = base_signal + self.gamma * context_vector
         sn = torch.linalg.vector_norm(signal)
         signal = signal / (sn + self.signal_eps)
+        # Phase 8: GOAT memory activation bonus — shifts signal direction toward active tokens.
+        if self._goat_mgr is not None:
+            bonus = float(self._goat_mgr.activation_bonus(token_id))
+            if bonus > 0.0:
+                signal = signal + bonus
+                sn2 = torch.linalg.vector_norm(signal)
+                signal = signal / (sn2 + self.signal_eps)
         return signal
 
     def all_signals(self, fast_state, slow_state):
@@ -552,35 +462,44 @@ class TorchAttractorLanguageModel(nn.Module):
             T = T + mu * entropy
         return T
 
-    def _single_window_step(self, S: torch.Tensor) -> torch.Tensor:
-        """One coupling + relaxation step; S is (B, W, D)."""
+    def _single_window_step(
+        self,
+        S: torch.Tensor,
+        context_ids: list[list[int]] | None = None,
+    ) -> torch.Tensor:
+        """One coupling + relaxation step; S is (B, W, D).
+
+        Uses the unified dynamics.step() interface so both SimpleAttractorDynamics
+        and VectorizedWindowDynamics work without attribute access.
+
+        If GOAT memory is active and context_ids is provided, an activation-bonus
+        signal is injected at each token position before the dynamics step.
+        """
         B, W, D = S.shape
         assert W == self.train_window_size
-        dyn = self.dynamics
-        zero_sig = torch.zeros(B, W, D, device=S.device, dtype=S.dtype)
         pos_g = F.softplus(self.position_gamma_raw) + 1e-6
         isc = F.softplus(self.interaction_scale_raw)
         idt = F.softplus(self.interaction_dt_raw)
-        ns = (
-            dyn.noise_scale.to(device=S.device, dtype=S.dtype)
-            if self.training
-            else torch.tensor(0.0, device=S.device, dtype=S.dtype)
-        )
         delta = positional_coupling_delta(S, pos_g, self.position_asym)
         S = S + idt * isc * delta
-        S = step_state_batch(
-            S,
-            dyn.diffusion,
-            zero_sig,
-            dyn.dt,
-            dyn.cubic_scale,
-            beta=dyn.beta,
-            noise_scale=ns,
-            lambda_decay=dyn.lambda_decay,
-            signal_scale=dyn.signal_scale,
-            state_norm_eps=dyn.state_norm_eps,
-            nonlinear_gain=WINDOW_NONLINEAR_GAIN,
-        )
+
+        # Build GOAT activation-bonus signal (Bug 1 fix).
+        # bonuses[b, t] is a scalar; we broadcast it across the D dimension.
+        if self._goat_mgr is not None and context_ids is not None:
+            bonuses = torch.zeros(B, W, 1, device=S.device, dtype=S.dtype)
+            for b in range(B):
+                ids_b = context_ids[b]
+                for t, tid in enumerate(ids_b):
+                    bonus = float(self._goat_mgr.activation_bonus(tid))
+                    if bonus > 0.0:
+                        bonuses[b, t, 0] = bonus
+            signal = bonuses.expand(B, W, D)
+        else:
+            signal = torch.zeros(B, W, D, device=S.device, dtype=S.dtype)
+
+        # Unified interface: both SimpleAttractorDynamics and
+        # VectorizedWindowDynamics implement step(S, signal) → S (Bug 2 fix).
+        S = self.dynamics.step(S, signal)
         return S
 
     def run_window_dynamics(
@@ -588,15 +507,22 @@ class TorchAttractorLanguageModel(nn.Module):
         S: torch.Tensor,
         collect_metrics: bool = False,
         record_tension_log: bool = True,
+        context_ids: list[list[int]] | None = None,
     ) -> tuple[torch.Tensor, list[dict] | None]:
         """
         Tension-adaptive evolution: (W, D) or (B, W, D). Gradients flow through all steps.
         If record_tension_log, fills _last_window_tension_curve with mean(T) after each step
         (use False on teacher-only passes so the student curve is preserved).
+
+        context_ids: list of per-batch token ID windows (B × W) used to compute
+        GOAT activation bonuses inside each dynamics step.
         """
         single = S.dim() == 2
         if single:
             S = S.unsqueeze(0)
+            # Wrap single window in a batch list so _single_window_step can index it.
+            if context_ids is not None and len(context_ids) > 0 and not isinstance(context_ids[0], list):
+                context_ids = [context_ids]  # type: ignore[list-item]
         B, W, D = S.shape
         assert W == self.train_window_size
         step_logs: list[dict] | None = [] if collect_metrics else None
@@ -605,7 +531,7 @@ class TorchAttractorLanguageModel(nn.Module):
         thigh = self.window_tension_high.to(device=S.device, dtype=S.dtype)
         for step in range(self.max_window_steps):
             S0 = S.detach().clone() if collect_metrics else None
-            S = self._single_window_step(S)
+            S = self._single_window_step(S, context_ids=context_ids)
             T = self.compute_window_tension(S)
             self._last_window_tension_mean = T.mean().detach()
             self._last_adaptive_window_steps = step + 1
@@ -686,7 +612,9 @@ class TorchAttractorLanguageModel(nn.Module):
         """
         assert len(context_ids) == self.train_window_size
         S = self.embed_window(context_ids)
-        S, dyn_logs = self.run_window_dynamics(S, collect_metrics=collect_dynamics_metrics)
+        S, dyn_logs = self.run_window_dynamics(
+            S, collect_metrics=collect_dynamics_metrics, context_ids=context_ids
+        )
         self._last_dynamics_logs = dyn_logs
         logits = self.readout_window(S.reshape(-1))
         logits = logits / self.effective_temperature()
@@ -708,7 +636,7 @@ class TorchAttractorLanguageModel(nn.Module):
         assert B == len(targets) and B >= 1
         S_pred = torch.stack([self.embed_window(c) for c in contexts], dim=0)
         S_pred, _ = self.run_window_dynamics(
-            S_pred, collect_metrics=False, record_tension_log=True
+            S_pred, collect_metrics=False, record_tension_log=True, context_ids=contexts
         )
         with torch.no_grad():
             S_tgt = torch.stack(
@@ -724,6 +652,8 @@ class TorchAttractorLanguageModel(nn.Module):
         loss_traj = self.trajectory_contrastive_loss(S_pred, S_tgt)
         logits = self.readout_window(S_pred.reshape(B, -1)) / self.effective_temperature()
         logits = torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=-1e4)
+        # Store final-position single state for auxiliary readout training (Phase 5).
+        self._last_pred_final_state = S_pred[:, -1, :]  # (B, D)
         return loss_traj, logits
 
     @staticmethod
@@ -745,9 +675,12 @@ class TorchAttractorLanguageModel(nn.Module):
     def encode_prompt(self, prompt: str) -> torch.Tensor:
         """Run window dynamics on the trailing context; return converged state (W, D)."""
         self.reset_readout_trajectory()
-        w2i = self._word_to_idx
-        tokens = [w for w in prompt.lower().split() if w in w2i] or ["the"]
-        input_ids = [w2i[w] for w in tokens]
+        if self.tokenizer is not None:
+            input_ids = self.tokenizer.encode(prompt)
+        else:
+            input_ids = [0]
+        if not input_ids:
+            input_ids = [0]
         wid = self.window_ids_from_sequence(input_ids)
         with torch.inference_mode():
             S = self.embed_window(wid)
@@ -779,14 +712,16 @@ class TorchAttractorLanguageModel(nn.Module):
         log_dynamics: bool = False,
     ):
         """Autoregressive generation: each step uses last-W context → dynamics → readout (same as training)."""
-        w2i = self._word_to_idx
-        tokens = [w for w in prompt.lower().split() if w in w2i] or ["the"]
-        input_ids = [w2i[w] for w in tokens]
+        if self.tokenizer is not None:
+            input_ids = self.tokenizer.encode(prompt)
+        else:
+            input_ids = list(range(min(self.train_window_size, 6)))
+        if not input_ids:
+            input_ids = [0]
 
         was_training = self.training
         self.eval()
         self.reset_readout_trajectory()
-        generated = tokens[:]
         generated_ids = list(input_ids)
         with torch.inference_mode():
             base_gen_temp = self.generation_temperature
@@ -818,8 +753,6 @@ class TorchAttractorLanguageModel(nn.Module):
                     GEN_REPEAT_LOGIT_PENALTY,
                     GEN_NO_REPEAT_LAST_EXTRA,
                 )
-                next_word = self.vocab[next_id]
-                generated.append(next_word)
                 generated_ids.append(next_id)
 
         if debug_track:
@@ -827,7 +760,9 @@ class TorchAttractorLanguageModel(nn.Module):
 
         if was_training:
             self.train()
-        return " ".join(generated)
+        if self.tokenizer is not None:
+            return self.tokenizer.decode(generated_ids)
+        return " ".join(str(i) for i in generated_ids)
 
 
 class SimpleAttractorDynamics(nn.Module):
@@ -868,6 +803,30 @@ class SimpleAttractorDynamics(nn.Module):
             state_norm_eps=self.state_norm_eps,
         )
 
+    def step(self, S: torch.Tensor, signal: torch.Tensor) -> torch.Tensor:
+        """Unified batched step interface for the window training path (B, W, D).
+
+        Noise is enabled when the module is in training mode, disabled in eval.
+        """
+        ns = (
+            self.noise_scale.to(device=S.device, dtype=S.dtype)
+            if self.training
+            else torch.tensor(0.0, device=S.device, dtype=S.dtype)
+        )
+        return step_state_batch(
+            S,
+            self.diffusion,
+            signal,
+            self.dt,
+            self.cubic_scale,
+            beta=self.beta,
+            noise_scale=ns,
+            lambda_decay=self.lambda_decay,
+            signal_scale=self.signal_scale,
+            state_norm_eps=self.state_norm_eps,
+            nonlinear_gain=WINDOW_NONLINEAR_GAIN,
+        )
+
 
 def make_diffusion_matrix(dim):
     torch.manual_seed(42)
@@ -897,17 +856,10 @@ def run_quick_window_tests(model: TorchAttractorLanguageModel) -> None:
     """Sanity checks: divergent states for different orderings; dynamics summary (no training)."""
     print("--- quick window / context test ---", flush=True)
     model.eval()
-    w2i = model._word_to_idx
     W = model.train_window_size
 
-    def to_ids(text: str) -> list[int]:
-        return [w2i[w] for w in text.lower().split() if w in w2i]
-
-    long_a = to_ids("the cat sat on the mat and then there was a reason")
-    long_b = to_ids("there was a reason and then the cat sat on the mat")
-    if len(long_a) < W + 1 or len(long_b) < W + 1:
-        long_a = to_ids("the quick brown fox jumps over lazy dog and then".split())
-        long_b = to_ids("and then lazy dog jumps over the quick brown fox".split())
+    long_a = list(range(W + 5))
+    long_b = list(reversed(range(W + 5)))
     wid_a = model.window_ids_from_sequence(long_a)
     wid_b = model.window_ids_from_sequence(long_b)
     with torch.inference_mode():
@@ -1096,31 +1048,24 @@ def load_corpus(path: Path) -> list[str]:
 
 def corpus_coverage_report(
     sentences: list[str],
-    vocab: set[str],
+    tokenizer,
     window_size: int,
 ) -> None:
-    """Print token OOV rate and how many lines yield at least one training window."""
+    """Print token statistics and usable-line count for the corpus."""
     n_lines = len(sentences)
     raw_tokens = 0
-    kept_tokens = 0
-    oov_tokens = 0
     n_too_short = 0
     n_usable = 0
     for s in sentences:
-        words_raw = s.lower().split()
-        raw_tokens += len(words_raw)
-        words_in = [w for w in words_raw if w in vocab]
-        oov_tokens += len(words_raw) - len(words_in)
-        kept_tokens += len(words_in)
-        if len(words_in) < window_size + 1:
+        ids = tokenizer.encode(s) if tokenizer is not None else s.lower().split()
+        raw_tokens += len(ids)
+        if len(ids) < window_size + 1:
             n_too_short += 1
         else:
             n_usable += 1
-    oov_rate = oov_tokens / raw_tokens if raw_tokens else 0.0
     print(
-        f"Corpus coverage: {n_lines} lines  |  {n_usable} usable (≥{window_size + 1} in-vocab tokens)  "
-        f"|  {n_too_short} too short after OOV drop  |  OOV tokens={oov_tokens}/{raw_tokens} "
-        f"({100.0 * oov_rate:.1f}%)",
+        f"Corpus coverage: {n_lines} lines  |  {n_usable} usable (≥{window_size + 1} tokens)  "
+        f"|  {n_too_short} too short  |  total_tokens={raw_tokens}",
         flush=True,
     )
 
@@ -1142,14 +1087,14 @@ def train_val_split(
 
 def sentences_with_training_windows(
     sentences: list[str],
-    vocab: set[str],
+    tokenizer,
     window_size: int,
 ) -> list[str]:
-    """Lines that yield at least one (context, target) pair after OOV removal."""
+    """Lines that yield at least one (context, target) pair after tokenization."""
     out: list[str] = []
     for s in sentences:
-        words = [w for w in s.lower().split() if w in vocab]
-        if len(words) >= window_size + 1:
+        ids = tokenizer.encode(s) if tokenizer is not None else s.lower().split()
+        if len(ids) >= window_size + 1:
             out.append(s)
     return out
 
@@ -1159,13 +1104,13 @@ def build_dataset_from_sentences(
     model: TorchAttractorLanguageModel,
     window_size: int,
 ) -> list:
-    w2i = model._word_to_idx
+    """Tokenize sentences via model.tokenizer and build sliding-window (context, target) pairs."""
+    tok = model.tokenizer
     dataset = []
     for sentence in sentences:
-        words = [w for w in sentence.split() if w in w2i]
-        if len(words) < window_size + 1:
+        ids = tok.encode(sentence) if tok is not None else []
+        if len(ids) < window_size + 1:
             continue
-        ids = [w2i[w] for w in words]
         dataset.extend(build_sequence_dataset(ids, window_size=window_size))
     return dataset
 
@@ -1360,186 +1305,276 @@ def _format_phase0_baseline_block(
     )
 
 
+def _save_checkpoint(
+    model: TorchAttractorLanguageModel,
+    optimizer: torch.optim.Optimizer,
+    step: int,
+    epoch: int,
+    args,
+    ckpt_dir: Path,
+) -> Path:
+    """Save model + optimizer state to a numbered checkpoint file."""
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_path = ckpt_dir / f"ckpt_step{step:07d}.pt"
+    torch.save(
+        {
+            "model_state": model.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+            "step": step,
+            "epoch": epoch,
+            "vocab_size": model.vocab_size,
+            "tokenizer_mode": getattr(args, "tokenizer", "fallback"),
+            "config": {
+                "state_dim": model.state_dim,
+                "train_window_size": model.train_window_size,
+                "vocab_size": model.vocab_size,
+            },
+        },
+        ckpt_path,
+    )
+    print(f"[ckpt] Saved: {ckpt_path}", flush=True)
+    return ckpt_path
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Attractor dynamics language model (see README)."
     )
-    parser.add_argument(
-        "--corpus",
-        type=Path,
-        default=None,
-        help=f"Training text: one sentence per line; lines starting with # ignored. "
-        f"Default: {DEFAULT_CORPUS_PATH}",
-    )
-    parser.add_argument(
-        "--val-fraction",
-        type=float,
-        default=0.05,
-        help="Hold out this fraction of lines for validation CE each epoch (0 disables).",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="RNG seed for shuffling and train/val split.",
-    )
-    parser.add_argument(
-        "--epoch-copies",
-        type=int,
-        default=CORPUS_EPOCH_COPIES,
-        help="Repeat the training sentence list this many times per epoch before shuffling.",
-    )
-    parser.add_argument(
-        "--baseline-out",
-        type=Path,
-        default=None,
-        help="Write Phase 0 baseline snapshot (metrics + fixed generations) to this file (UTF-8).",
-    )
-    parser.add_argument(
-        "--window-size",
-        type=int,
-        default=WINDOW_SIZE,
-        help="Sliding context length W; dataset yields (W tokens, next token).",
-    )
-    parser.add_argument(
-        "--num-dynamics-steps",
-        type=int,
-        default=MAX_WINDOW_STEPS,
-        help="Max outer steps per window (tension-adaptive run_window_dynamics; may exit early).",
-    )
-    parser.add_argument(
-        "--trajectory-batch-size",
-        type=int,
-        default=TRAJECTORY_BATCH_SIZE_DEFAULT,
-        help="Batch size for trajectory contrastive training (need >=2 for negatives).",
-    )
-    parser.add_argument(
-        "--quick-test",
-        action="store_true",
-        help="Run window/context sanity checks and exit (no training).",
-    )
-    parser.add_argument(
-        "--loss-mode",
-        choices=("trajectory", "ce"),
-        default="trajectory",
-        help="trajectory: contrastive(evolved pred vs teacher state) + optional token CE aux; "
-        "ce: classic next-token cross-entropy only.",
-    )
-    parser.add_argument(
-        "--token-aux-ce",
-        type=float,
-        default=TOKEN_AUX_CE_WEIGHT_DEFAULT,
-        help="When loss-mode=trajectory, weight on auxiliary readout CE (0 disables).",
-    )
-    parser.add_argument(
-        "--lr",
-        type=float,
-        default=0.001,
-        help="Adam learning rate.",
-    )
-    parser.add_argument(
-        "--lr-decay-every",
-        type=int,
-        default=0,
-        help="Multiply LR by --lr-gamma every N epochs (0 = no decay).",
-    )
-    parser.add_argument(
-        "--lr-gamma",
-        type=float,
-        default=0.5,
-        help="LR multiplier when --lr-decay-every is set.",
-    )
-    parser.add_argument(
-        "--epoch-metrics-csv",
-        type=Path,
-        default=None,
-        help="Append one CSV row per epoch (loss, CE, traj contrast, mean final-step tension, lr, …) for plotting.",
-    )
-    parser.add_argument(
-        "--log-hard-batch-loss-above",
-        type=float,
-        default=0.0,
-        help="Trajectory mode: print a hint for batches with loss above this (0 = off).",
-    )
-    args = parser.parse_args()
-    corpus_path = args.corpus if args.corpus is not None else DEFAULT_CORPUS_PATH
-    random.seed(args.seed)
-    window_size = args.window_size
-    if window_size < 2:
-        raise SystemExit("--window-size must be >= 2")
-    if args.loss_mode == "trajectory" and args.trajectory_batch_size < 2:
-        raise SystemExit("--trajectory-batch-size must be >= 2 for contrastive training")
+    # ---- existing args ----
+    parser.add_argument("--corpus", type=Path, default=None,
+        help=f"Training text (one sentence/line). Default: {DEFAULT_CORPUS_PATH}")
+    parser.add_argument("--val-fraction", type=float, default=0.05,
+        help="Hold-out fraction for validation CE each epoch (0 = off).")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--epoch-copies", type=int, default=CORPUS_EPOCH_COPIES,
+        help="Repeat training sentence list N times per epoch.")
+    parser.add_argument("--baseline-out", type=Path, default=None,
+        help="Write Phase-0 baseline snapshot to this file.")
+    parser.add_argument("--window-size", type=int, default=WINDOW_SIZE,
+        help="Sliding context length W.")
+    parser.add_argument("--num-dynamics-steps", type=int, default=MAX_WINDOW_STEPS,
+        help="Max outer steps per window (tension-adaptive).")
+    parser.add_argument("--trajectory-batch-size", type=int, default=TRAJECTORY_BATCH_SIZE_DEFAULT,
+        help="Batch size for trajectory contrastive training (need ≥2).")
+    parser.add_argument("--quick-test", action="store_true",
+        help="Window/context sanity checks and exit.")
+    parser.add_argument("--loss-mode", choices=("trajectory", "ce"), default="trajectory")
+    parser.add_argument("--token-aux-ce", type=float, default=TOKEN_AUX_CE_WEIGHT_DEFAULT,
+        help="trajectory mode: aux readout_window CE weight.")
+    parser.add_argument("--lr", type=float, default=0.001)
+    parser.add_argument("--lr-decay-every", type=int, default=0)
+    parser.add_argument("--lr-gamma", type=float, default=0.5)
+    parser.add_argument("--epoch-metrics-csv", type=Path, default=None)
+    parser.add_argument("--log-hard-batch-loss-above", type=float, default=0.0)
+    # ---- Phase 1: tokenizer ----
+    parser.add_argument("--tokenizer", choices=("tiktoken", "fallback"), default="fallback",
+        help="'tiktoken': BPE gpt2 (--vocab-cap tokens); 'fallback': same BPE capped at 512.")
+    parser.add_argument("--vocab-cap", type=int, default=32768,
+        help="BPE vocab cap when --tokenizer tiktoken (default 32768).")
+    # ---- Phase 2: data pipeline aliases (accept both hyphens and underscores) ----
+    parser.add_argument("--dataset-path", "--dataset_path", type=Path, default=None,
+        dest="dataset_path", help="Alias for --corpus (takes precedence).")
+    parser.add_argument("--seq-len", "--seq_len", type=int, default=None,
+        dest="seq_len", help="Alias for --window-size.")
+    parser.add_argument("--batch-size", "--batch_size", type=int, default=None,
+        dest="batch_size", help="Alias for --trajectory-batch-size.")
+    parser.add_argument("--shuffle-buffer", type=int, default=2048,
+        help="AttractorDataPipeline shuffle buffer size.")
+    # ---- Phase 3: device ----
+    parser.add_argument("--device", default="auto",
+        help="'auto' | 'cpu' | 'cuda' | 'cuda:N'.")
+    # ---- Phase 4: checkpointing ----
+    parser.add_argument("--resume-checkpoint", type=Path, default=None,
+        help="Resume training from this checkpoint file.")
+    parser.add_argument("--save-every", type=int, default=0,
+        help="Save checkpoint every N optimizer steps (0 = only final).")
+    parser.add_argument("--checkpoint-dir", type=Path, default=None,
+        help="Checkpoint directory (default: ./checkpoints).")
+    # ---- Phase 5: readout consistency ----
+    parser.add_argument("--readout-aux-alpha", type=float, default=0.15,
+        help="Weight on aux single-state readout CE loss (0 = disabled).")
+    # ---- Phase 7: TSCore substrate (accept both hyphens and underscores) ----
+    parser.add_argument("--use-substrate", "--use_substrate", action="store_true",
+        dest="use_substrate", help="Enable TSCore substrate coupling (LLMSubstrateNode).")
+    # ---- Phase 8: GOAT memory ----
+    parser.add_argument("--use-goat-memory", "--use_goat_memory", action="store_true",
+        dest="use_goat_memory", help="Enable GOAT-TS memory-state transitions (GoatMemoryManager).")
+    # ---- Phase 9: dynamics ----
+    parser.add_argument("--dynamics", choices=("simple", "vectorized"), default="simple",
+        help="'simple': SimpleAttractorDynamics; 'vectorized': MultiHeadDynamics.")
 
-    print(f"Vocab size: {len(FULL_VOCAB)}", flush=True)
+    args = parser.parse_args()
+
+    # ---- resolve aliases ----
+    corpus_path = args.dataset_path or args.corpus or DEFAULT_CORPUS_PATH
+    window_size = args.seq_len if args.seq_len is not None else args.window_size
+    traj_batch_size = args.batch_size if args.batch_size is not None else args.trajectory_batch_size
+
+    if window_size < 2:
+        raise SystemExit("window size must be >= 2")
+    if args.loss_mode == "trajectory" and traj_batch_size < 2:
+        raise SystemExit("trajectory batch size must be >= 2 for contrastive training")
+
+    random.seed(args.seed)
+
+    # ---- Phase 3: device ----
+    if args.device == "auto":
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(args.device)
+    print(f"Device: {device}", flush=True)
+
+    # ---- Phase 1: tokenizer ----
+    tok = _build_tokenizer(mode=args.tokenizer, vocab_cap=args.vocab_cap)
+    vocab_size = tok.n_vocab
+    print(f"Vocab size: {vocab_size}  tokenizer={args.tokenizer}", flush=True)
+
+    # ---- Build model ----
     model = TorchAttractorLanguageModel(
-        FULL_VOCAB,
+        vocab_size,
         train_window_size=window_size,
         max_window_steps=args.num_dynamics_steps,
     )
+    model.tokenizer = tok
+
+    # ---- Phase 4: build optimizer (before checkpoint load) ----
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-5)
+    start_epoch = 0
+    global_step = 0
+
+    if args.resume_checkpoint is not None and args.resume_checkpoint.is_file():
+        ckpt = torch.load(args.resume_checkpoint, map_location="cpu")
+        model.load_state_dict(ckpt["model_state"])
+        if "optimizer_state" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer_state"])
+        global_step = ckpt.get("step", 0)
+        start_epoch = ckpt.get("epoch", 0)
+        print(
+            f"Resumed from {args.resume_checkpoint} (step={global_step}, epoch={start_epoch})",
+            flush=True,
+        )
+
+    # ---- Phase 3: move to device ----
+    model = model.to(device)
+
     if args.quick_test:
         run_quick_window_tests(model)
         return
-    optimizer = torch.optim.Adam(
-        model.parameters(), lr=args.lr, weight_decay=1e-5
-    )
+
     lr_scheduler = None
     if args.lr_decay_every > 0:
         lr_scheduler = torch.optim.lr_scheduler.StepLR(
-            optimizer,
-            step_size=args.lr_decay_every,
-            gamma=args.lr_gamma,
+            optimizer, step_size=args.lr_decay_every, gamma=args.lr_gamma
         )
-    vocab_set = set(model.vocab)
 
+    # ---- Phase 9: dynamics swap ----
+    if args.dynamics == "vectorized":
+        try:
+            from dynamics_vectorized import VectorizedWindowDynamics  # type: ignore[import]
+            model.dynamics = VectorizedWindowDynamics(model.state_dim).to(device)
+            print("[phase-9] VectorizedWindowDynamics active", flush=True)
+        except Exception as _dyn_err:
+            print(f"[phase-9] Warning: vectorized dynamics unavailable ({_dyn_err})", flush=True)
+
+    # ---- Phase 7: TSCore substrate ----
+    substrate = None
+    if args.use_substrate:
+        try:
+            from llm_substrate_node import LLMSubstrateNode  # type: ignore[import]
+            substrate = LLMSubstrateNode(model, quiet=True)
+            print("[phase-7] TSCore substrate node active", flush=True)
+        except Exception as _sub_err:
+            print(f"[phase-7] Warning: substrate unavailable ({_sub_err})", flush=True)
+
+    # ---- Phase 8: GOAT memory ----
+    if args.use_goat_memory:
+        try:
+            from goat_memory_transitions import GoatMemoryManager  # type: ignore[import]
+            model._goat_mgr = GoatMemoryManager(model, bonus_scale=0.05)
+            print("[phase-8] GOAT memory manager active", flush=True)
+        except Exception as _goat_err:
+            print(f"[phase-8] Warning: GOAT memory unavailable ({_goat_err})", flush=True)
+
+    # ---- checkpoint dir ----
+    ckpt_dir = args.checkpoint_dir or (_REPO_ROOT / "checkpoints")
+
+    # ---- Phase 2: data pipeline ----
     sentences = load_corpus(corpus_path)
     print(f"Loaded corpus: {corpus_path}  ({len(sentences)} lines)", flush=True)
-    corpus_coverage_report(sentences, vocab_set, window_size)
+    corpus_coverage_report(sentences, tok, window_size)
 
-    usable = sentences_with_training_windows(sentences, vocab_set, window_size)
+    usable = sentences_with_training_windows(sentences, tok, window_size)
     if not usable:
         raise RuntimeError(
-            "No corpus lines have enough in-vocabulary tokens to form a training window. "
-            "Add text using words from the model vocab, or lower --window-size."
+            "No corpus lines have enough tokens to form a training window. "
+            "Add more text or lower --window-size / --seq-len."
         )
     n_skip = len(sentences) - len(usable)
     if n_skip:
         print(
-            f"Training/validation use only lines with ≥{window_size + 1} in-vocab tokens "
-            f"({len(usable)} lines; {n_skip} lines skipped).",
+            f"Training uses only {len(usable)} of {len(sentences)} lines "
+            f"({n_skip} too short for window_size={window_size}).",
             flush=True,
         )
 
     train_sents, val_sents = train_val_split(usable, args.val_fraction, args.seed)
     if val_sents:
         print(
-            f"Train/val split: {len(train_sents)} train lines, {len(val_sents)} val lines "
-            f"(fraction={args.val_fraction:g}, seed={args.seed})",
+            f"Train/val split: {len(train_sents)} train, {len(val_sents)} val "
+            f"(fraction={args.val_fraction:g})",
             flush=True,
         )
     val_dataset = build_dataset_from_sentences(val_sents, model, window_size)
     if val_sents and len(val_dataset) < 32:
         print(
-            f"Warning: validation set is tiny ({len(val_dataset)} windows from {len(val_sents)} lines); "
-            "val CE is mostly noise — use train CE and samples until you hold out more lines.",
+            f"Warning: validation set tiny ({len(val_dataset)} windows); val CE is noisy.",
+            flush=True,
+        )
+
+    # Write training sentences to a temp file for AttractorDataPipeline.
+    import tempfile as _tempfile
+
+    _tmp_f = _tempfile.NamedTemporaryFile(
+        mode="w", suffix=".txt", delete=False, encoding="utf-8"
+    )
+    for _s in train_sents * args.epoch_copies:
+        _tmp_f.write(_s + "\n")
+    _tmp_f.close()
+    _tmp_train_path = Path(_tmp_f.name)
+
+    pipeline = None
+    try:
+        from data_pipeline import AttractorDataPipeline  # type: ignore[import]
+        pipeline = AttractorDataPipeline(
+            sources=[_tmp_train_path],
+            model=model,
+            batch_size=traj_batch_size,
+            window_size=window_size,
+            shuffle_buffer=args.shuffle_buffer,
+            tokenizer=tok,
+            seed=args.seed,
+        )
+    except Exception as _pipe_err:
+        print(
+            f"Warning: data pipeline unavailable ({_pipe_err}), "
+            "falling back to legacy in-memory loader.",
             flush=True,
         )
 
     print(
-        f"Pre-training ({NUM_EPOCHS} epochs, sliding window size={window_size}, "
-        f"num_dynamics_steps={args.num_dynamics_steps}, "
-        f"epoch_copies={args.epoch_copies}, "
-        f"loss_mode={args.loss_mode}, token_aux_ce={args.token_aux_ce}, "
-        f"trajectory_batch_size={args.trajectory_batch_size}, lr={args.lr}, "
-        f"lr_decay_every={args.lr_decay_every})...",
+        f"Pre-training ({NUM_EPOCHS} epochs, window={window_size}, "
+        f"dynamics_steps={args.num_dynamics_steps}, loss={args.loss_mode}, "
+        f"aux_ce={args.token_aux_ce}, readout_aux_alpha={args.readout_aux_alpha}, "
+        f"batch={traj_batch_size}, lr={args.lr}, device={device})...",
         flush=True,
     )
-    if args.loss_mode == "trajectory" and args.token_aux_ce <= 0:
+    if args.loss_mode == "trajectory" and args.token_aux_ce <= 0 and args.readout_aux_alpha <= 0:
         print(
-            "Warning: trajectory contrastive loss does not depend on readout_window; with "
-            "token_aux_ce=0 the readout gets no gradients — generation quality may collapse. "
-            f"Use --token-aux-ce > 0 (default {TOKEN_AUX_CE_WEIGHT_DEFAULT}) unless you decode only by distance.",
+            "Warning: trajectory mode with token_aux_ce=0 and readout_aux_alpha=0 — "
+            "readout head gets no gradients. Use --token-aux-ce or --readout-aux-alpha.",
             flush=True,
         )
+
     t_train0 = time.perf_counter()
     last_mean_loss = 0.0
     last_train_ce = 0.0
@@ -1549,45 +1584,101 @@ def main() -> None:
     last_n_windows = 0
     last_epoch_sec = 0.0
     last_epoch_num = 0
-    w2i = model._word_to_idx
-    for epoch in range(NUM_EPOCHS):
-        training_sentences = list(train_sents * args.epoch_copies)
-        random.shuffle(training_sentences)
-        dataset = []
-        for sentence in training_sentences:
-            words = [w for w in sentence.split() if w in w2i]
-            if len(words) < window_size + 1:
-                continue
-            ids = [w2i[w] for w in words]
-            dataset.extend(build_sequence_dataset(ids, window_size=window_size))
-        random.shuffle(dataset)
 
-        n = len(dataset)
+    for epoch in range(start_epoch, start_epoch + NUM_EPOCHS):
         t_ep0 = time.perf_counter()
-        print(f"  epoch {epoch + 1}/{NUM_EPOCHS}  |  {n} windows", flush=True)
         loss_sum = 0.0
         mean_final_step_tension = float("nan")
         max_batch_loss_epoch = float("nan")
+        final_tension_values: list[float] = []
+        max_batch_loss = -1.0
+        bi = 0
+
+        if pipeline is not None:
+            # ---- Phase 2: streaming data pipeline ----
+            pipeline.seed = args.seed + epoch
+            batch_iter = pipeline.epoch_batches()
+            n_est = max(1, pipeline.epoch_count_estimate())
+            report_every = max(1, n_est // 10)
+        else:
+            # Legacy in-memory fallback (keeps working if data_pipeline unavailable).
+            training_sentences = list(train_sents * args.epoch_copies)
+            random.shuffle(training_sentences)
+            legacy_dataset: list = []
+            for _s in training_sentences:
+                _ids = tok.encode(_s)
+                if len(_ids) >= window_size + 1:
+                    legacy_dataset.extend(build_sequence_dataset(_ids, window_size))
+            random.shuffle(legacy_dataset)
+            _bs = max(2, traj_batch_size)
+
+            def _legacy_batch_iter():
+                for _start in range(0, len(legacy_dataset), _bs):
+                    chunk = legacy_dataset[_start : _start + _bs]
+                    if len(chunk) < 2:
+                        chunk = chunk * 2
+                    yield [c for c, _ in chunk], [t for _, t in chunk]
+
+            batch_iter = _legacy_batch_iter()
+            n_est = max(1, (len(legacy_dataset) + _bs - 1) // _bs)
+            report_every = max(1, n_est // 10)
+
+        print(f"  epoch {epoch + 1}/{start_epoch + NUM_EPOCHS}", flush=True)
+
+        # Bug 4: accumulate real train CE from batch readout logits.
+        train_ce_sum = 0.0
+        train_ce_count = 0
+        # Bug 5/6: TSCore per-epoch tracking.
+        substrate_evolve_start = substrate.evolve_count if substrate is not None else 0
+        substrate_idle_count = 0
+        substrate_active_count = 0
+        # Last batch data for train_traj_contrast (Bug 3).
+        _last_batch_contexts: list[list[int]] = []
+        _last_batch_targets: list[int] = []
+
         if args.loss_mode == "trajectory":
-            bs = max(2, args.trajectory_batch_size)
-            nb_total = (n + bs - 1) // bs
-            report_every = max(1, nb_total // 10)
-            final_tension_values: list[float] = []
-            max_batch_loss = -1.0
-            for bi, batch_start in enumerate(range(0, n, bs)):
-                chunk = dataset[batch_start : batch_start + bs]
-                if len(chunk) < 2:
-                    chunk = chunk + chunk
-                contexts = [c for c, t in chunk]
-                targets = [t for c, t in chunk]
+            for contexts, targets in batch_iter:
+                if len(contexts) < 2:
+                    contexts = contexts * 2
+                    targets = targets * 2
+
+                # Phase 3: targets tensor on device
+                targets_tensor = torch.tensor(targets, device=device, dtype=torch.long)
+                _last_batch_contexts = contexts
+                _last_batch_targets = targets
+
                 loss_traj, logits = model.trajectory_contrastive_loss_and_logits(
                     contexts, targets
                 )
                 loss = loss_traj
+
+                # Bug 4: accumulate real batch CE from readout_window logits.
+                with torch.no_grad():
+                    _bce = float(
+                        F.cross_entropy(logits, targets_tensor, label_smoothing=LABEL_SMOOTHING)
+                        .detach()
+                    )
+                    if math.isfinite(_bce):
+                        train_ce_sum += _bce
+                        train_ce_count += 1
+
+                # Phase 5: auxiliary single-state readout loss
+                if args.readout_aux_alpha > 0 and model._last_pred_final_state is not None:
+                    single_logits = model.readout(model._last_pred_final_state.to(device))
+                    single_logits = single_logits / model.effective_temperature()
+                    single_logits = torch.nan_to_num(
+                        single_logits, nan=0.0, posinf=0.0, neginf=-1e4
+                    )
+                    aux_r_loss = F.cross_entropy(
+                        single_logits, targets_tensor, label_smoothing=LABEL_SMOOTHING
+                    )
+                    loss = loss + args.readout_aux_alpha * aux_r_loss
+
                 if args.token_aux_ce > 0.0:
                     loss = loss + args.token_aux_ce * _aux_ce_loss_batch(
                         model, logits, contexts, targets
                     )
+
                 curve = model._last_window_tension_curve
                 if curve:
                     final_tension_values.append(curve[-1])
@@ -1595,95 +1686,144 @@ def main() -> None:
                 loss_sum += li
                 if li > max_batch_loss:
                     max_batch_loss = li
-                if (
-                    args.log_hard_batch_loss_above > 0
-                    and li >= args.log_hard_batch_loss_above
-                ):
-                    words0 = " ".join(model.vocab[tid] for tid in contexts[0])
+                if args.log_hard_batch_loss_above > 0 and li >= args.log_hard_batch_loss_above:
                     print(
-                        f"    [hard batch] batch={bi + 1}/{nb_total} loss={li:.4f}  "
-                        f"first_ctx={words0!r}",
+                        f"    [hard batch] bi={bi + 1} loss={li:.4f}  "
+                        f"ctx0={contexts[0][:6]}",
                         flush=True,
                     )
+
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 optimizer.step()
+                global_step += 1
+
+                # Phase 7: TSCore substrate coupling + idle tracking (Bugs 5/6).
+                if substrate is not None:
+                    _curve = model._last_window_tension_curve
+                    _lang_t = float(_curve[-1]) if _curve else 0.0
+                    if _lang_t < substrate.high_tension_threshold:
+                        substrate_idle_count += 1
+                    else:
+                        substrate_active_count += 1
+                    try:
+                        substrate.on_batch(model)
+                    except Exception:
+                        pass
+
+                # Phase 8: GOAT memory tick
+                if model._goat_mgr is not None:
+                    try:
+                        model._goat_mgr.tick(contexts)
+                    except Exception:
+                        pass
+
+                # Phase 4: periodic checkpoint
+                if args.save_every > 0 and global_step % args.save_every == 0:
+                    _save_checkpoint(model, optimizer, global_step, epoch, args, ckpt_dir)
+
                 ts = model._last_adaptive_window_steps
-                if bi % report_every == 0 or batch_start + bs >= n:
+                if bi % report_every == 0:
                     if curve:
-                        curve_s = "[" + ", ".join(f"{x:.4f}" for x in curve) + "]"
+                        cs = "[" + ", ".join(f"{x:.4f}" for x in curve) + "]"
                         print(
-                            f"    [batch {bi + 1}/{nb_total}] loss={loss.item():.4f}  "
-                            f"Tension curve: {curve_s}  |  Steps: {ts}",
+                            f"    [batch {bi + 1}] loss={li:.4f}  T={cs}  steps={ts}",
                             flush=True,
                         )
                     else:
-                        print(
-                            f"    [batch {bi + 1}/{nb_total}] loss={loss.item():.4f}",
-                            flush=True,
-                        )
-            mean_loss = loss_sum / max(nb_total, 1)
+                        print(f"    [batch {bi + 1}] loss={li:.4f}", flush=True)
+                bi += 1
+
+            mean_loss = loss_sum / max(bi, 1)
             if final_tension_values:
                 mean_final_step_tension = float(statistics.mean(final_tension_values))
-            if nb_total > 0:
-                max_batch_loss_epoch = max_batch_loss
-        else:
-            report_every = max(1, n // 10)
-            for step, (context, target_id) in enumerate(dataset):
-                logits = model.forward_training_window(context)
-                prev_id = context[-1]
-                logits = logits + BIGRAM_TRAIN_WEIGHT * torch.matmul(
-                    model.embedder.weight, model.embedder.weight[prev_id]
-                )
-                logits[prev_id] -= 2.0
-                for t in context[-3:]:
-                    logits[t] -= 1.0
-                logits = logits + TRAIN_LOGIT_NOISE * torch.randn_like(logits)
-                probs_floor = F.softmax(logits, dim=-1)
-                ent_s = -(probs_floor * torch.log(probs_floor + 1e-9)).sum()
-                if float(ent_s.detach()) < ENTROPY_FLOOR:
-                    logits = logits + torch.randn_like(logits) * ENTROPY_FLOOR_NOISE
-                    probs_for_entropy = F.softmax(logits, dim=-1)
-                else:
-                    probs_for_entropy = probs_floor
-                target = torch.tensor([target_id], device=logits.device, dtype=torch.long)
-                loss_ce = F.cross_entropy(
-                    logits.unsqueeze(0), target, label_smoothing=LABEL_SMOOTHING
-                )
-                entropy = -(probs_for_entropy * torch.log(probs_for_entropy + 1e-8)).sum()
-                loss = loss_ce - ENTROPY_WEIGHT * entropy
-                optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                optimizer.step()
-                loss_sum += float(loss.detach())
-                if step % report_every == 0 or step == n - 1:
-                    pct = 100.0 * (step + 1) / max(n, 1)
-                    print(
-                        f"    [{step + 1}/{n}] {pct:5.1f}%  loss={loss.item():.4f}",
-                        flush=True,
+            max_batch_loss_epoch = max_batch_loss if bi > 0 else float("nan")
+            n_windows = bi * traj_batch_size
+
+        else:  # CE mode
+            for contexts, targets in batch_iter:
+                for context, target_id in zip(contexts, targets):
+                    logits = model.forward_training_window(context)
+                    prev_id = context[-1]
+                    logits = logits + BIGRAM_TRAIN_WEIGHT * torch.matmul(
+                        model.embedder.weight, model.embedder.weight[prev_id]
                     )
-            mean_loss = loss_sum / max(n, 1)
+                    lo = logits.clone()
+                    lo[prev_id] -= 2.0
+                    for t in context[-3:]:
+                        lo[t] -= 1.0
+                    lo = lo + TRAIN_LOGIT_NOISE * torch.randn_like(lo)
+                    probs_floor = F.softmax(lo, dim=-1)
+                    ent_s = -(probs_floor * torch.log(probs_floor + 1e-9)).sum()
+                    if float(ent_s.detach()) < ENTROPY_FLOOR:
+                        lo = lo + torch.randn_like(lo) * ENTROPY_FLOOR_NOISE
+                        probs_for_entropy = F.softmax(lo, dim=-1)
+                    else:
+                        probs_for_entropy = probs_floor
+                    target = torch.tensor([target_id], device=device, dtype=torch.long)
+                    loss_ce = F.cross_entropy(
+                        lo.unsqueeze(0), target, label_smoothing=LABEL_SMOOTHING
+                    )
+                    entropy = -(probs_for_entropy * torch.log(probs_for_entropy + 1e-8)).sum()
+                    step_loss = loss_ce - ENTROPY_WEIGHT * entropy
+                    optimizer.zero_grad(set_to_none=True)
+                    step_loss.backward()
+                    optimizer.step()
+                    loss_sum += float(step_loss.detach())
+                    global_step += 1
+
+                    if substrate is not None:
+                        try:
+                            substrate.on_batch(model)
+                        except Exception:
+                            pass
+                    if model._goat_mgr is not None:
+                        try:
+                            model._goat_mgr.tick([context])
+                        except Exception:
+                            pass
+                    if args.save_every > 0 and global_step % args.save_every == 0:
+                        _save_checkpoint(model, optimizer, global_step, epoch, args, ckpt_dir)
+                bi += 1
+
+            mean_loss = loss_sum / max(bi * traj_batch_size, 1)
+            max_batch_loss_epoch = float("nan")
+            n_windows = bi * traj_batch_size
 
         ep_sec = time.perf_counter() - t_ep0
-        train_ce = mean_cross_entropy_eval(model, dataset)
-        val_msg = ""
+
+        # Bug 4: real train CE from batch readout_window logits (not val CE).
+        train_ce: float = train_ce_sum / max(train_ce_count, 1) if train_ce_count > 0 else float("nan")
+
         vce: float | None = None
+        val_msg = ""
         if val_dataset:
             vce = mean_cross_entropy_eval(model, val_dataset)
             val_msg = f"  |  val CE={vce:.4f}"
+
+        # Bug 3: compute val_traj_contrast (on held-out val data) and
+        # train_traj_contrast (on last training batch, no extra eval pass).
         train_traj_contrast: float | None = None
         val_traj_contrast: float | None = None
         lr_now = optimizer.param_groups[0]["lr"]
+
         if args.loss_mode == "trajectory":
-            train_traj_contrast = mean_trajectory_contrastive_eval(
-                model, dataset, batch_size=args.trajectory_batch_size
-            )
+            # val_traj_contrast — on the held-out val split.
             if val_dataset:
                 val_traj_contrast = mean_trajectory_contrastive_eval(
-                    model, val_dataset, batch_size=args.trajectory_batch_size
+                    model, val_dataset, batch_size=traj_batch_size
                 )
-            tm_s = f"{train_traj_contrast:.6f}" if train_traj_contrast is not None else "n/a"
-            vm_s = f"{val_traj_contrast:.6f}" if val_traj_contrast is not None else "n/a"
+            # train_traj_contrast — on the last batch seen this epoch (cheap, no extra forward pass
+            # beyond what's already in memory).
+            if _last_batch_contexts:
+                _tc_data = list(zip(_last_batch_contexts, _last_batch_targets))
+                with torch.no_grad():
+                    _tc_contexts = [c for c, _ in _tc_data]
+                    _tc_targets = [t for _, t in _tc_data]
+                    _tl, _ = model.trajectory_contrastive_loss_and_logits(_tc_contexts, _tc_targets)
+                    train_traj_contrast = float(_tl.detach())
+
+            vtc_s = f"{val_traj_contrast:.6f}" if val_traj_contrast is not None else "n/a"
             mft_s = (
                 f"  mean_final_T={mean_final_step_tension:.4f}"
                 if math.isfinite(mean_final_step_tension)
@@ -1696,8 +1836,8 @@ def main() -> None:
             )
             print(
                 f"  epoch {epoch + 1} done  |  {ep_sec:.1f}s  |  lr={lr_now:g}  |  "
-                f"mean loss={mean_loss:.4f}  |  train traj contrast={tm_s}  train CE={train_ce:.4f}  "
-                f"val traj contrast={vm_s}{mft_s}{mb_s}{val_msg}",
+                f"mean loss={mean_loss:.4f}  |  val_traj={vtc_s}"
+                f"  train CE={train_ce:.4f}{mft_s}{mb_s}{val_msg}",
                 flush=True,
             )
         else:
@@ -1706,6 +1846,28 @@ def main() -> None:
                 f"mean loss={mean_loss:.4f}  |  train CE={train_ce:.4f}{val_msg}",
                 flush=True,
             )
+
+        # Bug 5: log TSCore evolve_count and last_ts_tension.
+        ep_ts_tension: float = 0.0
+        ep_evolves: int = 0
+        if substrate is not None:
+            ep_evolves = substrate.evolve_count - substrate_evolve_start
+            ep_ts_tension = substrate.last_ts_tension
+            print(
+                f"  [tscore] evolves={ep_evolves}  last_ts_tension={ep_ts_tension:.4f}"
+                f"  active_batches={substrate_active_count}  idle_batches={substrate_idle_count}",
+                flush=True,
+            )
+            # Bug 6: warn once per epoch when TSCore was idle the entire epoch.
+            if substrate_active_count == 0 and substrate_idle_count > 0:
+                _max_tension = max(final_tension_values) if final_tension_values else 0.0
+                print(
+                    f"  [tscore] WARNING: inactive all epoch "
+                    f"(max lang_tension={_max_tension:.4f} < threshold={substrate.high_tension_threshold:.3f})",
+                    flush=True,
+                )
+
+        # Phase 12: CSV metrics logging (updated headers for Bug 4/5).
         if args.epoch_metrics_csv is not None:
             mpath = Path(args.epoch_metrics_csv)
             mpath.parent.mkdir(parents=True, exist_ok=True)
@@ -1718,59 +1880,58 @@ def main() -> None:
                 f"{vce:.6f}" if vce is not None else "",
                 f"{train_traj_contrast:.6f}" if train_traj_contrast is not None else "",
                 f"{val_traj_contrast:.6f}" if val_traj_contrast is not None else "",
-                f"{mean_final_step_tension:.6f}"
-                if math.isfinite(mean_final_step_tension)
-                else "",
-                f"{max_batch_loss_epoch:.6f}"
-                if math.isfinite(max_batch_loss_epoch)
-                else "",
+                f"{mean_final_step_tension:.6f}" if math.isfinite(mean_final_step_tension) else "",
+                f"{max_batch_loss_epoch:.6f}" if math.isfinite(max_batch_loss_epoch) else "",
                 f"{lr_now:.8f}",
+                str(global_step),
+                str(ep_evolves),
+                f"{ep_ts_tension:.6f}",
             ]
             with mpath.open("a", newline="", encoding="utf-8") as f:
                 w = csv.writer(f)
                 if new_file:
-                    w.writerow(
-                        [
-                            "epoch",
-                            "loss_mode",
-                            "mean_loss",
-                            "train_ce",
-                            "val_ce",
-                            "train_traj_contrast",
-                            "val_traj_contrast",
-                            "mean_final_step_tension",
-                            "max_batch_loss",
-                            "lr",
-                        ]
-                    )
+                    w.writerow([
+                        "epoch", "loss_mode", "mean_loss", "train_ce", "val_ce",
+                        "train_traj_contrast", "val_traj_contrast",
+                        "mean_final_step_tension", "max_batch_loss", "lr", "global_step",
+                        "tscore_evolves", "tscore_last_tension",
+                    ])
                 w.writerow(row)
+
         if lr_scheduler is not None:
             lr_scheduler.step()
+
         last_mean_loss = mean_loss
         last_train_ce = train_ce
         last_val_ce = vce
-        last_train_traj_contrast = (
-            train_traj_contrast if args.loss_mode == "trajectory" else None
-        )
-        last_val_traj_contrast = (
-            val_traj_contrast if args.loss_mode == "trajectory" else None
-        )
-        last_n_windows = n
+        last_train_traj_contrast = train_traj_contrast if args.loss_mode == "trajectory" else None
+        last_val_traj_contrast = val_traj_contrast if args.loss_mode == "trajectory" else None
+        last_n_windows = n_windows
         last_epoch_sec = ep_sec
         last_epoch_num = epoch + 1
 
-    train_sec_total = time.perf_counter() - t_train0
-    print(f"Pre-training done in {train_sec_total:.1f}s total.")
+    # Clean up temp file
+    try:
+        os.unlink(_tmp_train_path)
+    except OSError:
+        pass
 
-    print("\nPrompt 1:")
+    train_sec_total = time.perf_counter() - t_train0
+    print(f"Pre-training done in {train_sec_total:.1f}s total.", flush=True)
+
+    # Phase 4: final checkpoint
+    _save_checkpoint(model, optimizer, global_step, last_epoch_num, args, ckpt_dir)
+
+    # Phase 12: sample generations (decode via tokenizer)
+    print("\nPrompt 1:", flush=True)
     gen_baseline_1 = model.generate(BASELINE_PROMPT_1)
-    print(gen_baseline_1)
-    print("\nPrompt 2:")
+    print(gen_baseline_1, flush=True)
+    print("\nPrompt 2:", flush=True)
     gen_baseline_2 = model.generate(BASELINE_PROMPT_2)
-    print(gen_baseline_2)
-    print("\n(Order sensitivity check — same words, different order:)")
+    print(gen_baseline_2, flush=True)
+    print("\n(Order sensitivity check:)", flush=True)
     gen_baseline_3 = model.generate(BASELINE_PROMPT_3)
-    print(gen_baseline_3)
+    print(gen_baseline_3, flush=True)
 
     baseline_block = _format_phase0_baseline_block(
         corpus_path=corpus_path,
@@ -1799,18 +1960,15 @@ def main() -> None:
         args.baseline_out.parent.mkdir(parents=True, exist_ok=True)
         args.baseline_out.write_text(baseline_block, encoding="utf-8")
         print(f"Wrote baseline snapshot to {args.baseline_out}", flush=True)
-    print("\nDebug attractor tracking (one prompt):")
+
+    print("\nDebug attractor tracking:", flush=True)
     model.generate(
         "the system stays stable because the reason is clear",
         max_tokens=12,
         debug_track=True,
     )
-    print("\nTrajectory sensitivity (compare_prompts):")
-    compare_prompts(
-        model,
-        "mind reason cause effect system",
-        "effect cause reason mind system",
-    )
+    print("\nTrajectory sensitivity:", flush=True)
+    compare_prompts(model, "mind reason cause effect system", "effect cause reason mind system")
     compare_prompts(
         model,
         "the quick brown fox jumps over the lazy dog",

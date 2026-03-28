@@ -115,6 +115,14 @@ class VectorizedWindowDynamics(nn.Module):
         out = _clamp_norm(out, 1e-3, 12.0)
         return out.reshape(B, W, D)
 
+    def step(self, S: torch.Tensor, signal: torch.Tensor) -> torch.Tensor:
+        """Unified step interface matching SimpleAttractorDynamics.step(S, signal).
+
+        Delegates to _step so both dynamics classes are drop-in swappable inside
+        _single_window_step without any attribute access.
+        """
+        return self._step(S, signal)
+
     def forward(
         self,
         S: torch.Tensor,

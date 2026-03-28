@@ -2,16 +2,16 @@
 Wave G — Inference server.
 
 Serves the TorchAttractorLanguageModel via FastAPI (OpenAI-compatible /v1/completions
-endpoint). Uses the rolling state cache from wave_c_cache for O(1)-per-token latency.
+endpoint). Uses the rolling state cache from state_cache.py for O(1)-per-token latency.
 
 Endpoints
 ---------
 GET  /health                 — liveness + tension metrics
 POST /v1/completions         — OpenAI-compatible text completion
 POST /v1/generate            — raw generate call (more options)
-GET  /metrics/tension        — last window tension curve
+GET  /metrics/tension        — last window tension curve (computed during generation)
 POST /ts/propagate           — trigger one TSCore wave propagation
-GET  /ts/tension             — current TSCore graph tension
+GET  /ts/tension             — current TSCore graph tension (live)
 
 Run
 ---
@@ -21,7 +21,7 @@ Requires FastAPI and uvicorn:
     pip install fastapi uvicorn
 
 If --model-checkpoint is not given, an untrained model (sandbox defaults) is loaded.
-The server auto-installs state_cache and llm_substrate_node as background threads.
+TSCore substrate is activated per request via on_batch(); no background threads.
 """
 from __future__ import annotations
 
@@ -57,18 +57,31 @@ from llm_substrate_node import LLMSubstrateNode  # type: ignore[import]
 # Model loader
 # --------------------------------------------------------------------------
 
-def load_model(checkpoint: Optional[str] = None) -> "sb.TorchAttractorLanguageModel":
+def load_model(
+    checkpoint: Optional[str] = None,
+    tokenizer_mode: str = "fallback",
+    vocab_cap: int = 32768,
+) -> "sb.TorchAttractorLanguageModel":
     import torch
-    model = sb.TorchAttractorLanguageModel(sb.FULL_VOCAB)
+    tok = sb._build_tokenizer(mode=tokenizer_mode, vocab_cap=vocab_cap)
     if checkpoint:
         p = Path(checkpoint)
         if not p.exists():
             raise FileNotFoundError(f"Checkpoint not found: {checkpoint}")
-        state_dict = torch.load(str(p), map_location="cpu", weights_only=True)
-        model.load_state_dict(state_dict)
+        ckpt = torch.load(str(p), map_location="cpu")
+        vocab_size = ckpt.get("vocab_size", tok.n_vocab)
+        cfg = ckpt.get("config", {})
+        state_dim = cfg.get("state_dim", 512)
+        window_size = cfg.get("train_window_size", 6)
+        model = sb.TorchAttractorLanguageModel(
+            vocab_size, state_dim=state_dim, train_window_size=window_size
+        )
+        model.load_state_dict(ckpt["model_state"])
         print(f"[inference_server] loaded checkpoint: {checkpoint}", flush=True)
     else:
+        model = sb.TorchAttractorLanguageModel(tok.n_vocab)
         print("[inference_server] no checkpoint — using untrained model", flush=True)
+    model.tokenizer = tok
     model.eval()
     return model
 
@@ -92,6 +105,18 @@ class AppState:
         top_k: int = 28,
     ) -> dict:
         with self._lock:
+            # Run full window dynamics for one forward pass to populate tension curve.
+            tok = self.model.tokenizer
+            prompt_ids = tok.encode(prompt) if tok is not None else [0]
+            if not prompt_ids:
+                prompt_ids = [0]
+            import torch
+            self.model.eval()
+            with torch.inference_mode():
+                wid = self.model.window_ids_from_sequence(prompt_ids)
+                _ = self.model.forward_training_window(wid)
+            curve = list(getattr(self.model, "_last_window_tension_curve", []))
+
             text = generate_with_cache(
                 self.model,
                 self.cache,
@@ -101,11 +126,16 @@ class AppState:
                 top_k=top_k,
                 reset=True,
             )
-            curve = getattr(self.model, "_last_window_tension_curve", [])
+            # Compute real TSCore tension after generation.
+            try:
+                self.substrate.on_batch(self.model)
+            except Exception:
+                pass
             ts_t = self.substrate.last_ts_tension
         return {
             "text": text,
             "tension_curve": curve,
+            "last_tension": float(curve[-1]) if curve else None,
             "ts_tension": ts_t,
             "evolve_count": self.substrate.evolve_count,
         }
@@ -228,10 +258,12 @@ def create_app(state: AppState) -> "FastAPI":
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="woke-baby-llm inference server (Wave G)")
-    parser.add_argument("--model-checkpoint", default=None, help="Path to model state_dict .pt file")
+    parser.add_argument("--model-checkpoint", default=None, help="Path to .pt checkpoint file")
+    parser.add_argument("--tokenizer", choices=("tiktoken", "fallback"), default="fallback")
+    parser.add_argument("--vocab-cap", type=int, default=32768)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--self-test", action="store_true", help="Run a quick functional test and exit")
+    parser.add_argument("--self-test", action="store_true", help="Quick functional test and exit")
     args = parser.parse_args()
 
     state = AppState(checkpoint=args.model_checkpoint)

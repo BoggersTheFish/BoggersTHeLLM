@@ -170,12 +170,21 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Wave H evaluation harness")
     parser.add_argument("--corpus", default="data/corpus.txt")
     parser.add_argument("--val-fraction", type=float, default=0.2)
-    parser.add_argument("--model-checkpoint", default=None)
-    parser.add_argument("--wave-cycles", type=int, default=11)
+    parser.add_argument("--model-checkpoint", default=None,
+        help="Path to .pt checkpoint file (as saved by sandbox.py).")
+    parser.add_argument("--tokenizer", choices=("tiktoken", "fallback"), default="fallback")
+    parser.add_argument("--vocab-cap", type=int, default=32768)
+    parser.add_argument("--max-ticks", type=int, default=11,
+        help="Number of TSCore ticks in the wave cycle (was --wave-cycles).")
+    parser.add_argument("--wave-cycles", type=int, default=None,
+        help="Deprecated alias for --max-ticks.")
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--window-size", type=int, default=6)
     parser.add_argument("--output", default="eval_results.json")
     args = parser.parse_args()
+
+    # Resolve deprecated alias
+    max_ticks = args.wave_cycles if args.wave_cycles is not None else args.max_ticks
 
     corpus_path = Path(args.corpus)
     if not corpus_path.exists():
@@ -183,17 +192,31 @@ def main() -> None:
         sys.exit(1)
 
     print("[eval] loading model ...", flush=True)
-    model = sb.TorchAttractorLanguageModel(sb.FULL_VOCAB, train_window_size=args.window_size)
+    tok = sb._build_tokenizer(mode=args.tokenizer, vocab_cap=args.vocab_cap)
+
     if args.model_checkpoint:
-        sd = torch.load(args.model_checkpoint, map_location="cpu", weights_only=True)
-        model.load_state_dict(sd)
+        ckpt = torch.load(args.model_checkpoint, map_location="cpu")
+        vocab_size = ckpt.get("vocab_size", tok.n_vocab)
+        cfg = ckpt.get("config", {})
+        model = sb.TorchAttractorLanguageModel(
+            vocab_size,
+            state_dim=cfg.get("state_dim", 512),
+            train_window_size=args.window_size,
+        )
+        model.load_state_dict(ckpt["model_state"])
         print(f"[eval] loaded checkpoint: {args.model_checkpoint}", flush=True)
+    else:
+        model = sb.TorchAttractorLanguageModel(tok.n_vocab, train_window_size=args.window_size)
+        print("[eval] using untrained model", flush=True)
+
+    model.tokenizer = tok
     model.eval()
 
     sentences = sb.load_corpus(corpus_path)
     print(f"[eval] corpus: {len(sentences)} lines", flush=True)
 
-    usable = sb.sentences_with_training_windows(sentences, set(model.vocab), args.window_size)
+    # Use held-out val split for meaningful evaluation.
+    usable = sb.sentences_with_training_windows(sentences, tok, args.window_size)
     train_sents, val_sents = sb.train_val_split(usable, args.val_fraction, seed=42)
     val_dataset = sb.build_dataset_from_sentences(val_sents, model, args.window_size)
     train_dataset = sb.build_dataset_from_sentences(train_sents, model, args.window_size)
@@ -214,10 +237,10 @@ def main() -> None:
         high_tension_threshold=0.01,
         quiet=True,
     )
-    print(f"[eval] running {args.wave_cycles}-tick WaveCycle ...", flush=True)
+    print(f"[eval] running {max_ticks}-tick WaveCycle ...", flush=True)
     wave_result = run_wave_cycle(
         model, substrate, train_dataset,
-        max_ticks=args.wave_cycles,
+        max_ticks=max_ticks,
         batch_size=args.batch_size,
     )
     print(
@@ -249,9 +272,10 @@ def main() -> None:
         "config": {
             "corpus": str(corpus_path),
             "val_fraction": args.val_fraction,
-            "wave_cycles": args.wave_cycles,
+            "max_ticks": max_ticks,
             "window_size": args.window_size,
             "checkpoint": args.model_checkpoint,
+            "tokenizer": args.tokenizer,
         },
     }
 

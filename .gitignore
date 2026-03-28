@@ -1,4 +1,6 @@
 .venv/
+# Local TSCore data dir used by smoke / dev runs
+.tscore_smoke/
 # Local training / metric dumps (use --epoch-metrics-csv paths you choose)
 metrics.csv
 docs/BASELINE_LAST_RUN.txt

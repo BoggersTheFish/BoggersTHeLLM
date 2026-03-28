@@ -184,9 +184,13 @@ def generate_with_cache(
     """
     import sandbox as _sb  # noqa: F811  # type: ignore[import]
 
-    w2i = model._word_to_idx
-    prompt_words = [w for w in prompt.lower().split() if w in w2i] or ["the"]
-    prompt_ids = [w2i[w] for w in prompt_words]
+    tok = getattr(model, "tokenizer", None)
+    if tok is not None:
+        prompt_ids = tok.encode(prompt)
+    else:
+        prompt_ids = list(range(min(model.train_window_size, 6)))
+    if not prompt_ids:
+        prompt_ids = [0]
 
     if reset:
         cache.reset()
@@ -195,15 +199,12 @@ def generate_with_cache(
     model.eval()
 
     with torch.inference_mode():
-        # Warm up the cache on the prompt
         cache.warmup(prompt_ids)
 
         generated_ids = list(prompt_ids)
-        generated_words = list(prompt_words)
 
         for _ in range(max_tokens):
             logits = cache.logits()
-            # Apply repeat penalty on recent tokens
             recent = generated_ids[-top_k:] if len(generated_ids) > top_k else generated_ids
             for rid in set(recent):
                 logits[rid] = logits[rid] / repeat_penalty
@@ -219,13 +220,14 @@ def generate_with_cache(
                 no_repeat_last_extra,
             )
             generated_ids.append(next_id)
-            generated_words.append(model.vocab[next_id])
             cache.step(next_id)
 
     if was_training:
         model.train()
 
-    return " ".join(generated_words)
+    if tok is not None:
+        return tok.decode(generated_ids)
+    return " ".join(str(i) for i in generated_ids)
 
 
 # --------------------------------------------------------------------------
@@ -240,15 +242,16 @@ if __name__ == "__main__":
 
     print("[wave-c] state_cache self-test ...", flush=True)
 
-    model = sb.TorchAttractorLanguageModel(sb.FULL_VOCAB, state_dim=512, train_window_size=4)
+    tok = sb._build_tokenizer(mode="fallback", vocab_cap=512)
+    model = sb.TorchAttractorLanguageModel(tok.n_vocab, state_dim=512, train_window_size=4)
+    model.tokenizer = tok
     model.eval()
     cache = AttractorStateCache(model)
 
     # Test 1: step produces finite states
-    w2i = model._word_to_idx
-    for word in ["the", "cat", "sat", "on"]:
-        if word in w2i:
-            fs = cache.step(w2i[word])
+    for word in ["the cat sat on"]:
+        for tid in tok.encode(word)[:4]:
+            cache.step(tid)
     assert torch.isfinite(cache.fast_state).all(), "fast_state is not finite"
     assert torch.isfinite(cache.slow_memory).all(), "slow_memory is not finite"
     print(f"  test 1 PASS — fast_state norm={cache.fast_state.norm():.4f}  slow_norm={cache.slow_memory.norm():.4f}", flush=True)

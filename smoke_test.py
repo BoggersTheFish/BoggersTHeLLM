@@ -34,37 +34,34 @@ import torch.nn.functional as F
 print("[smoke] importing sandbox ...", flush=True)
 import sandbox as sb
 
-FULL_VOCAB = sb.FULL_VOCAB
-print(f"[smoke] vocab size: {len(FULL_VOCAB)}", flush=True)
+# Build tokenizer (fallback mode = tiktoken BPE capped at 512)
+tok = sb._build_tokenizer(mode="fallback", vocab_cap=512)
+print(f"[smoke] vocab size: {tok.n_vocab}", flush=True)
 
 # --------------------------------------------------------------------------
 # 2. Instantiate model with tiny config (window=4, fast dynamics only)
 # --------------------------------------------------------------------------
-model = sb.TorchAttractorLanguageModel(FULL_VOCAB, train_window_size=4, max_window_steps=8)
+model = sb.TorchAttractorLanguageModel(tok.n_vocab, train_window_size=4, max_window_steps=8)
+model.tokenizer = tok
 model.eval()
 
 W = model.train_window_size
-w2i = model._word_to_idx
 
 # Tiny corpus: sentences from data/corpus.txt or fallback
 corpus_path = REPO / "data" / "corpus.txt"
-sentences = sb.load_corpus(corpus_path) if corpus_path.is_file() else [
-    "the quick brown fox jumps over the lazy dog",
-    "mind understands the cause and the effect",
-    "the problem appears but the solution exists because the reason is clear",
-]
+sentences = sb.load_corpus(corpus_path) if corpus_path.is_file() else sb._FALLBACK_SENTENCES
 print(f"[smoke] corpus lines: {len(sentences)}", flush=True)
 
 # Filter to sentences that yield at least one training window
-usable = sb.sentences_with_training_windows(sentences, set(model.vocab), W)
-assert usable, "No usable training windows in corpus — check vocabulary coverage."
+usable = sb.sentences_with_training_windows(sentences, tok, W)
+assert usable, "No usable training windows in corpus — check tokenization."
 print(f"[smoke] usable sentences: {len(usable)}", flush=True)
 
 # --------------------------------------------------------------------------
 # 3. One wave cycle: single forward pass through run_window_dynamics
 # --------------------------------------------------------------------------
-ids = [w2i[w] for w in usable[0].lower().split() if w in w2i]
-assert len(ids) >= W + 1, "First usable sentence too short after filtering."
+ids = tok.encode(usable[0])
+assert len(ids) >= W + 1, "First usable sentence too short after tokenization."
 
 window_ids = model.window_ids_from_sequence(ids)
 S0 = model.embed_window(window_ids)

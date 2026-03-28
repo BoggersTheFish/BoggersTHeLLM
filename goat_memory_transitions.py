@@ -102,16 +102,17 @@ class GoatMemoryManager:
         self.ticks_to_deep = ticks_to_deep
         self.bonus_scale = bonus_scale
 
-        vocab = model.vocab
-        # One Node per token; activation starts at dormant_threshold
+        vocab_size = model.vocab_size
+        # One Node per token; activation starts at dormant_threshold.
+        # Labels are string token IDs (no word list required).
         self.nodes: list[Node] = [
             Node(
                 node_id=str(i),
-                label=w,
+                label=str(i),
                 activation=dormant_threshold,
                 state=MemoryState.DORMANT,
             )
-            for i, w in enumerate(vocab)
+            for i in range(vocab_size)
         ]
         self._low_activation_ticks: dict[str, int] = {}
         self._tick_count: int = 0
@@ -213,7 +214,9 @@ if __name__ == "__main__":
 
     print("[wave-f] goat_memory_transitions self-test ...", flush=True)
 
-    model = sb.TorchAttractorLanguageModel(sb.FULL_VOCAB, train_window_size=4)
+    tok = sb._build_tokenizer(mode="fallback", vocab_cap=512)
+    model = sb.TorchAttractorLanguageModel(tok.n_vocab, train_window_size=4)
+    model.tokenizer = tok
     mem = GoatMemoryManager(model, ticks_to_deep=2)
 
     # Test 1: initial state is all DORMANT
@@ -222,8 +225,7 @@ if __name__ == "__main__":
     print(f"  test 1 PASS — all {st['dormant']} tokens start DORMANT", flush=True)
 
     # Test 2: after one tick with real token ids, some tokens become ACTIVE
-    w2i = model._word_to_idx
-    contexts = [[w2i["the"], w2i["cat"], w2i["sat"], w2i["on"]]]
+    contexts = [tok.encode("the cat sat on")]
     mem.tick(contexts)
     st2 = mem.stats()
     assert st2["active"] > 0, f"No tokens became ACTIVE after tick: {st2}"

@@ -49,14 +49,17 @@ if TYPE_CHECKING:
 # --------------------------------------------------------------------------
 
 class _WordListTokenizer:
-    """Fallback tokenizer: split on whitespace, filter to model vocab."""
+    """Last-resort tokenizer: delegates to model.tokenizer or uses hash-based IDs."""
 
     def __init__(self, model: "sb.TorchAttractorLanguageModel") -> None:
-        self._w2i = model._word_to_idx
         self.n_vocab = model.vocab_size
+        self._tok = getattr(model, "tokenizer", None)
 
     def encode(self, text: str) -> list[int]:
-        return [self._w2i[w] for w in text.lower().split() if w in self._w2i]
+        if self._tok is not None:
+            return self._tok.encode(text)
+        # Bare minimum: stable hash-based IDs (no vocabulary required).
+        return [hash(w) % self.n_vocab for w in text.lower().split()]
 
 
 # --------------------------------------------------------------------------
@@ -242,7 +245,9 @@ if __name__ == "__main__":
     print("[wave-d] data_pipeline self-test ...", flush=True)
 
     CORPUS = _Path(__file__).resolve().parent / "data" / "corpus.txt"
-    model = sb.TorchAttractorLanguageModel(sb.FULL_VOCAB, train_window_size=4)
+    tok = sb._build_tokenizer(mode="fallback", vocab_cap=512)
+    model = sb.TorchAttractorLanguageModel(tok.n_vocab, train_window_size=4)
+    model.tokenizer = tok
     model.eval()
 
     pipe = AttractorDataPipeline(
@@ -251,6 +256,7 @@ if __name__ == "__main__":
         batch_size=4,
         window_size=4,
         shuffle_buffer=64,
+        tokenizer=tok,
         seed=0,
     )
 
@@ -273,7 +279,7 @@ if __name__ == "__main__":
     # Test 3: JSONL support (write a temp file)
     import json, tempfile, os
     with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as fh:
-        for sentence in sb.load_corpus(CORPUS)[:5]:
+        for sentence in sb.load_corpus(CORPUS)[:5]:  # type: ignore[attr-defined]
             fh.write(json.dumps({"text": sentence}) + "\n")
         tmp = fh.name
 
