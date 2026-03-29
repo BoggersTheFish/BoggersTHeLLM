@@ -2,7 +2,7 @@
 
 **BoggersTheLanguageModel** is a production-grade continuous attractor language model built without attention, transformers, or traditional LLM methods. State follows a physical **trajectory**; meaning is **path-dependent**. The architecture is driven by the **Propagate → Relax → Break → Evolve** cycle that powers the TS-OS.
 
-**Source repository:** [github.com/BoggersTheFish/idekatp](https://github.com/BoggersTheFish/idekatp) (clone the repo as `idekatp`; the product name is BoggersTheLanguageModel.)
+**Primary repository:** [github.com/BoggersTheFish/BoggersTHeLLM](https://github.com/BoggersTheFish/BoggersTHeLLM) — clone as `BoggersTHeLLM` (or any folder name). **Alternate mirror:** [github.com/BoggersTheFish/idekatp](https://github.com/BoggersTheFish/idekatp). The product name is **BoggersTheLanguageModel**.
 
 ---
 
@@ -59,6 +59,7 @@ The network contains only:
 | `state_cache.py` | C | Rolling attractor state cache — O(1) per token at inference |
 | `data_pipeline.py` | D | Streaming sharded DataLoader (txt / JSONL, multi-worker) |
 | `data/generate_corpus.py` | — | Deterministic synthetic `.txt` corpus (tiktoken-sized); CLI + `sandbox` fallback |
+| `data/hf_remote_corpus.py` | — | TinyStories / FineWeb-Edu → cached `.txt` for training (`--dataset-source`) |
 | `data/__init__.py` | — | Package marker for `data.generate_corpus` imports |
 | `llm_substrate_node.py` | E | Registers model as a native TSCore node; Evolve hook |
 | `goat_memory_transitions.py` | F | GOAT-TS ACTIVE → DORMANT → DEEP token state transitions |
@@ -82,8 +83,8 @@ The network contains only:
 - [PyTorch](https://pytorch.org/) (CPU or CUDA)
 
 ```bash
-git clone --recurse-submodules https://github.com/BoggersTheFish/idekatp.git
-cd idekatp
+git clone --recurse-submodules https://github.com/BoggersTheFish/BoggersTHeLLM.git
+cd BoggersTHeLLM
 python3 -m venv .venv
 source .venv/bin/activate   # after this, `python` usually works; without venv use `python3`
 pip install -r requirements.txt
@@ -109,6 +110,76 @@ python3 sandbox.py \
   --max-epochs 30
 ```
 
+### First real training run (public corpus + checkpoint + eval JSON)
+
+The default `data/corpus.txt` (or empty path) may trigger a **synthetic** text fallback so integration tests always have enough tokens. For a **real** corpus and metrics that reflect language modeling (not random-like ~506 val perplexity on a toy file), use a Hub dataset or your own large `.txt` / directory.
+
+**Option A — TinyStories via Hugging Face (recommended first real run)**
+
+Requires `datasets` (included in `requirements.txt`). The first run downloads data into `data/cache/hf/`. Optional: set `HF_TOKEN` for higher Hub rate limits.
+
+```bash
+pip install -r requirements.txt
+mkdir -p checkpoints/real_run
+
+python3 sandbox.py \
+  --dataset-source tinystories \
+  --tokenizer tiktoken \
+  --val-fraction 0.1 \
+  --max-epochs 50 \
+  --use-goat-memory \
+  --use-substrate \
+  --lr 0.001 \
+  --lr-decay-every 15 \
+  --lr-gamma 0.7 \
+  --epoch-metrics-csv metrics_real.csv \
+  --eval-results-json eval_results.json \
+  --checkpoint-dir checkpoints/real_run
+```
+
+This writes a final `ckpt_step*.pt` under `--checkpoint-dir` and an **`eval_results.json`** with the same **token-level val split** as training (`val_ce`, `val_ppl`, `val_windows`, checkpoint path). Perplexity should move off the untrained baseline as loss decreases.
+
+**Option B — FineWeb-Edu subset (streaming)**
+
+Uses the `sample-10BT` config and stops after `--hf-max-rows` rows (default 50k):
+
+```bash
+python3 sandbox.py \
+  --dataset-source fineweb-edu \
+  --hf-max-rows 20000 \
+  --tokenizer tiktoken \
+  --val-fraction 0.1 \
+  --max-epochs 50 \
+  --eval-results-json eval_results.json \
+  --checkpoint-dir checkpoints/fineweb_run
+```
+
+**Option C — Your own corpus (TS-OS export or any large text)**
+
+Place UTF-8 text at `data/corpus.txt`, or pass `--corpus /path/to/dir` (merges `.txt` / `.jsonl`). To **disable** automatic synthetic fallback when the file is missing or tiny:
+
+```bash
+python3 sandbox.py --corpus data/my_corpus.txt --no-synthetic-fallback --tokenizer tiktoken ...
+```
+
+**Materialize HF data only (no training)**
+
+```bash
+python3 data/hf_remote_corpus.py tinystories --max-rows 50000 --cache-dir data/cache/hf
+# The script prints the path to the generated .txt; pass it to --corpus:
+python3 sandbox.py --corpus PATH_PRINTED_ABOVE --tokenizer tiktoken ...
+```
+
+**Full Wave H harness** (TSCore before/after tension + same val perplexity) on the same cached file:
+
+```bash
+python3 eval_harness.py \
+  --dataset-source tinystories \
+  --tokenizer tiktoken \
+  --model-checkpoint checkpoints/real_run/ckpt_step0001234.pt \
+  --output eval_results_wave_h.json
+```
+
 ### Run the smoke test
 
 Verifies dynamics, tension, training step, and TSCore wave cycle all pass:
@@ -121,6 +192,13 @@ python3 smoke_test.py
 
 ```bash
 python3 eval_harness.py --val-fraction 0.2 --max-ticks 11 --output eval_results.json
+```
+
+Use the same Hugging Face corpus as training (ignores `--corpus` when set):
+
+```bash
+python3 eval_harness.py --dataset-source tinystories --tokenizer tiktoken \
+  --val-fraction 0.2 --max-ticks 11 --output eval_results.json
 ```
 
 (`--wave-cycles` is a deprecated alias for `--max-ticks`.)
@@ -170,7 +248,9 @@ This section is the operational manual — what to run, how data and validation 
 
 **Corpus path.** `--dataset-path` wins over `--corpus` if both are set; otherwise the default is `data/corpus.txt`. Paths may be a single file, a directory (all `.txt` / `.jsonl` / `.json` under it, merged), or `.jsonl` with `text` / `content` / `sentence` fields concatenated.
 
-**Automatic fallback.** If no text files resolve for the path, or if the tokenized sequence is shorter than `20 * window_size` tokens, training prints `Corpus too small — generating synthetic corpus...`, writes a **temporary** UTF-8 file using `data/generate_corpus.py`’s `generate_corpus()` (target length at least 20k tiktoken GPT-2 tokens, scaled up slightly with window size), trains from that file, and deletes the temp file after the run. This keeps local experiments runnable without hand-curating a large corpus.
+**Hugging Face datasets (`--dataset-source`).** With `--dataset-source tinystories` or `fineweb-edu`, the sandbox ignores `--corpus` / `--dataset-path` for loading and materializes text into `data/cache/hf/` (override with `--hf-cache-dir`). Limits: `--hf-max-rows`, `--hf-max-chars`; `--hf-refresh` rebuilds the cache file. Requires `pip install datasets` (listed in `requirements.txt`).
+
+**Automatic fallback.** If no text files resolve for the path, or if the tokenized sequence is shorter than `20 * window_size` tokens, training prints `Corpus too small — generating synthetic corpus...`, writes a **temporary** UTF-8 file using `data/generate_corpus.py`’s `generate_corpus()` (target length at least 20k tiktoken GPT-2 tokens, scaled up slightly with window size), trains from that file, and deletes the temp file after the run. This keeps local experiments runnable without hand-curating a large corpus. Pass **`--no-synthetic-fallback`** to fail fast instead (recommended when you expect a real corpus file to be present).
 
 **Manual corpus generation.** To persist synthetic text instead of a temp file:
 
@@ -202,7 +282,7 @@ python3 sandbox.py --corpus data/generated.txt
 | Command | Purpose |
 |--------|---------|
 | `python3 smoke_test.py` | Fast integration check: model + one dynamics pass + training step + TSCore wave cycle. Run after install or refactors. |
-| `python3 eval_harness.py …` | Perplexity, mean tension, trajectory contrast, optional TSCore `WaveCycleRunner` metrics; writes JSON (e.g. `--output eval_results.json`). |
+| `python3 eval_harness.py …` | Perplexity, mean tension, trajectory contrast, optional TSCore `WaveCycleRunner` metrics; writes JSON. Use `--dataset-source tinystories` / `fineweb-edu` to match Hub training data. |
 | `python3 inference_server.py` | FastAPI server: OpenAI-style `/v1/completions`, cache-backed generation, optional TSCore hooks. Needs `pip install fastapi uvicorn`. |
 | `python3 data/generate_corpus.py --out PATH --tokens N` | Offline synthetic corpus for tests or a fixed `data/generated.txt`. |
 
@@ -448,6 +528,12 @@ python3 sandbox.py [options]    # or: source .venv/bin/activate && python sandbo
 Data & tokenizer:
   --corpus PATH              Training text (default: data/corpus.txt)
   --dataset-path PATH        Alias for --corpus (takes precedence if set)
+  --dataset-source {local,tinystories,fineweb-edu}  Hugging Face corpus (requires `datasets`); ignores --corpus
+  --hf-cache-dir PATH        HF materialized text cache (default: data/cache/hf)
+  --hf-max-rows N            HF rows to read (default: 50000)
+  --hf-max-chars N           Optional total character cap (0 = none)
+  --hf-refresh               Rebuild HF cache file
+  --no-synthetic-fallback    Error if corpus missing/too small instead of temp synthetic text
   --val-fraction FLOAT       Token-level val hold-out in stream mode (default: 0.05). Use ~0.3 if you need many val windows; 0 = off.
   --tokenizer {tiktoken,fallback}   BPE mode (default: fallback)
   --vocab-cap INT            Max BPE vocab when using tiktoken mode (default: 32768)
@@ -481,6 +567,7 @@ Integrations:
 
 Logging:
   --epoch-metrics-csv PATH   Per-epoch CSV (see below)
+  --eval-results-json PATH   After training: val CE, val PPL, checkpoint path (same val split as training)
   --log-hard-batch-loss-above FLOAT
   --baseline-out PATH        Phase-0 baseline snapshot text file
 
@@ -530,7 +617,7 @@ python3 sandbox.py \
 Clone with:
 
 ```bash
-git clone --recurse-submodules https://github.com/BoggersTheFish/idekatp.git
+git clone --recurse-submodules https://github.com/BoggersTheFish/BoggersTHeLLM.git
 ```
 
 If already cloned:

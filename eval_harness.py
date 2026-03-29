@@ -10,6 +10,7 @@ Runs the full 11-step WaveCycleRunner on the language substrate and measures:
 Usage
 -----
     python eval_harness.py [--corpus data/corpus.txt] [--val-fraction 0.2]
+                           [--dataset-source tinystories|fineweb-edu]
                            [--model-checkpoint path] [--wave-cycles 11]
                            [--output eval_results.json]
 
@@ -170,7 +171,22 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="BoggersTheLanguageModel — Wave H evaluation harness"
     )
-    parser.add_argument("--corpus", default="data/corpus.txt")
+    parser.add_argument("--corpus", default="data/corpus.txt",
+        help="Training/eval text file (line-based). Ignored when --dataset-source is not local.")
+    parser.add_argument(
+        "--dataset-source",
+        choices=("local", "tinystories", "fineweb-edu"),
+        default="local",
+        help="Same as sandbox.py: materialize a Hugging Face corpus into cache, then evaluate.",
+    )
+    parser.add_argument(
+        "--hf-cache-dir",
+        type=Path,
+        default=_REPO / "data" / "cache" / "hf",
+    )
+    parser.add_argument("--hf-max-rows", type=int, default=50_000)
+    parser.add_argument("--hf-max-chars", type=int, default=0)
+    parser.add_argument("--hf-refresh", action="store_true")
     parser.add_argument("--val-fraction", type=float, default=0.2)
     parser.add_argument("--model-checkpoint", default=None,
         help="Path to .pt checkpoint file (as saved by sandbox.py).")
@@ -188,10 +204,21 @@ def main() -> None:
     # Resolve deprecated alias
     max_ticks = args.wave_cycles if args.wave_cycles is not None else args.max_ticks
 
-    corpus_path = Path(args.corpus)
-    if not corpus_path.exists():
-        print(f"Corpus not found: {corpus_path}", file=sys.stderr)
-        sys.exit(1)
+    if args.dataset_source != "local":
+        from data.hf_remote_corpus import ensure_hf_corpus_file  # type: ignore[import]
+
+        corpus_path = ensure_hf_corpus_file(
+            args.dataset_source,
+            cache_dir=args.hf_cache_dir,
+            max_rows=max(1, args.hf_max_rows),
+            max_chars=max(0, args.hf_max_chars),
+            refresh=args.hf_refresh,
+        )
+    else:
+        corpus_path = Path(args.corpus)
+        if not corpus_path.exists():
+            print(f"Corpus not found: {corpus_path}", file=sys.stderr)
+            sys.exit(1)
 
     print("[eval] loading model ...", flush=True)
     tok = sb._build_tokenizer(mode=args.tokenizer, vocab_cap=args.vocab_cap)
@@ -273,6 +300,7 @@ def main() -> None:
         },
         "config": {
             "corpus": str(corpus_path),
+            "dataset_source": args.dataset_source,
             "val_fraction": args.val_fraction,
             "max_ticks": max_ticks,
             "window_size": args.window_size,

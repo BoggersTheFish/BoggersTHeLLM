@@ -1,4 +1,6 @@
 .venv/
+# Hugging Face Hub caches (see --hf-cache-dir; default data/cache/hf)
+data/cache/
 # Local checkpoint weights (use --checkpoint-dir outside repo or upload artifacts separately)
 checkpoints/
 experiments/

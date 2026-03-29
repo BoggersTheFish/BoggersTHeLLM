@@ -1,6 +1,7 @@
 import argparse
 import csv
 import datetime
+import json
 import math
 import os
 import random
@@ -1483,6 +1484,50 @@ def main() -> None:
     # ---- Phase 2: data pipeline aliases (accept both hyphens and underscores) ----
     parser.add_argument("--dataset-path", "--dataset_path", type=Path, default=None,
         dest="dataset_path", help="Alias for --corpus (takes precedence).")
+    parser.add_argument(
+        "--dataset-source",
+        "--dataset_source",
+        choices=("local", "tinystories", "fineweb-edu"),
+        default="local",
+        dest="dataset_source",
+        help="local = use --corpus / --dataset-path (default). "
+        "tinystories / fineweb-edu = download a public corpus via Hugging Face (requires: pip install datasets).",
+    )
+    parser.add_argument(
+        "--hf-cache-dir",
+        type=Path,
+        default=_REPO_ROOT / "data" / "cache" / "hf",
+        help="Cache directory for --dataset-source Hugging Face materialized .txt files.",
+    )
+    parser.add_argument(
+        "--hf-max-rows",
+        type=int,
+        default=50_000,
+        help="Max rows to read from the Hub dataset (TinyStories slice or FineWeb-Edu stream).",
+    )
+    parser.add_argument(
+        "--hf-max-chars",
+        type=int,
+        default=0,
+        help="Optional cap on total UTF-8 characters when materializing HF data (0 = no cap).",
+    )
+    parser.add_argument(
+        "--hf-refresh",
+        action="store_true",
+        help="Rebuild cached HF corpus file even if it already exists.",
+    )
+    parser.add_argument(
+        "--no-synthetic-fallback",
+        action="store_true",
+        help="Do not auto-generate synthetic text when the corpus is missing or too small; exit with an error.",
+    )
+    parser.add_argument(
+        "--eval-results-json",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="After training, write val CE / perplexity and checkpoint path to this JSON file.",
+    )
     parser.add_argument("--seq-len", "--seq_len", type=int, default=None,
         dest="seq_len", help="Alias for --window-size.")
     parser.add_argument("--batch-size", "--batch_size", type=int, default=None,
@@ -1522,6 +1567,16 @@ def main() -> None:
 
     # ---- resolve aliases ----
     corpus_path = args.dataset_path or args.corpus or DEFAULT_CORPUS_PATH
+    if args.dataset_source != "local":
+        from data.hf_remote_corpus import ensure_hf_corpus_file  # type: ignore[import]
+
+        corpus_path = ensure_hf_corpus_file(
+            args.dataset_source,
+            cache_dir=args.hf_cache_dir,
+            max_rows=max(1, args.hf_max_rows),
+            max_chars=max(0, args.hf_max_chars),
+            refresh=args.hf_refresh,
+        )
     window_size = args.seq_len if args.seq_len is not None else args.window_size
     traj_batch_size = args.batch_size if args.batch_size is not None else args.trajectory_batch_size
 
@@ -1636,6 +1691,12 @@ def main() -> None:
             tokens = tok.encode(full_text)
             need_syn = len(tokens) < window_size * 20
         if need_syn:
+            if args.no_synthetic_fallback:
+                raise SystemExit(
+                    "Corpus missing or too small after tokenization, and --no-synthetic-fallback is set. "
+                    "Provide a larger --corpus / --dataset-path, use --dataset-source tinystories (or fineweb-edu), "
+                    "or remove --no-synthetic-fallback."
+                )
             print("Corpus too small — generating synthetic corpus...", flush=True)
             import tempfile as _tmpcorpus
 
@@ -2173,7 +2234,63 @@ def main() -> None:
     print(f"Pre-training done in {train_sec_total:.1f}s total.", flush=True)
 
     # Phase 4: final checkpoint
-    _save_checkpoint(model, optimizer, global_step, last_epoch_num, args, ckpt_dir)
+    final_ckpt_path = _save_checkpoint(
+        model, optimizer, global_step, last_epoch_num, args, ckpt_dir
+    )
+
+    if args.eval_results_json is not None:
+        model.eval()
+        vce_final: float | None = None
+        vtc_final: float | None = None
+        if val_dataset:
+            vce_final = mean_cross_entropy_eval(model, val_dataset)
+            if args.loss_mode == "trajectory":
+                vtc_final = mean_trajectory_contrastive_eval(
+                    model, val_dataset, batch_size=traj_batch_size
+                )
+        ppl_final = (
+            math.exp(vce_final)
+            if vce_final is not None and math.isfinite(vce_final)
+            else float("nan")
+        )
+
+        def _json_num(x: float | None) -> float | None:
+            if x is None:
+                return None
+            return x if math.isfinite(x) else None
+
+        eval_payload = {
+            "base": {
+                "val_ce": _json_num(vce_final),
+                "val_ppl": _json_num(ppl_final),
+                "val_traj_contrast": _json_num(vtc_final),
+                "val_windows": len(val_dataset),
+                "val_metrics_reliable": not val_metrics_unreliable,
+            },
+            "checkpoint": str(final_ckpt_path),
+            "config": {
+                "dataset_source": args.dataset_source,
+                "corpus_path": str(corpus_path),
+                "stream_source_path": str(stream_source_path)
+                if streaming_dataset
+                else str(corpus_path),
+                "tokenizer": args.tokenizer,
+                "vocab_cap": args.vocab_cap,
+                "window_size": window_size,
+                "max_epochs": num_epochs,
+                "val_fraction": args.val_fraction,
+                "loss_mode": args.loss_mode,
+                "use_goat_memory": bool(args.use_goat_memory),
+                "use_substrate": bool(args.use_substrate),
+                "seed": args.seed,
+            },
+        }
+        args.eval_results_json.parent.mkdir(parents=True, exist_ok=True)
+        args.eval_results_json.write_text(
+            json.dumps(eval_payload, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        print(f"Wrote eval summary to {args.eval_results_json}", flush=True)
 
     # Phase 12: sample generations (decode via tokenizer)
     print("\nPrompt 1:", flush=True)

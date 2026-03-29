@@ -3,9 +3,16 @@
 All notable changes to this project are documented here.
 Format: [Wave / Phase] — description — date.
 
-The project is documented as **BoggersTheLanguageModel**; canonical source is [github.com/BoggersTheFish/idekatp](https://github.com/BoggersTheFish/idekatp).
+The project is documented as **BoggersTheLanguageModel**; canonical source is [github.com/BoggersTheFish/BoggersTHeLLM](https://github.com/BoggersTheFish/BoggersTHeLLM) (alternate: [idekatp](https://github.com/BoggersTheFish/idekatp)).
 
 ---
+
+## Data — Hugging Face corpora + training eval JSON (Mar 2026)
+
+- **`data/hf_remote_corpus.py`**: materialize TinyStories (`roneneldan/TinyStories`) or FineWeb-Edu (`HuggingFaceFW/fineweb-edu`, `sample-10BT`) into cached UTF-8 text; CLI `python data/hf_remote_corpus.py tinystories …`.
+- **`sandbox.py`**: `--dataset-source {local,tinystories,fineweb-edu}`, `--hf-cache-dir`, `--hf-max-rows`, `--hf-max-chars`, `--hf-refresh`, `--no-synthetic-fallback`, **`--eval-results-json`** (post-training val CE / val PPL, checkpoint path, config).
+- **`eval_harness.py`**: same `--dataset-source` / `--hf-*` flags for evaluation on Hub data without a local `--corpus`.
+- **`requirements.txt`**: `datasets` package for Hugging Face Hub loading.
 
 ## Data — Stream corpus (Mar 2026)
 
