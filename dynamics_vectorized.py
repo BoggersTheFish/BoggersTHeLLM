@@ -145,15 +145,27 @@ class VectorizedWindowDynamics(nn.Module):
         B, W, D = S.shape
 
         _tol = tol if tol is not None else torch.tensor(0.05, device=S.device, dtype=S.dtype)
-        _thigh = thigh if thigh is not None else torch.tensor(0.22, device=S.device, dtype=S.dtype)
+        _thigh = thigh if thigh is not None else torch.tensor(0.18, device=S.device, dtype=S.dtype)
 
         tension_curve: list[float] = []
+        consecutive_low_t_steps = 0
 
         for _ in range(self.max_steps):
             S = self._step(S, signal)
             T = _window_tension(S)
+            T_mean = float(T.mean().item())
             if record_tension_log:
-                tension_curve.append(float(T.mean().item()))
+                tension_curve.append(T_mean)
+            if T_mean < 0.08:
+                consecutive_low_t_steps += 1
+            else:
+                consecutive_low_t_steps = 0
+            # Extra stochastic break for stuck low-tension attractors (GOAT DORMANT→ACTIVE jitter)
+            if T_mean < 0.08 and consecutive_low_t_steps >= 4:
+                noise = torch.randn_like(S) * 0.015
+                S = S + noise
+                # GOAT transition: use TorchAttractorLanguageModel.run_window_dynamics when training (.step path)
+                consecutive_low_t_steps = 0
             if (T < _tol).all():
                 break
             if (T > _thigh).any():

@@ -93,7 +93,7 @@ MAX_WINDOW_STEPS = 16
 # Window tension: two regimes — with readout entropy (scale ~0.7–0.9) vs geometry-only (much smaller).
 WINDOW_TENSION_USE_ENTROPY = False
 WINDOW_TENSION_TOL_GEOMETRY = 0.05
-WINDOW_TENSION_HIGH_GEOMETRY = 0.22
+WINDOW_TENSION_HIGH_GEOMETRY = 0.18
 WINDOW_TENSION_TOL_ENTROPY = 0.75
 WINDOW_TENSION_HIGH_ENTROPY = 0.92
 TRAJECTORY_BATCH_SIZE_DEFAULT = 16
@@ -241,6 +241,45 @@ class TorchAttractorLanguageModel(nn.Module):
         self.tokenizer = None           # AttractorTokenizer for encode / decode
         self._goat_mgr = None           # GoatMemoryManager for per-token activation bonuses
         self._last_pred_final_state: torch.Tensor | None = None  # (B, D) after trajectory dynamics
+        # Phase 1 repetition fix: rolling mean final-row states for repulsion term (last 8 batches).
+        self._repulsion_prev_states: list[torch.Tensor] = []
+        self._last_traj_student_tension_mean: torch.Tensor | None = None
+        self._goat_transition_context_ids: list[list[int]] | list[int] | None = None
+
+    @property
+    def goat_memory(self):
+        """Shim so run_window_dynamics can call self.goat_memory.apply_transition(...)."""
+        return self
+
+    def apply_transition(self, fast_state: torch.Tensor, fr: str, to: str) -> torch.Tensor:
+        """GOAT DORMANT→ACTIVE jitter hook (Phase 1 repetition fix); returns fast_state unchanged if no-op."""
+        mgr = self._goat_mgr
+        ctx = self._goat_transition_context_ids
+        if mgr is None or ctx is None or fr != "DORMANT" or to != "ACTIVE":
+            return fast_state
+        try:
+            from dataclasses import replace
+
+            from goat_memory_transitions import MemoryState
+        except Exception:
+            return fast_state
+        if not ctx:
+            rows = []
+        elif isinstance(ctx[0], list):
+            rows = ctx  # type: ignore[assignment]
+        else:
+            rows = [ctx]  # type: ignore[list-item]
+        for row in rows:
+            for tid in row:
+                if isinstance(tid, int) and 0 <= tid < len(mgr.nodes):
+                    n = mgr.nodes[tid]
+                    if n.state == MemoryState.DORMANT:
+                        mgr.nodes[tid] = replace(
+                            n,
+                            state=MemoryState.ACTIVE,
+                            activation=max(float(n.activation), float(mgr.active_threshold)),
+                        )
+        return fast_state
 
     def reset_readout_trajectory(self):
         """Clear stored combined state for drift pressure (call once per training window / at generate start)."""
@@ -533,6 +572,7 @@ class TorchAttractorLanguageModel(nn.Module):
         tension_curve: list[float] = []
         tol = self.window_tension_tol.to(device=S.device, dtype=S.dtype)
         thigh = self.window_tension_high.to(device=S.device, dtype=S.dtype)
+        consecutive_low_t_steps = 0
         for step in range(self.max_window_steps):
             S0 = S.detach().clone() if collect_metrics else None
             S = self._single_window_step(S, context_ids=context_ids)
@@ -560,6 +600,18 @@ class TorchAttractorLanguageModel(nn.Module):
                             "mean_row_norm": mn,
                         }
                     )
+            T_mean = float(T.mean().detach())
+            if T_mean < 0.08:
+                consecutive_low_t_steps += 1
+            else:
+                consecutive_low_t_steps = 0
+            # Extra stochastic break for stuck low-tension attractors (GOAT DORMANT→ACTIVE jitter)
+            if T_mean < 0.08 and consecutive_low_t_steps >= 4:
+                noise = torch.randn_like(S) * 0.015
+                S = S + noise
+                self._goat_transition_context_ids = context_ids
+                self.goat_memory.apply_transition(S[:, -1, :].mean(dim=0), "DORMANT", "ACTIVE")
+                consecutive_low_t_steps = 0
             if (T < tol).all():
                 break
             if (T > thigh).any():
@@ -642,6 +694,7 @@ class TorchAttractorLanguageModel(nn.Module):
         S_pred, _ = self.run_window_dynamics(
             S_pred, collect_metrics=False, record_tension_log=True, context_ids=contexts
         )
+        self._last_traj_student_tension_mean = self.compute_window_tension(S_pred).mean().detach()
         with torch.no_grad():
             S_tgt = torch.stack(
                 [
@@ -654,6 +707,29 @@ class TorchAttractorLanguageModel(nn.Module):
                 S_tgt, collect_metrics=False, record_tension_log=False
             )
         loss_traj = self.trajectory_contrastive_loss(S_pred, S_tgt)
+        T = self.compute_window_tension(S_pred).mean()
+        base_entropy_floor = torch.as_tensor(
+            float(ENTROPY_FLOOR), device=S_pred.device, dtype=S_pred.dtype
+        )
+        entropy_floor = base_entropy_floor * (
+            1.0 + 0.5 * (1.0 - torch.sigmoid(8.0 * (T - 0.12)))
+        )
+        fast_state = S_pred[:, -1, :].mean(dim=0)
+        if self._repulsion_prev_states:
+            prev_states = torch.stack(self._repulsion_prev_states, dim=0).to(
+                device=S_pred.device, dtype=S_pred.dtype
+            )
+            repulsion = 0.08 * torch.mean(
+                torch.cosine_similarity(fast_state.unsqueeze(0), prev_states, dim=-1)
+            )
+        else:
+            repulsion = torch.zeros((), device=S_pred.device, dtype=S_pred.dtype)
+        # Repulsion term to push away from previous states and break basin collapse
+        loss_traj = loss_traj + entropy_floor - repulsion
+        with torch.no_grad():
+            self._repulsion_prev_states.append(fast_state.detach().clone())
+            if len(self._repulsion_prev_states) > 8:
+                self._repulsion_prev_states.pop(0)
         logits = self.readout_window(S_pred.reshape(B, -1)) / self.effective_temperature()
         logits = torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=-1e4)
         # Store final-position single state for auxiliary readout training (Phase 5).
@@ -1306,7 +1382,18 @@ def _aux_ce_loss_batch(
         lo = lo + TRAIN_LOGIT_NOISE * torch.randn_like(lo)
         probs_floor = F.softmax(lo, dim=-1)
         ent_s = -(probs_floor * torch.log(probs_floor + 1e-9)).sum()
-        if float(ent_s.detach()) < ENTROPY_FLOOR:
+        ts = getattr(model, "_last_traj_student_tension_mean", None)
+        base_entropy_floor = torch.as_tensor(float(ENTROPY_FLOOR), device=device, dtype=lo.dtype)
+        if ts is not None:
+            tref = ts.to(device=device, dtype=lo.dtype)
+            if tref.dim() > 0:
+                tref = tref.mean()
+            entropy_floor = base_entropy_floor * (
+                1.0 + 0.5 * (1.0 - torch.sigmoid(8.0 * (tref - 0.12)))
+            )
+        else:
+            entropy_floor = base_entropy_floor
+        if float(ent_s.detach()) < float(entropy_floor.detach()):
             lo = lo + torch.randn_like(lo) * ENTROPY_FLOOR_NOISE
             probs_for_entropy = F.softmax(lo, dim=-1)
         else:
