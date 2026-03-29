@@ -645,3 +645,10 @@ git commit -m "chore: bump <name> submodule"
 ## License
 
 [MIT](LICENSE)
+
+## Phase 0 Baseline (March 29 2026)
+First real training run on TinyStories (120 stories).
+Mean trajectory loss: **2.3759**
+Val trajectory contrast: **0.112059**
+Checkpoint: [ckpt_step0000274.pt](https://github.com/BoggersTheFish/BoggersTHeLLM/tree/main/checkpoints/first_real_release)
+
