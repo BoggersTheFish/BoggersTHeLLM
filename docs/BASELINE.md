@@ -2,7 +2,9 @@
 
 Phase 0 locks a **reproducible reference** for **BoggersTheLanguageModel** (`sandbox.py`) before scaling data, windows, or model size. Use it to answer “did the change help?” without guessing.
 
-For runs on a **public or large text corpus** (Hugging Face TinyStories / FineWeb-Edu or your own files), follow README → [First real training run](https://github.com/BoggersTheFish/BoggersTHeLLM#first-real-training-run-public-corpus--checkpoint--eval-json). Use **`--eval-results-json`** with `sandbox.py` to write val CE / val PPL and the checkpoint path alongside training.
+For runs on a **public or large text corpus** (Hugging Face TinyStories / FineWeb-Edu or your own files), follow README → [First real training run](https://github.com/BoggersTheFish/BoggersTheLLM#first-real-training-run-public-corpus--checkpoint--eval-json). Use **`--eval-results-json`** with `sandbox.py` to write val CE / val PPL and the checkpoint path alongside training.
+
+**Phase 0.5 / 1 / 2:** If you enable **`--phase05-batch-metrics-csv`**, each batch row includes extra diagnostics (window tension traces, breaks, Phase 1 interaction RMS / head tension / diversity loss, Phase 2 break direction norm, α, ΔT, Δalignment, head-weight entropy, interaction reg). Re-baseline after changing **`--phase2-*`** or **`--phase1-*`** because dynamics and loss shape change.
 
 ## How to record a baseline run
 
@@ -42,6 +44,7 @@ For runs on a **public or large text corpus** (Hugging Face TinyStories / FineWe
 | **val_traj_contrast** | Mean trajectory contrastive loss over the **full validation** set (when val exists). |
 | **mean_final_T** | Mean window tension at the **last** adaptive dynamics step each epoch—track drift via `--epoch-metrics-csv`. |
 | **tscore_evolves** / **tscore_last_tension** | With `--use-substrate`: per-epoch evolve delta and last TSCore tension. |
+| **Per-batch CSV** (`--phase05-batch-metrics-csv`) | Not in epoch CSV: separate file; see `PHASE05_BATCH_CSV_HEADER` in `sandbox.py` for column names (`phase2_*`, `phase1_*`, tension curves, etc.). |
 
 Architecture changes will change absolute numbers—re-record baseline after major `sandbox.py` updates. Window dynamics and **`AttractorStateCache`** both go through **`run_window_dynamics`**; **`mean_final_T`** in CSV reflects **`compute_tension_window`** at the last outer step each window.
 

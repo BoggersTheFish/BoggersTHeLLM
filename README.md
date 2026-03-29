@@ -2,7 +2,7 @@
 
 **BoggersTheLanguageModel** is a production-grade continuous attractor language model built without attention, transformers, or traditional LLM methods. State follows a physical **trajectory**; meaning is **path-dependent**. The architecture is driven by the **Propagate → Relax → Break → Evolve** cycle that powers the TS-OS.
 
-**Primary repository:** [github.com/BoggersTheFish/BoggersTHeLLM](https://github.com/BoggersTheFish/BoggersTHeLLM) — clone as `BoggersTHeLLM` (or any folder name). **Alternate mirror:** [github.com/BoggersTheFish/idekatp](https://github.com/BoggersTheFish/idekatp). The product name is **BoggersTheLanguageModel**.
+**Primary repository:** [github.com/BoggersTheFish/BoggersTheLLM](https://github.com/BoggersTheFish/BoggersTheLLM). **Alternate mirror:** [github.com/BoggersTheFish/idekatp](https://github.com/BoggersTheFish/idekatp). The product name is **BoggersTheLanguageModel**.
 
 ---
 
@@ -24,7 +24,8 @@ Corpus / Token stream
 │    ├─ optional GOAT activation_bonus → per-position signal│
 │    ├─ compute_tension_window (geometry ± entropy)       │
 │    │     (alias: compute_window_tension)                │
-│    └─ masked jitter / GOAT transition / high-T renorm   │
+│    └─ tension-driven breaks (Phase 2: directional escape) │
+│         + GOAT transition + high-T renorm                  │
 │         │                                               │
 │  readout_window() → logits (training / trajectory)      │
 └─────────────────────────────────────────────────────────┘
@@ -54,7 +55,10 @@ The network contains only:
 
 | File / Directory | Wave | Purpose |
 |---|---|---|
-| `sandbox.py` | Phase 0 | **BoggersTheLanguageModel** core: training, generation, all dynamics |
+| `sandbox.py` | Phase 0+ | **BoggersTheLanguageModel** core: training, generation, dynamics |
+| `phase05_config.py` | 0.5 | `Phase05Config`: tension weights, batch CSV, adaptive dt, neg-def diffusion |
+| `phase1_config.py` | 1 | `Phase1Config`: multi-head drift, window interaction matrix `C`, diversity loss |
+| `phase2_config.py` | 2 | `Phase2Config`: directional breaks, residual mixing, `C` reg, head tension weights |
 | `smoke_test.py` | Phase 0 | 5-assertion integration test (dynamics + TSCore wave cycle) |
 | `wave_a_tokenizer.py` | A | tiktoken BPE helpers; training uses `sandbox._build_tokenizer()` |
 | `dynamics_vectorized.py` | B | `VectorizedWindowDynamics`: `step(S, signal)` only; `forward` disabled; `run_window_dynamics_vectorized` → `model.run_window_dynamics` |
@@ -73,8 +77,9 @@ The network contains only:
 | `vendor/GOAT-TS` | — | Constraint-graph engine (submodule) |
 | `vendor/TS-Core` | — | UniversalLivingGraph + WaveCycleRunner (submodule) |
 | `vendor/ts-llm` | — | Tokenizer, hierarchical dynamics, attractor LLM package (submodule) |
-| `docs/API_DISCOVERY.md` | — | Verified entrypoints for all three vendored repos |
+| `docs/API_DISCOVERY.md` | — | Verified entrypoints for vendored repos + model config surface |
 | `docs/BASELINE.md` | — | Phase 0 baseline recording instructions |
+| `scripts/plot_phase05_metrics.py` | — | Plots `--phase05-batch-metrics-csv` columns (incl. Phase 1–2 extras) |
 
 ---
 
@@ -86,8 +91,8 @@ The network contains only:
 - [PyTorch](https://pytorch.org/) (CPU or CUDA)
 
 ```bash
-git clone --recurse-submodules https://github.com/BoggersTheFish/BoggersTHeLLM.git
-cd BoggersTHeLLM
+git clone --recurse-submodules https://github.com/BoggersTheFish/BoggersTheLLM.git
+cd BoggersTheLLM
 python3 -m venv .venv
 source .venv/bin/activate   # after this, `python` usually works; without venv use `python3`
 pip install -r requirements.txt
@@ -450,6 +455,43 @@ python inference_server.py --self-test
 
 TSCore converges cleanly. High PPL is expected for an untrained model — the harness is the measurement instrument.
 
+### Phase 0.5 — Instrumentation and stability
+
+Configuration: **`Phase05Config`** in `phase05_config.py`, passed to **`TorchAttractorLanguageModel(..., phase05=...)`** (CLI: `--phase05-*`).
+
+- **`--phase05-log-metrics`**: collect window-trace and token-evolve diagnostics used for batch CSV and logged scalars.
+- **`--phase05-batch-metrics-csv PATH`**: append one row per training batch (implies log metrics). Column list is `PHASE05_BATCH_CSV_HEADER` in `sandbox.py` (tension components, stagnation, trajectory margin, break counts, Phase 1–2 extensions).
+- **`--phase05-enforce-negdef-diffusion`**: strictly negative-definite diffusion in the simple dynamics path.
+- **`--phase05-adaptive-window-dt`**: EMA-scaled positional timestep from window tension.
+- **`--phase05-tension-w w1,w2,w3`**: override weights in `T_total = w1·T_energy + w2·T_align + w3·T_entropy`.
+- **`--phase05-multi-negative` / `--phase05-num-negatives` / `--phase05-traj-temperature`**: trajectory contrastive negatives and temperature.
+
+### Phase 1 — Multi-head diffusion and window interaction
+
+Configuration: **`Phase1Config`** in `phase1_config.py` (CLI: `--phase1-*`).
+
+- **`--phase1-num-heads`**, **`--phase1-head-dim-mode {shared,split}`**: parallel drift heads; split mode partitions `D` across heads (`D % H == 0`).
+- **`--phase1-enable-window-interaction`**: learnable **`C ∈ ℝ^{W×W}`** applied as `einsum('bid,ij->bjd', S, C)` after each local step (scaled by **`--phase1-interaction-scale`**).
+- **`--phase1-head-diversity-weight`**: auxiliary penalty on mean pairwise cosine similarity of head drift directions.
+- **`--phase1-enable-per-head-tension`**: when logging, record mean per-head geometry tension (split layout).
+
+### Phase 2 — Directional breaks and stabilised routing
+
+Configuration: **`Phase2Config`** in `phase2_config.py` (CLI: **`--phase2-*`**). No attention or token–token scoring; head-level weighting only.
+
+| Area | Behaviour |
+|------|-----------|
+| **Breaks** | Default: escape along normalised **`state − prev_state`**, step size **`α = break_base_strength · clamp((T_target − T)/T_target, min, max)`**; tiny delta norm falls back to random unit direction. **`--phase2-disable-directional-break`** restores Gaussian jitter. |
+| **Rejection** | **`--phase2-enable-break-rejection`**: revert a break if tension increases and row cosine alignment worsens. |
+| **Mixing** | **`state + sigmoid(gate)·W_mix(concat heads)`** when residual mixing is on; **`--phase2-disable-residual-mixing`** uses linear mix only. **`--phase2-mixing-gate-init`** sets initial gate (~0.1 default). |
+| **Window `C`** | Optional **`--phase2-interaction-decay-tau`**: multiply **`C`** by **`exp(−|i−j|/τ)`** before the einsum. **`--phase2-interaction-reg-weight`**: add **`‖C−I‖²`** to the trajectory loss (requires window interaction). |
+| **Head weights** | **`--phase2-enable-head-tension-weighting`**: combine head drifts with **`softmax(−T_head)`** (requires per-head tension signal in the dynamics path). |
+| **Memory hook** | **`--phase2-store-break-memory`**: store last pre/post break window states on the model for future reuse. |
+
+Batch CSV (with `--phase05-batch-metrics-csv`) gains Phase 2 fields when breaks occur: **`phase2_break_direction_norm_mean`**, **`phase2_break_applied_alpha_mean`**, **`phase2_break_delta_tension_mean`**, **`phase2_break_delta_alignment_mean`**, **`phase2_head_weight_entropy`**, **`phase2_interaction_reg_loss`**.
+
+**Checkpoints:** new parameters (for example **`mixing_gate_raw`**, **`phase1_window_C`**) are not in older checkpoints; load with **`strict=False`** or retrain.
+
 ---
 
 ## Core model API
@@ -463,6 +505,9 @@ model = sb.TorchAttractorLanguageModel(
     state_dim=512,
     train_window_size=6,
     max_window_steps=16,
+    phase05=sb.Phase05Config(),
+    phase1=sb.Phase1Config(),
+    phase2=sb.Phase2Config(),
 )
 model.tokenizer = tok
 
@@ -514,10 +559,10 @@ T = |ΔE_state| + λ · (1 − cos(fast, slow)) + μ · H(readout_logits)
 
 | T < tol | Early exit — attractor is stable |
 |---------|----------------------------------|
-| T > high | Inject noise — push out of shallow attractor |
-| T > break_thresh | Break perturbation — reset trajectory |
+| T > high | Directional break (Phase 2 default) or Gaussian jitter (`--phase2-disable-directional-break`) |
+| T > break_thresh | Same break family on the token path |
 
-**Window path** (`run_window_dynamics`): after each outer iteration, **`compute_tension_window`** (alias **`compute_window_tension`**) uses neighbor energy drift + misalignment + optional readout entropy (see `WINDOW_TENSION_USE_ENTROPY` in `sandbox.py`). The outer loop always runs up to **`max_window_steps`**; tension drives **masked jitter**, **GOAT transitions**, and **high-T row renorm**, not early exit of the whole window.
+**Window path** (`run_window_dynamics`): after each outer iteration, **`compute_tension_window`** (alias **`compute_window_tension`**) uses neighbor energy drift + misalignment + optional readout entropy (see `WINDOW_TENSION_USE_ENTROPY` in `sandbox.py`). The outer loop always runs up to **`max_window_steps`**; tension drives **low-tension escape**, **high-tension breaks**, **GOAT transitions**, and **high-T row renorm**, not early exit of the whole window. Phase 2 breaks use **`state − prev_state`** (normalised) with tension-scaled magnitude; see [Phase 2](#phase-2--directional-breaks-and-stabilised-routing).
 
 ---
 
@@ -567,6 +612,36 @@ Integrations:
   --use-lorentz              Lorentzian positional coupling in window dynamics (default: off)
   --dynamics {simple,vectorized}
 
+Phase 0.5 (instrumentation):
+  --phase05-log-metrics      Per-batch diagnostics + window trace for CSV
+  --phase05-batch-metrics-csv PATH  Append batch rows (implies log-metrics); see PHASE05_BATCH_CSV_HEADER
+  --phase05-enforce-negdef-diffusion
+  --phase05-adaptive-window-dt
+  --phase05-tension-w w1,w2,w3
+  --phase05-multi-negative   Trajectory: multi-shuffle negatives
+  --phase05-num-negatives K  (with multi-negative; default 4)
+  --phase05-traj-temperature FLOAT
+
+Phase 1 (multi-head + window C):
+  --phase1-num-heads H
+  --phase1-head-dim-mode {shared,split}
+  --phase1-interaction-scale FLOAT
+  --phase1-enable-window-interaction
+  --phase1-head-diversity-weight FLOAT
+  --phase1-enable-per-head-tension
+
+Phase 2 (breaks + stable routing):
+  --phase2-disable-directional-break   Legacy Gaussian breaks
+  --phase2-break-base-strength, --phase2-break-min-scale, --phase2-break-max-scale
+  --phase2-break-t-target FLOAT        Reference T in α scaling
+  --phase2-enable-break-rejection
+  --phase2-disable-residual-mixing     Linear W_mix only
+  --phase2-mixing-gate-init FLOAT
+  --phase2-interaction-reg-weight FLOAT  ‖C−I‖² on loss (needs window interaction)
+  --phase2-interaction-decay-tau TAU   exp(−|i−j|/τ) mask on C
+  --phase2-enable-head-tension-weighting
+  --phase2-store-break-memory
+
 Logging:
   --epoch-metrics-csv PATH   Per-epoch CSV (see below)
   --eval-results-json PATH   After training: val CE, val PPL, checkpoint path (same val split as training)
@@ -580,6 +655,8 @@ Misc:
 ### Epoch metrics CSV columns
 
 When `--epoch-metrics-csv` is set, each row includes: `epoch`, `loss_mode`, `mean_loss`, **`train_ce`** (mean batch CE from `readout_window` logits during the epoch), **`val_ce`** (held-out `mean_cross_entropy_eval`, empty if no val), `train_traj_contrast` (last training batch trajectory loss snapshot), **`val_traj_contrast`** (full val-set mean when val exists), `mean_final_step_tension`, `max_batch_loss`, `lr`, `global_step`, **`tscore_evolves`**, **`tscore_last_tension`** (0 if substrate disabled).
+
+**Per-batch CSV** (`--phase05-batch-metrics-csv`): separate file; one row per optimizer step with window tension curves, trajectory margins, break counters, and (when enabled) Phase 1 / Phase 2 columns — see `PHASE05_BATCH_CSV_HEADER` in `sandbox.py`. Plot with **`python3 scripts/plot_phase05_metrics.py PATH --out DIR`**.
 
 **Validation perplexity:** `PPL_val = exp(val_ce)` when `val_ce` is finite.
 
@@ -619,7 +696,7 @@ python3 sandbox.py \
 Clone with:
 
 ```bash
-git clone --recurse-submodules https://github.com/BoggersTheFish/BoggersTHeLLM.git
+git clone --recurse-submodules https://github.com/BoggersTheFish/BoggersTheLLM.git
 ```
 
 If already cloned:
@@ -652,5 +729,5 @@ git commit -m "chore: bump <name> submodule"
 First real training run on TinyStories (120 stories).
 Mean trajectory loss: **2.3759**
 Val trajectory contrast: **0.112059**
-Checkpoint: [ckpt_step0000274.pt](https://github.com/BoggersTheFish/BoggersTHeLLM/tree/main/checkpoints/first_real_release)
+Checkpoint: [ckpt_step0000274.pt](https://github.com/BoggersTheFish/BoggersTheLLM/tree/main/checkpoints/first_real_release)
 

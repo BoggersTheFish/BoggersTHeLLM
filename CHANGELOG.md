@@ -3,9 +3,20 @@
 All notable changes to this project are documented here.
 Format: [Wave / Phase] — description — date.
 
-The project is documented as **BoggersTheLanguageModel**; canonical source is [github.com/BoggersTheFish/BoggersTHeLLM](https://github.com/BoggersTheFish/BoggersTHeLLM) (alternate: [idekatp](https://github.com/BoggersTheFish/idekatp)).
+The project is documented as **BoggersTheLanguageModel**; canonical source is [github.com/BoggersTheFish/BoggersTheLLM](https://github.com/BoggersTheFish/BoggersTheLLM) (alternate: [idekatp](https://github.com/BoggersTheFish/idekatp)).
 
 ---
+
+## Phase 2 — Directional breaks, residual mixing, stable window coupling (Mar 2026)
+
+- **`phase2_config.py`**: `Phase2Config` (directional vs legacy breaks, adaptive α, break rejection, residual head mixing gate, `‖C−I‖²` loss weight, optional distance decay on `C`, head-level `softmax(−T)` drift weighting, break memory buffers).
+- **`sandbox.py`**: `TorchAttractorLanguageModel(..., phase2=...)`; `phase2_config_from_args`; CLI `--phase2-*`. Window and token breaks use normalised **`state − prev_state`** with tension-scaled step (fallback random direction if delta norm tiny). Optional revert when tension rises and alignment worsens. `SimpleAttractorDynamics`: **`state + sigmoid(gate)·mixed`** when residual mixing enabled. Interaction step: **`C * exp(−|i−j|/τ)`** when `interaction_decay_tau` set. Trajectory loss adds interaction regulariser when `interaction_reg_weight > 0`.
+- **`PHASE05_BATCH_CSV_HEADER`**: `phase2_break_*`, `phase2_head_weight_entropy`, `phase2_interaction_reg_loss` when batch metrics CSV enabled.
+- **`scripts/plot_phase05_metrics.py`**: optional plots for Phase 2 columns when present.
+
+## Phase 1 & 0.5 — Config modules (Mar 2026)
+
+- **`phase05_config.py`**, **`phase1_config.py`**: split from `sandbox.py` for `Phase05Config` / `Phase1Config`; wired through `TorchAttractorLanguageModel` and `SimpleAttractorDynamics`.
 
 ## Dynamics — unified window loop, cache alignment, vectorized compile (Mar 2026)
 

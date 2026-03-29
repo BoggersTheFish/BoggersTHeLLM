@@ -14,6 +14,10 @@ from collections import Counter
 from tqdm import tqdm
 from pathlib import Path
 
+from phase05_config import Phase05Config
+from phase1_config import Phase1Config
+from phase2_config import Phase2Config
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -113,6 +117,50 @@ WINDOW_NONLINEAR_GAIN = 4.0
 # Scales (1 + strength * tanh(asym) * sign(j−i)); was 0.5, too weak for left/right contrast.
 POSITION_ASYM_STRENGTH = 1.25
 
+# Phase 0.5 per-batch CSV columns (see phase05_batch_csv_values).
+PHASE05_BATCH_CSV_HEADER = [
+    "epoch",
+    "batch_idx",
+    "global_step",
+    "tension_curve_final",
+    "student_T_total",
+    "student_T_energy",
+    "student_T_align",
+    "student_T_entropy",
+    "outer_mean_T_total",
+    "outer_mean_T_energy",
+    "outer_mean_T_align",
+    "outer_mean_T_entropy",
+    "state_norm_mean",
+    "state_norm_std",
+    "win_delta_l2_mean",
+    "stagnation_frac",
+    "cos_pos",
+    "cos_neg",
+    "margin",
+    "break_high_count",
+    "break_low_jitter_count",
+    "break_avg_t_pre",
+    "break_avg_t_post",
+    "interaction_dt_scale",
+    "token_break_high_count",
+    "token_low_tension_exit_count",
+    "token_break_avg_t_pre",
+    "token_break_avg_t_post",
+    "loss_traj_core",
+    "loss_traj_full",
+    "batch_ce",
+    "phase1_interaction_rms",
+    "phase1_tension_heads_mean",
+    "phase1_head_div_loss",
+    "phase2_break_direction_norm_mean",
+    "phase2_break_applied_alpha_mean",
+    "phase2_break_delta_tension_mean",
+    "phase2_break_delta_alignment_mean",
+    "phase2_head_weight_entropy",
+    "phase2_interaction_reg_loss",
+]
+
 
 def sample_next_token_id(
     logits: torch.Tensor,
@@ -155,8 +203,15 @@ class TorchAttractorLanguageModel(nn.Module):
         max_convergence_steps=MAX_CONVERGENCE_STEPS,
         train_window_size: int = 6,
         max_window_steps: int = MAX_WINDOW_STEPS,
+        phase05: Phase05Config | None = None,
+        phase1: Phase1Config | None = None,
+        phase2: Phase2Config | None = None,
     ):
         super().__init__()
+        self.phase05_config = phase05 if phase05 is not None else Phase05Config()
+        self.phase1_config = phase1 if phase1 is not None else Phase1Config()
+        self.phase2_config = phase2 if phase2 is not None else Phase2Config()
+        self.register_buffer("_phase05_interaction_dt_scale", torch.tensor(1.0))
         self.vocab_size = vocab_size
         self.state_dim = state_dim
         self.train_window_size = train_window_size
@@ -187,7 +242,30 @@ class TorchAttractorLanguageModel(nn.Module):
         self.register_buffer("generation_temperature", torch.tensor(float(generation_temperature)))
         # Context-dependent signal injection strength (trajectory sensitivity).
         self.register_buffer("signal_eps", torch.tensor(1e-6))
-        self.dynamics = SimpleAttractorDynamics(state_dim)
+        self.dynamics = SimpleAttractorDynamics(
+            state_dim,
+            enforce_negative_definite=self.phase05_config.enforce_negative_definite_diffusion,
+            phase1=self.phase1_config,
+            phase2=self.phase2_config,
+        )
+        _w = train_window_size
+        _tau = self.phase2_config.interaction_decay_tau
+        if _tau is not None and _tau > 0:
+            idx = torch.arange(_w, dtype=torch.float32)
+            dist = (idx.unsqueeze(0) - idx.unsqueeze(1)).abs()
+            self.register_buffer(
+                "_phase2_C_dist_mask",
+                torch.exp(-dist / float(_tau)),
+            )
+        else:
+            self.register_buffer("_phase2_C_dist_mask", torch.ones(_w, _w))
+        if self.phase1_config.enable_window_interaction:
+            off = 1.0 - torch.eye(_w)
+            self.phase1_window_C = nn.Parameter(
+                torch.eye(_w) + 0.01 * torch.randn(_w, _w) * off
+            )
+        else:
+            self.register_buffer("phase1_window_C", torch.zeros(_w, _w))
         self.embedder = nn.Embedding(self.vocab_size, state_dim)
         self.norm = nn.LayerNorm(state_dim, elementwise_affine=False)
         self.readout = nn.Linear(self.state_dim, self.vocab_size, bias=False)
@@ -247,6 +325,153 @@ class TorchAttractorLanguageModel(nn.Module):
         self._repulsion_prev_states: list[torch.Tensor] = []
         self._last_traj_student_tension_mean: torch.Tensor | None = None
         self._goat_transition_context_ids: list[list[int]] | list[int] | None = None
+        # Phase 0.5: evolve_token break tallies (cleared each trajectory batch when logging).
+        self._phase05_evolve_high_breaks: int = 0
+        self._phase05_evolve_low_exits: int = 0
+        self._phase05_evolve_t_pre_sum: float = 0.0
+        self._phase05_evolve_t_post_sum: float = 0.0
+        self._last_traj_cos_pos: float = float("nan")
+        self._last_traj_cos_neg: float = float("nan")
+        self._last_traj_margin: float = float("nan")
+        self._phase05_last_window_trace: dict[str, float] | None = None
+        self._phase2_last_break_pre: torch.Tensor | None = None
+        self._phase2_last_break_post: torch.Tensor | None = None
+        self._phase2_interaction_reg_logged: float = float("nan")
+        self._phase2_head_weight_entropy_logged: float = float("nan")
+
+    def _window_row_cos_mean(self, X: torch.Tensor) -> torch.Tensor:
+        """Mean cosine between consecutive window rows (B, W, D)."""
+        if X.dim() != 3 or X.size(1) < 2:
+            return X.new_zeros(())
+        return F.cosine_similarity(X[:, 1:], X[:, :-1], dim=-1).mean()
+
+    def _phase2_break_alpha(self, t_mean: torch.Tensor) -> torch.Tensor:
+        """Scalar α = base * clamp((T_tgt - T)/T_tgt, min, max); low T → larger α."""
+        p2 = self.phase2_config
+        tgt = float(p2.break_t_target)
+        tm = t_mean.detach() if torch.is_tensor(t_mean) else torch.as_tensor(t_mean)
+        ratio = (tgt - tm) / (tgt + 1e-8)
+        sc = torch.clamp(
+            ratio,
+            float(p2.break_min_scale),
+            float(p2.break_max_scale),
+        )
+        return torch.as_tensor(float(p2.break_base_strength), device=tm.device, dtype=tm.dtype) * sc
+
+    def _phase2_directional_escape(
+        self,
+        S: torch.Tensor,
+        delta_ref: torch.Tensor,
+        t_mean: torch.Tensor,
+        *,
+        row_renorm: bool,
+        legacy_scale: float,
+    ) -> torch.Tensor:
+        """state + α * û(delta); random unit fallback if ||delta|| tiny (vectorised)."""
+        if S.dim() == 1:
+            return self._phase2_directional_escape(
+                S.unsqueeze(0),
+                delta_ref.unsqueeze(0),
+                t_mean,
+                row_renorm=row_renorm,
+                legacy_scale=legacy_scale,
+            ).squeeze(0)
+        p2 = self.phase2_config
+        if not p2.enable_directional_break:
+            if row_renorm:
+                z = S + legacy_scale * torch.randn_like(S)
+                return z / (torch.linalg.vector_norm(z, dim=-1, keepdim=True) + 1e-8)
+            return S + legacy_scale * torch.randn_like(S)
+        dn = torch.linalg.vector_norm(delta_ref, dim=-1, keepdim=True)
+        rnd = torch.randn_like(delta_ref)
+        rn = torch.linalg.vector_norm(rnd, dim=-1, keepdim=True).clamp(min=1e-8)
+        dir_u = torch.where(dn >= 1e-6, delta_ref / dn.clamp(min=1e-8), rnd / rn)
+        alpha = self._phase2_break_alpha(t_mean)
+        if not torch.is_tensor(alpha):
+            alpha = torch.as_tensor(alpha, device=S.device, dtype=S.dtype)
+        out = S + alpha * dir_u
+        if row_renorm:
+            out = out / (torch.linalg.vector_norm(out, dim=-1, keepdim=True) + 1e-8)
+        return out
+
+    def phase2_interaction_reg_loss(self) -> torch.Tensor:
+        """Pull C toward identity (off-diagonal noise regularised)."""
+        p2 = self.phase2_config
+        z = self.embedder.weight.new_zeros(())
+        if p2.interaction_reg_weight <= 0.0 or not self.phase1_config.enable_window_interaction:
+            return z
+        W = self.train_window_size
+        C = self.phase1_window_C
+        I = torch.eye(W, device=C.device, dtype=C.dtype)
+        return ((C - I) ** 2).sum()
+
+    def _phase05_tension_w(self) -> tuple[float, float, float]:
+        """(w_energy, w_align, w_entropy) for T = w1*E + w2*A + w3*H; None weights → legacy λ, μ."""
+        if self.phase05_config.tension_weights is not None:
+            return self.phase05_config.tension_weights
+        return (1.0, float(self.tension_lambda.item()), float(self.tension_mu.item()))
+
+    def _phase1_global_interaction_step(
+        self, S: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """
+        Learnable cross-position mix: delta[b,j,d] = sum_i S[b,i,d] C[i,j]; add scale * delta.
+        No softmax — linear routing only.
+        """
+        p = self.phase1_config
+        if not p.enable_window_interaction:
+            self._phase1_last_interaction_rms = None
+            return S, None
+        C = self.phase1_window_C.to(device=S.device, dtype=S.dtype)
+        mask = self._phase2_C_dist_mask.to(device=S.device, dtype=S.dtype)
+        C = C * mask
+        delta = torch.einsum("bid,ij->bjd", S, C)
+        rms = torch.sqrt(delta.pow(2).mean() + 1e-12)
+        self._phase1_last_interaction_rms = rms
+        return S + float(p.interaction_scale) * delta, rms
+
+    def _phase1_per_head_tension_means(self, S: torch.Tensor) -> torch.Tensor | None:
+        """(B, H) geometry tension per head slice; entropy omitted (no per-head readout)."""
+        p = self.phase1_config
+        if not p.enable_per_head_tension or p.num_heads < 2:
+            return None
+        B, W, D = S.shape
+        H = p.num_heads
+        if D % H != 0:
+            return None
+        dh = D // H
+        parts = S.reshape(B, W, H, dh)
+        dpos = parts[:, 1:] - parts[:, :-1]
+        T_e = dpos.pow(2).mean(dim=(1, 3))
+        cos = F.cosine_similarity(parts[:, :-1], parts[:, 1:], dim=-1)
+        T_a = (1.0 - cos).mean(dim=1)
+        w1, w2, _w3 = self._phase05_tension_w()
+        w1t = torch.as_tensor(w1, device=S.device, dtype=S.dtype)
+        w2t = torch.as_tensor(w2, device=S.device, dtype=S.dtype)
+        return w1t * T_e + w2t * T_a
+
+    def phase1_head_diversity_loss(self) -> torch.Tensor:
+        """Mean pairwise cosine of batch-mean head drift directions; minimise to decorrelate heads."""
+        p = self.phase1_config
+        dyn = self.dynamics
+        z0 = self.embedder.weight.new_zeros(())
+        if p.head_diversity_weight <= 0:
+            return z0
+        if not isinstance(dyn, SimpleAttractorDynamics) or dyn.num_heads < 2:
+            return z0
+        d = dyn._last_multihead_drifts
+        if d is None:
+            return z0
+        zn = F.normalize(d, dim=-1, eps=1e-8)
+        m = F.normalize(zn.mean(dim=0), dim=-1, eps=1e-8)
+        sim = torch.mm(m, m.T)
+        mask = torch.triu(
+            torch.ones_like(sim, dtype=torch.bool), diagonal=1
+        )
+        n = int(mask.sum().item())
+        if n <= 0:
+            return z0
+        return (sim * mask.to(sim.dtype)).sum() / float(n)
 
     @property
     def goat_memory(self):
@@ -320,7 +545,8 @@ class TorchAttractorLanguageModel(nn.Module):
         div = 1.0 - cos_fs
         probs = F.softmax(logits, dim=-1)
         H = -(probs * (probs.clamp(min=1e-9)).log()).sum(dim=-1)
-        T = de + self.tension_lambda * div + self.tension_mu * H
+        w1, w2, w3 = self._phase05_tension_w()
+        T = w1 * de + w2 * div + w3 * H
         return T, de, div, H
 
     def _symplectic_combined(self, fast: torch.Tensor, slow: torch.Tensor) -> torch.Tensor:
@@ -412,6 +638,7 @@ class TorchAttractorLanguageModel(nn.Module):
         i = 0
         while i < max_steps:
             prev_fast = fast_state.detach()
+            fast_before_dyn = fast_state
             t_prev = self._last_tension_val
             noise_mul = (1.0 + F.softplus(self.tension_noise_gain) * min(t_prev, 3.0)).detach()
             fast_state = self.dynamics(fast_state, signal, noise_scale_mul=noise_mul)
@@ -423,9 +650,47 @@ class TorchAttractorLanguageModel(nn.Module):
             t_item = T.detach().item()
             self._last_tension_val = t_item
             if t_item > brk:
-                fast_state = fast_state + 0.02 * torch.randn_like(fast_state)
-                nrm = torch.linalg.vector_norm(fast_state)
-                fast_state = fast_state / (nrm + 1e-8)
+                if self.phase05_config.log_metrics:
+                    self._phase05_evolve_high_breaks += 1
+                    T_pre = T.detach().item()
+                delta_im = fast_state - fast_before_dyn
+                t_for_alpha = torch.as_tensor(t_item, device=fast_state.device, dtype=fast_state.dtype)
+                cos_pre = F.cosine_similarity(
+                    fast_state.unsqueeze(0), fast_before_dyn.unsqueeze(0), dim=-1
+                ).squeeze()
+                fast_pre_break = fast_state
+                prop = self._phase2_directional_escape(
+                    fast_state,
+                    delta_im,
+                    t_for_alpha,
+                    row_renorm=True,
+                    legacy_scale=0.02,
+                )
+                logits_post = self._logits_for_tension(prop, slow_state)
+                T_post, _, _, _ = self.compute_tension(
+                    prop, slow_state, logits_post, prev_energy
+                )
+                cos_post = F.cosine_similarity(
+                    prop.unsqueeze(0), fast_before_dyn.unsqueeze(0), dim=-1
+                ).squeeze()
+                rejected = False
+                if self.phase2_config.enable_break_rejection:
+                    if float(T_post.detach()) > float(T.detach()) and float(
+                        cos_post.detach()
+                    ) < float(cos_pre.detach()):
+                        prop = fast_pre_break
+                        rejected = True
+                fast_state = prop
+                if self.phase2_config.store_break_memory:
+                    self._phase2_last_break_pre = fast_pre_break.detach().clone()
+                    self._phase2_last_break_post = fast_state.detach().clone()
+                if self.phase05_config.log_metrics:
+                    self._phase05_evolve_t_pre_sum += T_pre
+                    self._phase05_evolve_t_post_sum += (
+                        float(T.detach().item())
+                        if rejected
+                        else float(T_post.detach().item())
+                    )
             self._last_state_norm = float(torch.linalg.vector_norm(fast_state.detach()))
             self._last_state_delta = float(
                 torch.linalg.vector_norm((fast_state - prev_fast).detach())
@@ -437,6 +702,8 @@ class TorchAttractorLanguageModel(nn.Module):
                 )
             i += 1
             if i >= base and t_item < tol:
+                if self.phase05_config.log_metrics:
+                    self._phase05_evolve_low_exits += 1
                 break
         slow_state = (1.0 - self.slow_decay) * slow_state + self.slow_lr * fast_state
         sn_slow = torch.linalg.vector_norm(slow_state)
@@ -488,6 +755,36 @@ class TorchAttractorLanguageModel(nn.Module):
         logits = torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=-1e4)
         return logits
 
+    def compute_tension_window_components(
+        self, state: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Window tension decomposition (B,).
+
+        T_energy: mean squared delta along positions (legacy energy term).
+        T_alignment: mean (1 - cosine) between consecutive rows (positional misalignment).
+        T_entropy: readout entropy when WINDOW_TENSION_USE_ENTROPY else 0.
+        T_total: w1*T_energy + w2*T_alignment + w3*T_entropy (Phase 0.5 weights).
+        """
+        assert state.dim() == 3 and state.size(1) >= 2
+        w1, w2, w3 = self._phase05_tension_w()
+        w1_t = torch.as_tensor(w1, device=state.device, dtype=state.dtype)
+        w2_t = torch.as_tensor(w2, device=state.device, dtype=state.dtype)
+        w3_t = torch.as_tensor(w3, device=state.device, dtype=state.dtype)
+        delta = state[:, 1:] - state[:, :-1]
+        T_energy = delta.pow(2).mean(dim=(1, 2))
+        cos = F.cosine_similarity(state[:, 1:], state[:, :-1], dim=-1)
+        T_alignment = (1.0 - cos).mean(dim=1)
+        if WINDOW_TENSION_USE_ENTROPY:
+            flat = state.reshape(state.size(0), -1)
+            logits = self.readout_window(flat)
+            probs = F.softmax(logits, dim=-1)
+            T_entropy = -(probs * torch.log(probs + 1e-9)).sum(dim=-1)
+        else:
+            T_entropy = torch.zeros(state.size(0), device=state.device, dtype=state.dtype)
+        T_total = w1_t * T_energy + w2_t * T_alignment + w3_t * T_entropy
+        return T_total, T_energy, T_alignment, T_entropy
+
     def compute_tension_window(self, state: torch.Tensor) -> torch.Tensor:
         """
         state: (B, W, D) normalized states
@@ -495,20 +792,7 @@ class TorchAttractorLanguageModel(nn.Module):
         Returns:
             scalar tension per batch (B,)
         """
-        assert state.dim() == 3 and state.size(1) >= 2
-        lam = self.tension_lambda.to(device=state.device, dtype=state.dtype)
-        delta = state[:, 1:] - state[:, :-1]
-        energy = delta.pow(2).mean(dim=(1, 2))
-        cos = F.cosine_similarity(state[:, 1:], state[:, :-1], dim=-1)
-        misalign = (1 - cos).mean(dim=1)
-        T = energy + lam * misalign
-        if WINDOW_TENSION_USE_ENTROPY:
-            mu = self.tension_mu.to(device=state.device, dtype=state.dtype)
-            flat = state.reshape(state.size(0), -1)
-            logits = self.readout_window(flat)
-            probs = F.softmax(logits, dim=-1)
-            entropy = -(probs * torch.log(probs + 1e-9)).sum(dim=-1)
-            T = T + mu * entropy
+        T, _, _, _ = self.compute_tension_window_components(state)
         return T
 
     def compute_window_tension(self, state: torch.Tensor) -> torch.Tensor:
@@ -534,6 +818,10 @@ class TorchAttractorLanguageModel(nn.Module):
         pos_g = F.softplus(self.position_gamma_raw) + 1e-6
         isc = F.softplus(self.interaction_scale_raw)
         idt = F.softplus(self.interaction_dt_raw)
+        if self.phase05_config.adaptive_window_dt:
+            idt = idt * self._phase05_interaction_dt_scale.to(
+                device=idt.device, dtype=idt.dtype
+            )
         delta = positional_coupling_delta(S, pos_g, self.position_asym)
         S = S + idt * isc * delta
 
@@ -549,9 +837,9 @@ class TorchAttractorLanguageModel(nn.Module):
         else:
             signal = torch.zeros(B, W, D, device=S.device, dtype=S.dtype)
 
-        # Unified interface: both SimpleAttractorDynamics and
-        # VectorizedWindowDynamics implement step(S, signal) → S (Bug 2 fix).
+        # Local dynamics (per-position multi-head diffusion), then optional global C coupling.
         S = self.dynamics.step(S, signal)
+        S, _ = self._phase1_global_interaction_step(S)
         return S
 
     def run_window_dynamics(
@@ -589,17 +877,90 @@ class TorchAttractorLanguageModel(nn.Module):
             )
             if context_tensor.dim() == 1:
                 context_tensor = context_tensor.unsqueeze(0)
+        trace = self.phase05_config.log_metrics
+        if not trace:
+            self._phase05_last_window_trace = None
+        if trace:
+            z = torch.zeros((), device=S.device, dtype=S.dtype)
+            _acc_T = z.clone()
+            _acc_Te = z.clone()
+            _acc_Ta = z.clone()
+            _acc_Th = z.clone()
+            _acc_rnm = z.clone()
+            _acc_rns = z.clone()
+            _acc_dl2 = z.clone()
+            _acc_stag = z.clone()
+            _n_trace = 0
+            _br_high = 0
+            _br_low = 0
+            _t_pre_h = z.clone()
+            _t_post_h = z.clone()
+            _n_h_ev = 0
+            _acc_p1_ir = z.clone()
+            _n_p1_ir = 0
+            _acc_p1_th = z.clone()
+            _n_p1_th = 0
+            _acc_p2_dn = z.clone()
+            _acc_p2_al = z.clone()
+            _acc_p2_dt = z.clone()
+            _acc_p2_dc = z.clone()
+            _n_p2_br = 0
+        S_prev: torch.Tensor | None = None
+        stag_eps = float(self.phase05_config.stagnation_delta_thresh)
         for step in range(self.max_window_steps):
+            S_prev_outer = S
             S0 = S.detach().clone() if collect_metrics else None
             S = self._single_window_step(
                 S, context_ids=context_ids, context_tensor=context_tensor
             )
-            T = self.compute_tension_window(S)
+            T, Te, Ta, Th = self.compute_tension_window_components(S)
             t_mean = T.mean()
             self._last_window_tension_mean = t_mean.detach()
             self._last_adaptive_window_steps = step + 1
+            if self.phase05_config.adaptive_window_dt:
+                tm = t_mean.detach()
+                sc = self._phase05_interaction_dt_scale
+                cfg = self.phase05_config
+                spike = (tm > cfg.adaptive_dt_spike_thresh).to(dtype=torch.float32)
+                low = (tm < cfg.adaptive_dt_low_thresh).to(dtype=torch.float32)
+                fac = (
+                    1.0
+                    - spike
+                    - low
+                    + spike * cfg.adaptive_dt_spike_factor
+                    + low * cfg.adaptive_dt_low_factor
+                )
+                tgt = (sc * fac).clamp(
+                    cfg.adaptive_dt_min_scale, cfg.adaptive_dt_max_scale
+                )
+                sm = cfg.adaptive_dt_smooth
+                self._phase05_interaction_dt_scale.copy_((1.0 - sm) * sc + sm * tgt)
             if record_tension_log:
                 tension_curve_tensors.append(t_mean.detach())
+            if trace:
+                with torch.no_grad():
+                    _acc_T = _acc_T + t_mean
+                    _acc_Te = _acc_Te + Te.mean()
+                    _acc_Ta = _acc_Ta + Ta.mean()
+                    _acc_Th = _acc_Th + Th.mean()
+                    rn = torch.linalg.vector_norm(S, dim=-1)
+                    _acc_rnm = _acc_rnm + rn.mean()
+                    _acc_rns = _acc_rns + rn.std(unbiased=False)
+                    dpos = S[:, 1:] - S[:, :-1]
+                    _acc_dl2 = _acc_dl2 + torch.linalg.vector_norm(dpos, dim=-1).mean()
+                    if S_prev is not None:
+                        dstep = torch.linalg.vector_norm(S - S_prev, dim=-1)
+                        _acc_stag = _acc_stag + (dstep < stag_eps).float().mean()
+                    _n_trace += 1
+                    lrms = getattr(self, "_phase1_last_interaction_rms", None)
+                    if lrms is not None:
+                        _acc_p1_ir = _acc_p1_ir + lrms
+                        _n_p1_ir += 1
+                    thm = self._phase1_per_head_tension_means(S)
+                    if thm is not None:
+                        _acc_p1_th = _acc_p1_th + thm.mean()
+                        _n_p1_th += 1
+                S_prev = S.detach()
             if collect_metrics and S0 is not None and step_logs is not None:
                 with torch.no_grad():
                     diff = S - S0
@@ -626,8 +987,40 @@ class TorchAttractorLanguageModel(nn.Module):
                 torch.zeros((), device=S.device, dtype=torch.long),
             )
             need_jitter = is_low & (consecutive_low_t_steps_t >= 4)
-            # Extra stochastic break for stuck low-tension attractors (GOAT DORMANT→ACTIVE jitter)
-            S = S + torch.randn_like(S) * (need_jitter.to(dtype=S.dtype) * 0.015)
+            # Low-tension break: directional escape along (S − S_prev_outer) or legacy Gaussian jitter.
+            if bool(need_jitter.item()):
+                S_low_bef = S
+                delta_lo = S - S_prev_outer
+                T_pre_l = self.compute_tension_window(S_low_bef).mean().detach()
+                cos_pre_l = self._window_row_cos_mean(S_low_bef).detach()
+                S_try_l = self._phase2_directional_escape(
+                    S_low_bef,
+                    delta_lo,
+                    t_mean,
+                    row_renorm=False,
+                    legacy_scale=0.015,
+                )
+                T_post_l = self.compute_tension_window(S_try_l).mean().detach()
+                cos_post_l = self._window_row_cos_mean(S_try_l).detach()
+                if self.phase2_config.enable_break_rejection:
+                    if float(T_post_l) > float(T_pre_l) and float(cos_post_l) < float(
+                        cos_pre_l
+                    ):
+                        S_try_l = S_low_bef
+                S = S_try_l
+                if trace:
+                    _br_low += 1
+                    with torch.no_grad():
+                        _acc_p2_dn = _acc_p2_dn + torch.linalg.vector_norm(
+                            delta_lo, dim=-1
+                        ).mean()
+                        _acc_p2_al = _acc_p2_al + self._phase2_break_alpha(t_mean)
+                        _acc_p2_dt = _acc_p2_dt + (T_post_l - T_pre_l)
+                        _acc_p2_dc = _acc_p2_dc + (cos_post_l - cos_pre_l)
+                        _n_p2_br += 1
+                if self.phase2_config.store_break_memory:
+                    self._phase2_last_break_pre = S_low_bef.detach().clone()
+                    self._phase2_last_break_post = S.detach().clone()
             consecutive_low_t_steps_t = torch.where(need_jitter, zero_long, consecutive_low_t_steps_t)
             # GOAT node updates are Python-side; one scalar sync only when GOAT is on and jitter fires.
             if (
@@ -640,9 +1033,103 @@ class TorchAttractorLanguageModel(nn.Module):
                     S[:, -1, :].mean(dim=0), "DORMANT", "ACTIVE"
                 )
             high = (T > thigh).any()
-            S_hi = S + 0.01 * torch.randn_like(S)
-            S_hi = S_hi / (torch.linalg.vector_norm(S_hi, dim=-1, keepdim=True) + 1e-8)
-            S = torch.where(high.view(1, 1, 1), S_hi, S)
+            if bool(high.item()):
+                S_h_bef = S
+                delta_h = S - S_prev_outer
+                T_pre_hm = self.compute_tension_window(S_h_bef).mean().detach()
+                cos_pre_h = self._window_row_cos_mean(S_h_bef).detach()
+                S_try_h = self._phase2_directional_escape(
+                    S_h_bef,
+                    delta_h,
+                    t_mean,
+                    row_renorm=True,
+                    legacy_scale=0.01,
+                )
+                T_post_hm = self.compute_tension_window(S_try_h).mean().detach()
+                cos_post_h = self._window_row_cos_mean(S_try_h).detach()
+                if self.phase2_config.enable_break_rejection:
+                    if float(T_post_hm) > float(T_pre_hm) and float(cos_post_h) < float(
+                        cos_pre_h
+                    ):
+                        S_try_h = S_h_bef
+                S_hi = S_try_h
+                if trace:
+                    _br_high += 1
+                    _t_pre_h = _t_pre_h + t_mean.detach()
+                    with torch.no_grad():
+                        _acc_p2_dn = _acc_p2_dn + torch.linalg.vector_norm(
+                            delta_h, dim=-1
+                        ).mean()
+                        _acc_p2_al = _acc_p2_al + self._phase2_break_alpha(t_mean)
+                        _acc_p2_dt = _acc_p2_dt + (T_post_hm - T_pre_hm)
+                        _acc_p2_dc = _acc_p2_dc + (cos_post_h - cos_pre_h)
+                        _n_p2_br += 1
+                if self.phase2_config.store_break_memory:
+                    self._phase2_last_break_pre = S_h_bef.detach().clone()
+                    self._phase2_last_break_post = S_hi.detach().clone()
+                S = S_hi
+            if trace and bool(high.item()):
+                t_af = self.compute_tension_window(S).mean().detach()
+                _t_post_h = _t_post_h + t_af
+                _n_h_ev += 1
+        if trace and _n_trace > 0:
+            nf = float(_n_trace)
+            if _n_h_ev > 0:
+                nh = float(_n_h_ev)
+                avg_post = float((_t_post_h / nh).item())
+                avg_pre = float((_t_pre_h / nh).item())
+            else:
+                avg_post = float("nan")
+                avg_pre = float("nan")
+            self._phase05_last_window_trace = {
+                "win_T_mean": float((_acc_T / nf).item()),
+                "win_T_energy": float((_acc_Te / nf).item()),
+                "win_T_align": float((_acc_Ta / nf).item()),
+                "win_T_entropy": float((_acc_Th / nf).item()),
+                "state_norm_mean": float((_acc_rnm / nf).item()),
+                "state_norm_std": float((_acc_rns / nf).item()),
+                "win_delta_l2_mean": float((_acc_dl2 / nf).item()),
+                "stagnation_frac": float((_acc_stag / max(_n_trace - 1, 1)).item()),
+                "break_high_count": float(_br_high),
+                "break_low_jitter_count": float(_br_low),
+                "break_avg_t_pre": avg_pre,
+                "break_avg_t_post": avg_post,
+                "interaction_dt_scale": float(
+                    self._phase05_interaction_dt_scale.detach().item()
+                ),
+                "phase1_interaction_rms": float(
+                    (_acc_p1_ir / float(max(_n_p1_ir, 1))).item()
+                )
+                if _n_p1_ir > 0
+                else float("nan"),
+                "phase1_tension_heads_mean": float(
+                    (_acc_p1_th / float(max(_n_p1_th, 1))).item()
+                )
+                if _n_p1_th > 0
+                else float("nan"),
+                "phase2_break_direction_norm_mean": float(
+                    (_acc_p2_dn / float(max(_n_p2_br, 1))).item()
+                )
+                if _n_p2_br > 0
+                else float("nan"),
+                "phase2_break_applied_alpha_mean": float(
+                    (_acc_p2_al / float(max(_n_p2_br, 1))).item()
+                )
+                if _n_p2_br > 0
+                else float("nan"),
+                "phase2_break_delta_tension_mean": float(
+                    (_acc_p2_dt / float(max(_n_p2_br, 1))).item()
+                )
+                if _n_p2_br > 0
+                else float("nan"),
+                "phase2_break_delta_alignment_mean": float(
+                    (_acc_p2_dc / float(max(_n_p2_br, 1))).item()
+                )
+                if _n_p2_br > 0
+                else float("nan"),
+            }
+        elif trace:
+            self._phase05_last_window_trace = {}
         if record_tension_log:
             self._last_window_tension_curve = [
                 float(x) for x in tension_curve_tensors
@@ -658,14 +1145,29 @@ class TorchAttractorLanguageModel(nn.Module):
         state_a: evolved(context); state_b: evolved(shifted_context + target).
         Same shape (B, W, D).
         """
+        cfg = self.phase05_config
         a = state_a.reshape(state_a.size(0), -1)
         b = state_b.reshape(state_b.size(0), -1)
         a = F.normalize(a, dim=-1)
         b = F.normalize(b, dim=-1)
+        B = a.size(0)
         pos = (a * b).sum(dim=-1)
-        b_neg = b[torch.randperm(b.size(0), device=b.device)]
-        neg = (a * b_neg).sum(dim=-1)
-        return F.relu(0.2 - pos + neg).mean()
+        if cfg.multi_negative and cfg.num_negatives > 1:
+            K = max(2, int(cfg.num_negatives))
+            scores = torch.rand(K, B, device=a.device, dtype=a.dtype)
+            perm = torch.argsort(scores, dim=1)
+            b_k = b[perm]
+            neg = (a.unsqueeze(0) * b_k).sum(dim=-1).mean(dim=0)
+        else:
+            b_neg = b[torch.randperm(B, device=b.device)]
+            neg = (a * b_neg).sum(dim=-1)
+        tau = max(1e-6, float(cfg.trajectory_temperature))
+        margin = (0.2 - pos + neg) / tau
+        with torch.no_grad():
+            self._last_traj_cos_pos = float(pos.mean().item())
+            self._last_traj_cos_neg = float(neg.mean().item())
+            self._last_traj_margin = float((pos - neg).mean().item())
+        return F.relu(margin).mean() * tau
 
     def window_ids_from_sequence(self, seq_ids: list[int]) -> list[int]:
         """Last W token ids; left-pad with seq_ids[0] if shorter than window (full window for dynamics)."""
@@ -717,6 +1219,13 @@ class TorchAttractorLanguageModel(nn.Module):
         """
         B = len(contexts)
         assert B == len(targets) and B >= 1
+        if self.phase05_config.log_metrics:
+            self._phase05_evolve_high_breaks = 0
+            self._phase05_evolve_low_exits = 0
+            self._phase05_evolve_t_pre_sum = 0.0
+            self._phase05_evolve_t_post_sum = 0.0
+        if isinstance(self.dynamics, SimpleAttractorDynamics):
+            self.dynamics._last_multihead_drifts = None
         S_pred = torch.stack([self.embed_window(c) for c in contexts], dim=0)
         S_pred, _ = self.run_window_dynamics(
             S_pred, collect_metrics=False, record_tension_log=True, context_ids=contexts
@@ -733,7 +1242,8 @@ class TorchAttractorLanguageModel(nn.Module):
             S_tgt, _ = self.run_window_dynamics(
                 S_tgt, collect_metrics=False, record_tension_log=False
             )
-        loss_traj = self.trajectory_contrastive_loss(S_pred, S_tgt)
+        loss_core = self.trajectory_contrastive_loss(S_pred, S_tgt)
+        self._phase05_loss_traj_core = float(loss_core.detach().item())
         T = self.compute_tension_window(S_pred).mean()
         base_entropy_floor = torch.as_tensor(
             float(ENTROPY_FLOOR), device=S_pred.device, dtype=S_pred.dtype
@@ -752,7 +1262,13 @@ class TorchAttractorLanguageModel(nn.Module):
         else:
             repulsion = torch.zeros((), device=S_pred.device, dtype=S_pred.dtype)
         # Repulsion term to push away from previous states and break basin collapse
-        loss_traj = loss_traj + entropy_floor - repulsion
+        loss_traj = loss_core + entropy_floor - repulsion
+        div = self.phase1_head_diversity_loss()
+        if self.phase1_config.head_diversity_weight > 0.0:
+            loss_traj = loss_traj + self.phase1_config.head_diversity_weight * div
+        reg_c = self.phase2_interaction_reg_loss()
+        if self.phase2_config.interaction_reg_weight > 0.0:
+            loss_traj = loss_traj + self.phase2_config.interaction_reg_weight * reg_c
         with torch.no_grad():
             self._repulsion_prev_states.append(fast_state.detach().clone())
             if len(self._repulsion_prev_states) > 8:
@@ -761,7 +1277,94 @@ class TorchAttractorLanguageModel(nn.Module):
         logits = torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=-1e4)
         # Store final-position single state for auxiliary readout training (Phase 5).
         self._last_pred_final_state = S_pred[:, -1, :]  # (B, D)
+        if self.phase05_config.log_metrics:
+            self._phase05_loss_traj_full = float(loss_traj.detach().item())
+            _, t_te, t_ta, t_th = self.compute_tension_window_components(S_pred)
+            self._phase05_last_student_T_components = (
+                float(T.detach().item()),
+                float(t_te.mean().detach().item()),
+                float(t_ta.mean().detach().item()),
+                float(t_th.mean().detach().item()),
+            )
+            self._phase1_head_div_logged = (
+                float(div.detach().item())
+                if self.phase1_config.head_diversity_weight > 0.0
+                else float("nan")
+            )
+            self._phase2_interaction_reg_logged = (
+                float(reg_c.detach().item())
+                if self.phase2_config.interaction_reg_weight > 0.0
+                else float("nan")
+            )
+            _he = getattr(self.dynamics, "_last_head_weight_entropy", None)
+            self._phase2_head_weight_entropy_logged = (
+                float(_he.detach().item())
+                if isinstance(_he, torch.Tensor)
+                else float("nan")
+            )
         return loss_traj, logits
+
+    def phase05_batch_csv_values(
+        self,
+        epoch: int,
+        batch_idx: int,
+        global_step: int,
+        batch_ce: float,
+    ) -> list[float | int]:
+        """Flat row for phase05 batch CSV (caller writes header once)."""
+        wt = self._phase05_last_window_trace or {}
+        t_tot, t_e, t_a, t_h = getattr(
+            self,
+            "_phase05_last_student_T_components",
+            (float("nan"), float("nan"), float("nan"), float("nan")),
+        )
+        ev_n = self._phase05_evolve_high_breaks
+        ev_pre = self._phase05_evolve_t_pre_sum / ev_n if ev_n > 0 else float("nan")
+        ev_post = self._phase05_evolve_t_post_sum / ev_n if ev_n > 0 else float("nan")
+        curve = self._last_window_tension_curve
+        t_final = float(curve[-1]) if curve else float("nan")
+        return [
+            epoch + 1,
+            batch_idx,
+            global_step,
+            t_final,
+            t_tot,
+            t_e,
+            t_a,
+            t_h,
+            wt.get("win_T_mean", float("nan")),
+            wt.get("win_T_energy", float("nan")),
+            wt.get("win_T_align", float("nan")),
+            wt.get("win_T_entropy", float("nan")),
+            wt.get("state_norm_mean", float("nan")),
+            wt.get("state_norm_std", float("nan")),
+            wt.get("win_delta_l2_mean", float("nan")),
+            wt.get("stagnation_frac", float("nan")),
+            self._last_traj_cos_pos,
+            self._last_traj_cos_neg,
+            self._last_traj_margin,
+            wt.get("break_high_count", float("nan")),
+            wt.get("break_low_jitter_count", float("nan")),
+            wt.get("break_avg_t_pre", float("nan")),
+            wt.get("break_avg_t_post", float("nan")),
+            wt.get("interaction_dt_scale", float("nan")),
+            float(self._phase05_evolve_high_breaks),
+            float(self._phase05_evolve_low_exits),
+            ev_pre,
+            ev_post,
+            getattr(self, "_phase05_loss_traj_core", float("nan")),
+            getattr(self, "_phase05_loss_traj_full", float("nan")),
+            batch_ce,
+            wt.get("phase1_interaction_rms", float("nan")),
+            wt.get("phase1_tension_heads_mean", float("nan")),
+            getattr(self, "_phase1_head_div_logged", float("nan")),
+            wt.get("phase2_break_direction_norm_mean", float("nan")),
+            wt.get("phase2_break_applied_alpha_mean", float("nan")),
+            wt.get("phase2_break_delta_tension_mean", float("nan")),
+            wt.get("phase2_break_delta_alignment_mean", float("nan")),
+            getattr(self, "_phase2_head_weight_entropy_logged", float("nan")),
+            getattr(self, "_phase2_interaction_reg_logged", float("nan")),
+        ]
 
     @staticmethod
     def summarize_dynamics_logs(logs: list[dict] | None) -> str:
@@ -873,6 +1476,11 @@ class TorchAttractorLanguageModel(nn.Module):
 
 
 class SimpleAttractorDynamics(nn.Module):
+    """
+    Phase 1: optional multi-head diffusion — parallel linear drifts concat → W_mix → dim.
+    H=1 + identity W_mix reproduces single matrix drift state @ D.
+    """
+
     def __init__(
         self,
         dim=512,
@@ -883,62 +1491,202 @@ class SimpleAttractorDynamics(nn.Module):
         lambda_decay=0.1,
         signal_scale=0.5,
         state_norm_eps=1e-8,
+        enforce_negative_definite: bool = False,
+        phase1: Phase1Config | None = None,
+        phase2: Phase2Config | None = None,
     ):
         super().__init__()
         self.dim = dim
         self.dt = dt
         self.cubic_scale = cubic_scale
-        self.diffusion = nn.Parameter(make_diffusion_matrix(dim))
+        self.phase1 = phase1 if phase1 is not None else Phase1Config()
+        self.phase2 = phase2 if phase2 is not None else Phase2Config()
+        self.num_heads = max(1, int(self.phase1.num_heads))
+        self.head_dim_mode = self.phase1.head_dim_mode
+        if self.head_dim_mode not in ("shared", "split"):
+            raise ValueError("head_dim_mode must be 'shared' or 'split'")
+        if self.head_dim_mode == "split" and dim % self.num_heads != 0:
+            raise ValueError(f"split mode requires dim % num_heads == 0; got {dim} % {self.num_heads}")
+        self.dh = dim // self.num_heads if self.head_dim_mode == "split" else dim
+        self._track_head_drifts = (
+            self.num_heads > 1 and float(self.phase1.head_diversity_weight) > 0.0
+        )
+        self._last_multihead_drifts: torch.Tensor | None = None
+        self._last_head_weight_entropy: torch.Tensor | None = None
+        mg = float(self.phase2.mixing_gate_init)
+        mg = min(max(mg, 1e-4), 1.0 - 1e-4)
+        self.mixing_gate_raw = nn.Parameter(
+            torch.tensor(math.log(mg / (1.0 - mg)))
+        )
+
+        heads: list[torch.Tensor] = []
+        H = self.num_heads
+        if self.head_dim_mode == "split":
+            dsub = self.dh
+            for h in range(H):
+                heads.append(
+                    make_diffusion_matrix(
+                        dsub,
+                        enforce_negative_definite=enforce_negative_definite,
+                        seed_offset=h,
+                    )
+                )
+            self.diffusion_heads = nn.Parameter(torch.stack(heads, dim=0))
+            mix_in = dim
+        else:
+            for h in range(H):
+                heads.append(
+                    make_diffusion_matrix(
+                        dim,
+                        enforce_negative_definite=enforce_negative_definite,
+                        seed_offset=h,
+                    )
+                )
+            self.diffusion_heads = nn.Parameter(torch.stack(heads, dim=0))
+            mix_in = H * dim
+        self.w_mix = nn.Linear(mix_in, dim, bias=False)
+        with torch.no_grad():
+            self.w_mix.weight.zero_()
+            if self.head_dim_mode == "shared":
+                for h in range(H):
+                    self.w_mix.weight[:, h * dim : (h + 1) * dim].copy_(
+                        torch.eye(dim) / float(H)
+                    )
+            else:
+                self.w_mix.weight.copy_(torch.eye(dim))
+
         self.beta = nn.Parameter(torch.tensor(float(beta_init)))
         self.register_buffer("noise_scale", torch.tensor(float(noise_scale)))
         self.register_buffer("lambda_decay", torch.tensor(float(lambda_decay)))
         self.register_buffer("signal_scale", torch.tensor(float(signal_scale)))
         self.register_buffer("state_norm_eps", torch.tensor(float(state_norm_eps)))
 
+    def linear_drift(self, state_batch: torch.Tensor) -> torch.Tensor:
+        """Multi-head linear drift; optional softmax(-T_slice) head weights; residual mixing."""
+        N, dim = state_batch.shape
+        H = self.num_heads
+        if self.head_dim_mode == "split":
+            x = state_batch.view(N, H, self.dh)
+            drifts = torch.einsum("nhd,hde->nhe", x, self.diffusion_heads)
+        else:
+            drifts = torch.einsum("nd,hde->nhe", state_batch, self.diffusion_heads)
+        if self.training and self._track_head_drifts:
+            self._last_multihead_drifts = drifts
+        p2 = self.phase2
+        use_ht = (
+            p2.enable_head_tension_weighting
+            and H > 1
+            and dim % H == 0
+        )
+        if use_ht:
+            parts = state_batch.view(N, H, dim // H)
+            T_h = parts.pow(2).mean(dim=-1)
+            w = F.softmax(-T_h, dim=-1)
+            self._last_head_weight_entropy = (
+                -(w * (w.clamp(min=1e-9)).log()).sum(dim=-1).mean()
+            )
+            mixed = (w.unsqueeze(-1) * drifts).sum(dim=1)
+        else:
+            self._last_head_weight_entropy = None
+            flat = drifts.reshape(N, -1)
+            mixed = F.linear(flat, self.w_mix.weight)
+        if p2.enable_residual_mixing:
+            g = torch.sigmoid(self.mixing_gate_raw)
+            return state_batch + g * mixed
+        return mixed
+
+    def _step_rows(
+        self,
+        state_batch: torch.Tensor,
+        applied_signal_batch: torch.Tensor,
+        noise_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        drift_lin = self.linear_drift(state_batch)
+        c = state_batch - state_batch.mean(dim=-1, keepdim=True)
+        nonlinear = self.cubic_scale * float(WINDOW_NONLINEAR_GAIN) * torch.tanh(c)
+        scaled_signal = self.signal_scale * applied_signal_batch
+        drift = (
+            drift_lin
+            + nonlinear
+            + self.beta * scaled_signal
+            - self.lambda_decay * state_batch
+        )
+        s = state_batch + self.dt * drift
+        if noise_scale is not None and float(noise_scale) > 0:
+            s = s + noise_scale * torch.randn_like(s)
+        s = torch.nan_to_num(s, nan=0.0, posinf=0.0, neginf=0.0)
+        nrm = torch.linalg.vector_norm(s, dim=-1, keepdim=True)
+        eps = self.state_norm_eps
+        if torch.is_tensor(eps):
+            eps = eps.to(device=s.device, dtype=s.dtype)
+        s = s / (nrm + eps)
+        return torch.clamp(s, -10.0, 10.0)
+
     def forward(self, state, signal, noise_scale_mul=1.0):
         ns = self.noise_scale * noise_scale_mul
-        return step_state(
-            state,
-            self.diffusion,
-            signal,
-            self.dt,
-            self.cubic_scale,
-            beta=self.beta,
-            noise_scale=ns,
-            lambda_decay=self.lambda_decay,
-            signal_scale=self.signal_scale,
-            state_norm_eps=self.state_norm_eps,
+        drift_lin = self.linear_drift(state.view(1, -1)).view(-1)
+        c = state - state.mean()
+        nonlinear = self.cubic_scale * torch.tanh(c)
+        scaled_signal = self.signal_scale * signal
+        drift = (
+            drift_lin
+            + nonlinear
+            + self.beta * scaled_signal
+            - self.lambda_decay * state
         )
+        s = state + self.dt * drift
+        if ns is not None and float(ns) > 0:
+            s = s + ns * torch.randn_like(s)
+        s = torch.nan_to_num(s, nan=0.0, posinf=0.0, neginf=0.0)
+        nrm = torch.linalg.vector_norm(s)
+        eps = self.state_norm_eps
+        if torch.is_tensor(eps):
+            eps = eps.to(device=s.device, dtype=s.dtype)
+        s = s / (nrm + eps)
+        return torch.clamp(s, -10.0, 10.0)
 
     def step(self, S: torch.Tensor, signal: torch.Tensor) -> torch.Tensor:
-        """Unified batched step interface for the window training path (B, W, D).
-
-        Noise is enabled when the module is in training mode, disabled in eval.
-        """
+        """Unified batched step (B, W, D) or (N, D)."""
         ns = (
             self.noise_scale.to(device=S.device, dtype=S.dtype)
             if self.training
             else torch.tensor(0.0, device=S.device, dtype=S.dtype)
         )
-        return step_state_batch(
-            S,
-            self.diffusion,
-            signal,
-            self.dt,
-            self.cubic_scale,
-            beta=self.beta,
-            noise_scale=ns,
-            lambda_decay=self.lambda_decay,
-            signal_scale=self.signal_scale,
-            state_norm_eps=self.state_norm_eps,
-            nonlinear_gain=WINDOW_NONLINEAR_GAIN,
-        )
+        if S.dim() == 3:
+            B, W, D = S.shape
+            flat = S.reshape(B * W, D)
+            sig_flat = signal.reshape(B * W, D)
+            out_flat = self._step_rows(flat, sig_flat, ns)
+            return out_flat.reshape(B, W, D)
+        return self._step_rows(S, signal, ns)
 
 
-def make_diffusion_matrix(dim):
-    torch.manual_seed(42)
-    q = torch.linalg.qr(torch.randn(dim, dim))[0]
-    u = torch.rand(dim)
+def make_diffusion_matrix(
+    dim: int,
+    enforce_negative_definite: bool = False,
+    eps: float = 1e-2,
+    seed_offset: int = 0,
+):
+    """
+    Random negative-definite-ish diffusion (legacy) or strict D = -(A^T A) - eps I.
+    seed_offset differentiates independent draws for multi-head matrices.
+    """
+    sk = 42 + int(seed_offset)
+    if enforce_negative_definite:
+        g = torch.Generator()
+        g.manual_seed(sk)
+        A = torch.randn(dim, dim, generator=g)
+        D = -(A.T @ A) - float(eps) * torch.eye(dim)
+        return D.contiguous()
+    if int(seed_offset) == 0:
+        torch.manual_seed(42)
+        q = torch.linalg.qr(torch.randn(dim, dim))[0]
+        u = torch.rand(dim)
+    else:
+        g = torch.Generator()
+        g.manual_seed(sk)
+        q = torch.linalg.qr(torch.randn(dim, dim, generator=g))[0]
+        u = torch.rand(dim, generator=g)
     eigenvalues = -0.2 - (0.05 + 0.3 * u)
     return (q * eigenvalues) @ q.T
 
@@ -1557,6 +2305,75 @@ def _save_checkpoint(
     return ckpt_path
 
 
+def phase05_config_from_args(args: argparse.Namespace) -> Phase05Config:
+    tw: tuple[float, float, float] | None = None
+    raw = getattr(args, "phase05_tension_w", None)
+    if raw:
+        parts = [float(x.strip()) for x in str(raw).split(",")]
+        if len(parts) != 3:
+            raise SystemExit("--phase05-tension-w requires exactly three comma-separated floats")
+        tw = (parts[0], parts[1], parts[2])
+    csv_p = getattr(args, "phase05_batch_metrics_csv", None)
+    log_m = bool(getattr(args, "phase05_log_metrics", False))
+    if csv_p is not None:
+        log_m = True
+    return Phase05Config(
+        log_metrics=log_m,
+        batch_metrics_csv=str(csv_p) if csv_p is not None else None,
+        enforce_negative_definite_diffusion=bool(
+            getattr(args, "phase05_enforce_negdef_diffusion", False)
+        ),
+        adaptive_window_dt=bool(getattr(args, "phase05_adaptive_window_dt", False)),
+        tension_weights=tw,
+        multi_negative=bool(getattr(args, "phase05_multi_negative", False)),
+        num_negatives=max(2, int(getattr(args, "phase05_num_negatives", 4))),
+        trajectory_temperature=float(getattr(args, "phase05_traj_temperature", 1.0)),
+    )
+
+
+def phase2_config_from_args(args: argparse.Namespace) -> Phase2Config:
+    tau = getattr(args, "phase2_interaction_decay_tau", None)
+    tau_f = float(tau) if tau is not None and tau > 0 else None
+    return Phase2Config(
+        enable_directional_break=not bool(
+            getattr(args, "phase2_disable_directional_break", False)
+        ),
+        break_base_strength=float(getattr(args, "phase2_break_base_strength", 0.1)),
+        break_min_scale=float(getattr(args, "phase2_break_min_scale", 0.1)),
+        break_max_scale=float(getattr(args, "phase2_break_max_scale", 2.0)),
+        break_t_target=float(getattr(args, "phase2_break_t_target", 0.12)),
+        enable_break_rejection=bool(getattr(args, "phase2_enable_break_rejection", False)),
+        enable_residual_mixing=not bool(
+            getattr(args, "phase2_disable_residual_mixing", False)
+        ),
+        mixing_gate_init=float(getattr(args, "phase2_mixing_gate_init", 0.1)),
+        interaction_reg_weight=float(getattr(args, "phase2_interaction_reg_weight", 0.0)),
+        interaction_decay_tau=tau_f,
+        enable_head_tension_weighting=bool(
+            getattr(args, "phase2_enable_head_tension_weighting", False)
+        ),
+        store_break_memory=bool(getattr(args, "phase2_store_break_memory", False)),
+    )
+
+
+def phase1_config_from_args(args: argparse.Namespace) -> Phase1Config:
+    mode = str(getattr(args, "phase1_head_dim_mode", "shared")).lower()
+    if mode not in ("shared", "split"):
+        raise SystemExit("--phase1-head-dim-mode must be 'shared' or 'split'")
+    return Phase1Config(
+        num_heads=max(1, int(getattr(args, "phase1_num_heads", 1))),
+        head_dim_mode=mode,
+        interaction_scale=float(getattr(args, "phase1_interaction_scale", 0.01)),
+        enable_window_interaction=bool(
+            getattr(args, "phase1_enable_window_interaction", False)
+        ),
+        head_diversity_weight=float(getattr(args, "phase1_head_diversity_weight", 0.0)),
+        enable_per_head_tension=bool(
+            getattr(args, "phase1_enable_per_head_tension", False)
+        ),
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="BoggersTheLanguageModel — attractor dynamics training (see README)."
@@ -1689,6 +2506,179 @@ def main() -> None:
         dest="use_lorentz",
         help="Vectorized dynamics only: Lorentz/hyperbolic step (tangent projection + curvature scaling).",
     )
+    # ---- Phase 0.5: instrumentation + stability (toggleable) ----
+    parser.add_argument(
+        "--phase05-log-metrics",
+        action="store_true",
+        dest="phase05_log_metrics",
+        help="Collect window/token tension breakdown, dynamics, trajectory cosines (cheap batch-boundary export).",
+    )
+    parser.add_argument(
+        "--phase05-batch-metrics-csv",
+        type=Path,
+        default=None,
+        dest="phase05_batch_metrics_csv",
+        help="Append one CSV row per training batch (implies --phase05-log-metrics).",
+    )
+    parser.add_argument(
+        "--phase05-enforce-negdef-diffusion",
+        action="store_true",
+        dest="phase05_enforce_negdef_diffusion",
+        help="SimpleAttractorDynamics: D = -(A^T A) - eps I (strictly negative definite).",
+    )
+    parser.add_argument(
+        "--phase05-adaptive-window-dt",
+        action="store_true",
+        dest="phase05_adaptive_window_dt",
+        help="EMA scale on window positional dt from per-step tension (clamped, smooth).",
+    )
+    parser.add_argument(
+        "--phase05-tension-w",
+        type=str,
+        default=None,
+        dest="phase05_tension_w",
+        metavar="W1,W2,W3",
+        help="Tension weights (energy, alignment, entropy). Default: 1,λ,μ from model buffers.",
+    )
+    parser.add_argument(
+        "--phase05-multi-negative",
+        action="store_true",
+        dest="phase05_multi_negative",
+        help="Trajectory contrastive: average cosine over K random permutations (see --phase05-num-negatives).",
+    )
+    parser.add_argument(
+        "--phase05-num-negatives",
+        type=int,
+        default=4,
+        dest="phase05_num_negatives",
+        metavar="K",
+        help="Number of shuffled negatives per batch row for trajectory loss (>=2).",
+    )
+    parser.add_argument(
+        "--phase05-traj-temperature",
+        type=float,
+        default=1.0,
+        dest="phase05_traj_temperature",
+        help="Divides trajectory margin inside ReLU; 1.0 preserves default scaling.",
+    )
+    # ---- Phase 1: multi-head diffusion + structured window coupling ----
+    parser.add_argument(
+        "--phase1-num-heads",
+        type=int,
+        default=1,
+        dest="phase1_num_heads",
+        help="SimpleAttractorDynamics: parallel diffusion heads (1 = legacy single-matrix drift).",
+    )
+    parser.add_argument(
+        "--phase1-head-dim-mode",
+        choices=("shared", "split"),
+        default="shared",
+        dest="phase1_head_dim_mode",
+        help="shared: H full D×D matrices; split: H blocks of (D/H)×(D/H) (requires D %% H == 0).",
+    )
+    parser.add_argument(
+        "--phase1-interaction-scale",
+        type=float,
+        default=0.01,
+        dest="phase1_interaction_scale",
+        help="Scales learnable cross-position coupling delta after local dynamics.",
+    )
+    parser.add_argument(
+        "--phase1-enable-window-interaction",
+        action="store_true",
+        dest="phase1_enable_window_interaction",
+        help="Add einsum('bid,ij->bjd', S, C) after each local dynamics step.",
+    )
+    parser.add_argument(
+        "--phase1-head-diversity-weight",
+        type=float,
+        default=0.0,
+        dest="phase1_head_diversity_weight",
+        help="Penalty on mean pairwise cosine similarity of head drift directions (0 = off).",
+    )
+    parser.add_argument(
+        "--phase1-enable-per-head-tension",
+        action="store_true",
+        dest="phase1_enable_per_head_tension",
+        help="When --phase05-log-metrics, log mean per-head geometry tension (split layout on D).",
+    )
+    # ---- Phase 2: directional breaks, residual mixing, C regularisation, head tension weights ----
+    parser.add_argument(
+        "--phase2-disable-directional-break",
+        action="store_true",
+        dest="phase2_disable_directional_break",
+        help="Use legacy Gaussian jitter for window/token breaks.",
+    )
+    parser.add_argument(
+        "--phase2-break-base-strength",
+        type=float,
+        default=0.1,
+        dest="phase2_break_base_strength",
+    )
+    parser.add_argument(
+        "--phase2-break-min-scale",
+        type=float,
+        default=0.1,
+        dest="phase2_break_min_scale",
+    )
+    parser.add_argument(
+        "--phase2-break-max-scale",
+        type=float,
+        default=2.0,
+        dest="phase2_break_max_scale",
+    )
+    parser.add_argument(
+        "--phase2-break-t-target",
+        type=float,
+        default=0.12,
+        dest="phase2_break_t_target",
+        help="Reference T in α = base * clamp((T_ref−T)/T_ref, …).",
+    )
+    parser.add_argument(
+        "--phase2-enable-break-rejection",
+        action="store_true",
+        dest="phase2_enable_break_rejection",
+    )
+    parser.add_argument(
+        "--phase2-disable-residual-mixing",
+        action="store_true",
+        dest="phase2_disable_residual_mixing",
+        help="Use Phase-1 linear mix only (no state + gate * mixed).",
+    )
+    parser.add_argument(
+        "--phase2-mixing-gate-init",
+        type=float,
+        default=0.1,
+        dest="phase2_mixing_gate_init",
+        help="Initial sigmoid(gate_raw) for residual mixing.",
+    )
+    parser.add_argument(
+        "--phase2-interaction-reg-weight",
+        type=float,
+        default=0.0,
+        dest="phase2_interaction_reg_weight",
+        help="||C−I||² weight (requires --phase1-enable-window-interaction).",
+    )
+    parser.add_argument(
+        "--phase2-interaction-decay-tau",
+        type=float,
+        default=None,
+        dest="phase2_interaction_decay_tau",
+        metavar="TAU",
+        help="If set, multiply C elementwise by exp(−|i−j|/τ).",
+    )
+    parser.add_argument(
+        "--phase2-enable-head-tension-weighting",
+        action="store_true",
+        dest="phase2_enable_head_tension_weighting",
+        help="Head-level softmax(−T_slice) weights on drift heads (not token attention).",
+    )
+    parser.add_argument(
+        "--phase2-store-break-memory",
+        action="store_true",
+        dest="phase2_store_break_memory",
+        help="Keep last pre/post break window states on the model.",
+    )
 
     args = parser.parse_args()
 
@@ -1730,10 +2720,16 @@ def main() -> None:
     print(f"Vocab size: {vocab_size}  tokenizer={args.tokenizer}", flush=True)
 
     # ---- Build model ----
+    _p05 = phase05_config_from_args(args)
+    _p1 = phase1_config_from_args(args)
+    _p2 = phase2_config_from_args(args)
     model = TorchAttractorLanguageModel(
         vocab_size,
         train_window_size=window_size,
         max_window_steps=args.num_dynamics_steps,
+        phase05=_p05,
+        phase1=_p1,
+        phase2=_p2,
     )
     model.tokenizer = tok
 
@@ -2032,6 +3028,20 @@ def main() -> None:
     last_epoch_sec = 0.0
     last_epoch_num = 0
 
+    phase05_csv_fp = None
+    phase05_csv_writer = None
+    if (
+        model.phase05_config.batch_metrics_csv is not None
+        and args.loss_mode == "trajectory"
+    ):
+        pcsv = Path(model.phase05_config.batch_metrics_csv)
+        pcsv.parent.mkdir(parents=True, exist_ok=True)
+        new_p05 = not pcsv.exists() or pcsv.stat().st_size == 0
+        phase05_csv_fp = pcsv.open("a", newline="", encoding="utf-8")
+        phase05_csv_writer = csv.writer(phase05_csv_fp)
+        if new_p05:
+            phase05_csv_writer.writerow(PHASE05_BATCH_CSV_HEADER)
+
     for epoch in range(start_epoch, start_epoch + num_epochs):
         t_ep0 = time.perf_counter()
         loss_sum = 0.0
@@ -2152,6 +3162,16 @@ def main() -> None:
                 loss.backward()
                 optimizer.step()
                 global_step += 1
+
+                if phase05_csv_writer is not None:
+                    _bce_log = _bce if math.isfinite(_bce) else float("nan")
+                    phase05_csv_writer.writerow(
+                        model.phase05_batch_csv_values(
+                            epoch, batch_idx, global_step, _bce_log
+                        )
+                    )
+                    if (batch_idx + 1) % 32 == 0 and phase05_csv_fp is not None:
+                        phase05_csv_fp.flush()
 
                 # Phase 7: TSCore substrate coupling + idle tracking (Bugs 5/6).
                 if substrate is not None:
@@ -2368,6 +3388,13 @@ def main() -> None:
         last_n_windows = n_windows
         last_epoch_sec = ep_sec
         last_epoch_num = epoch + 1
+
+    if phase05_csv_fp is not None:
+        try:
+            phase05_csv_fp.flush()
+            phase05_csv_fp.close()
+        except OSError:
+            pass
 
     # Clean up temp files (line-based train list, synthetic corpus fallback)
     if _tmp_train_path is not None:
