@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import NoReturn, Optional
 
 import torch
 import torch.nn as nn
@@ -84,11 +84,13 @@ class VectorizedWindowDynamics(nn.Module):
         max_steps: int = 16,
         dt: float = 0.09,
         coupling: float = 0.01,
+        use_lorentz: bool = False,
     ) -> None:
         super().__init__()
         self.state_dim = state_dim
         self.window_size = window_size
         self.max_steps = max_steps
+        self.use_lorentz = use_lorentz
 
         # Multi-head low-rank dynamics; state shape for each row is (D,)
         # We reshape (B, W, D) → (B*W, D) for the batched head pass.
@@ -99,6 +101,19 @@ class VectorizedWindowDynamics(nn.Module):
             dt=dt,
             coupling=coupling,
         )
+
+    def minkowski_inner(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        return x[..., 0] * y[..., 0] - (x[..., 1:] * y[..., 1:]).sum(dim=-1)
+
+    def project_tangent(self, x: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        inner = self.minkowski_inner(x, v)
+        return v + inner.unsqueeze(-1) * x
+
+    def project(self, x: torch.Tensor) -> torch.Tensor:
+        norm = self.minkowski_inner(x, x)
+        x = x / torch.sqrt(torch.abs(norm).unsqueeze(-1) + 1e-8)
+        x[..., 0] = torch.abs(x[..., 0])
+        return x
 
     def _step(self, S: torch.Tensor, signal: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
@@ -111,7 +126,16 @@ class VectorizedWindowDynamics(nn.Module):
             sig = torch.zeros_like(flat)
         else:
             sig = signal.reshape(B * W, D)
-        out = flat + self.mhd.dt * self.mhd.drift(flat, sig)
+        if self.use_lorentz:
+            v_raw = self.mhd.drift(flat, sig)
+            v = self.project_tangent(flat, v_raw)
+            radius = torch.acosh(flat[..., 0].clamp(min=1 + 1e-6))
+            scale = 1.0 / (1.0 + radius)
+            v = v * scale.unsqueeze(-1)
+            out = flat + self.mhd.dt * v
+            out = self.project(out)
+        else:
+            out = flat + self.mhd.dt * self.mhd.drift(flat, sig)
         out = _clamp_norm(out, 1e-3, 12.0)
         return out.reshape(B, W, D)
 
@@ -123,64 +147,16 @@ class VectorizedWindowDynamics(nn.Module):
         """
         return self._step(S, signal)
 
-    def forward(
-        self,
-        S: torch.Tensor,
-        tol: Optional[torch.Tensor] = None,
-        thigh: Optional[torch.Tensor] = None,
-        signal: Optional[torch.Tensor] = None,
-        record_tension_log: bool = True,
-    ) -> tuple[torch.Tensor, list[float]]:
+    def forward(self, *args: object, **kwargs: object) -> NoReturn:
         """
-        Tension-adaptive evolution of (B, W, D) or (W, D).
-
-        Returns
-        -------
-        S_out : (B, W, D) or (W, D) matching input
-        tension_curve : list[float] — mean batch tension after each step
+        Disabled: adaptive window loops live in ``TorchAttractorLanguageModel.run_window_dynamics``.
+        Use ``.step(S, signal)`` with ``S`` of shape ``(B, W, D)``, or call ``model.run_window_dynamics``.
         """
-        single = S.dim() == 2
-        if single:
-            S = S.unsqueeze(0)
-        B, W, D = S.shape
-
-        _tol = tol if tol is not None else torch.tensor(0.05, device=S.device, dtype=S.dtype)
-        _thigh = thigh if thigh is not None else torch.tensor(0.18, device=S.device, dtype=S.dtype)
-
-        tension_curve_tensors: list[torch.Tensor] = []
-        zero_long = torch.zeros((), device=S.device, dtype=torch.long)
-        consecutive_low_t_steps_t = zero_long.clone()
-
-        for _ in range(self.max_steps):
-            S = self._step(S, signal)
-            T = _window_tension(S)
-            t_mean = T.mean()
-            if record_tension_log:
-                tension_curve_tensors.append(t_mean.detach())
-            is_low = t_mean < 0.08
-            consecutive_low_t_steps_t = torch.where(
-                is_low,
-                consecutive_low_t_steps_t + 1,
-                torch.zeros((), device=S.device, dtype=torch.long),
-            )
-            need_jitter = is_low & (consecutive_low_t_steps_t >= 4)
-            # Extra stochastic break for stuck low-tension attractors (GOAT DORMANT→ACTIVE jitter)
-            if bool(need_jitter.item()):
-                noise = torch.randn_like(S) * 0.015
-                S = S + noise
-                # GOAT transition: use TorchAttractorLanguageModel.run_window_dynamics when training (.step path)
-                consecutive_low_t_steps_t = zero_long.clone()
-            if (T < _tol).all():
-                break
-            if (T > _thigh).any():
-                noise = 0.01 * torch.randn_like(S)
-                S = S + noise
-                S = S / (torch.linalg.vector_norm(S, dim=-1, keepdim=True) + 1e-8)
-
-        tension_curve = [float(x) for x in tension_curve_tensors]
-        if single:
-            S = S.squeeze(0)
-        return S, tension_curve
+        raise NotImplementedError(
+            "VectorizedWindowDynamics.forward is disabled. Use "
+            "TorchAttractorLanguageModel.run_window_dynamics (unified tension + jitter) "
+            "or call .step(S, signal) with S shaped (B, W, D)."
+        )
 
 
 # --------------------------------------------------------------------------
@@ -195,49 +171,19 @@ def run_window_dynamics_vectorized(
     record_tension_log: bool = True,
 ) -> tuple[torch.Tensor, list[dict] | None]:
     """
-    Drop-in for model.run_window_dynamics(S, collect_metrics, record_tension_log).
-
-    Runs VectorizedWindowDynamics instead of the Python for-loop. Writes to
-    model._last_window_tension_curve and model._last_adaptive_window_steps for
-    compatibility with calling code.
+    Redirect to ``model.run_window_dynamics`` with ``model.dynamics`` temporarily set to
+    ``vec_dyn`` so only ``.step`` is used (no ``VectorizedWindowDynamics.forward``).
     """
-    tol = model.window_tension_tol.to(device=S.device, dtype=S.dtype)
-    thigh = model.window_tension_high.to(device=S.device, dtype=S.dtype)
-
-    S_out, curve = vec_dyn(
-        S,
-        tol=tol,
-        thigh=thigh,
-        record_tension_log=record_tension_log,
-    )
-
-    if record_tension_log:
-        model._last_window_tension_curve = curve
-    model._last_adaptive_window_steps = len(curve)
-    if curve:
-        model._last_window_tension_mean = torch.tensor(curve[-1], device=S.device, dtype=S.dtype)
-
-    step_logs: list[dict] | None = None
-    if collect_metrics and len(curve) > 0:
-        step_logs = [{"tension": t} for t in curve]
-
-    return S_out, step_logs
-
-
-# --------------------------------------------------------------------------
-# Tension helper (mirrors sandbox.py compute_window_tension without the model)
-# --------------------------------------------------------------------------
-
-def _window_tension(S: torch.Tensor) -> torch.Tensor:
-    """
-    Geometry-only tension for (B, W, D): energy drift proxy via pairwise cosine variance.
-    Returns shape (B,).
-    """
-    B, W, D = S.shape
-    normed = F.normalize(S, dim=-1)
-    mean_dir = normed.mean(dim=1)
-    cos = (normed * mean_dir.unsqueeze(1)).sum(dim=-1)
-    return 1.0 - cos.mean(dim=-1)
+    saved = model.dynamics
+    model.dynamics = vec_dyn
+    try:
+        return model.run_window_dynamics(
+            S,
+            collect_metrics=collect_metrics,
+            record_tension_log=record_tension_log,
+        )
+    finally:
+        model.dynamics = saved
 
 
 # --------------------------------------------------------------------------
@@ -253,12 +199,13 @@ def get_compiled(
     rank: int = 64,
     max_steps: int = 16,
     dt: float = 0.09,
+    use_lorentz: bool = False,
 ) -> VectorizedWindowDynamics:
     """
     Return a torch.compile'd VectorizedWindowDynamics (cached by key).
     Falls back to uncompiled if torch.compile is unavailable (PyTorch < 2.0).
     """
-    key = f"{state_dim}_{window_size}_{num_heads}_{rank}_{max_steps}_{dt}"
+    key = f"{state_dim}_{window_size}_{num_heads}_{rank}_{max_steps}_{dt}_{int(use_lorentz)}"
     if key not in _COMPILED:
         mod = VectorizedWindowDynamics(
             state_dim=state_dim,
@@ -267,9 +214,10 @@ def get_compiled(
             rank=rank,
             max_steps=max_steps,
             dt=dt,
+            use_lorentz=use_lorentz,
         )
         try:
-            mod = torch.compile(mod)  # type: ignore[assignment]
+            mod._step = torch.compile(mod._step, mode="reduce-overhead")  # type: ignore[assignment]
         except Exception:
             pass
         _COMPILED[key] = mod  # type: ignore[assignment]
@@ -290,51 +238,63 @@ if __name__ == "__main__":
     STATE_DIM = 128
     WINDOW_SIZE = 4
 
-    # --- test 1: VectorizedWindowDynamics output is finite -----------------
+    # --- test 1: run_window_dynamics + VectorizedWindowDynamics.step is finite ---
     torch.manual_seed(0)
     vec_dyn = VectorizedWindowDynamics(state_dim=STATE_DIM, window_size=WINDOW_SIZE, num_heads=4, rank=16, max_steps=8)
-    S = torch.randn(2, WINDOW_SIZE, STATE_DIM)
-    with torch.no_grad():
-        S_out, curve = vec_dyn(S)
-    assert torch.isfinite(S_out).all(), "VectorizedWindowDynamics output has non-finite values"
-    assert len(curve) > 0, "tension curve is empty"
-    print(f"  test 1 PASS — S_out finite, tension_curve len={len(curve)}, final_T={curve[-1]:.4f}", flush=True)
-
-    # --- test 2: gradient flows through vectorized step --------------------
-    vec_dyn.train()
-    S_train = torch.randn(2, WINDOW_SIZE, STATE_DIM, requires_grad=False)
-    S_out2, _ = vec_dyn(S_train, record_tension_log=False)
-    loss = S_out2.pow(2).mean()
-    loss.backward()
-    grad = vec_dyn.mhd.U.grad
-    assert grad is not None and grad.abs().sum() > 0, "No gradient through VectorizedWindowDynamics"
-    print(f"  test 2 PASS — gradient flows (mhd.U grad norm={grad.norm():.4f})", flush=True)
-
-    # --- test 3: parity check vs sandbox.py run_window_dynamics ------------
-    # Both start from the same random S; we check that both produce finite results
-    # (exact numerical match is not expected: different dynamics equations).
     model = sb.TorchAttractorLanguageModel(sb.FULL_VOCAB, state_dim=STATE_DIM, train_window_size=WINDOW_SIZE, max_window_steps=8)
     model.eval()
+    saved = model.dynamics
+    model.dynamics = vec_dyn
+    S = torch.randn(2, WINDOW_SIZE, STATE_DIM)
+    with torch.no_grad():
+        S_out, _logs = model.run_window_dynamics(S.clone(), record_tension_log=True)
+    model.dynamics = saved
+    assert torch.isfinite(S_out).all(), "run_window_dynamics + vec_dyn output has non-finite values"
+    assert len(model._last_window_tension_curve) > 0, "tension curve is empty"
+    print(
+        f"  test 1 PASS — S_out finite, tension_curve len={len(model._last_window_tension_curve)}",
+        flush=True,
+    )
 
+    # --- test 2: gradient flows through vectorized dynamics via run_window_dynamics
+    vec_dyn2 = VectorizedWindowDynamics(state_dim=STATE_DIM, window_size=WINDOW_SIZE, num_heads=4, rank=16, max_steps=8)
+    model2 = sb.TorchAttractorLanguageModel(sb.FULL_VOCAB, state_dim=STATE_DIM, train_window_size=WINDOW_SIZE, max_window_steps=8)
+    model2.train()
+    model2.dynamics = vec_dyn2
+    S_train = torch.randn(2, WINDOW_SIZE, STATE_DIM, requires_grad=True)
+    S_out2, _ = model2.run_window_dynamics(S_train, record_tension_log=False)
+    loss = S_out2.pow(2).mean()
+    loss.backward()
+    grad = vec_dyn2.mhd.U.grad
+    assert grad is not None and grad.abs().sum() > 0, "No gradient through vectorized dynamics"
+    print(f"  test 2 PASS — gradient flows (mhd.U grad norm={grad.norm():.4f})", flush=True)
+
+    # --- test 3: simple vs vectorized dynamics both finite (different fields) ---
+    model3 = sb.TorchAttractorLanguageModel(sb.FULL_VOCAB, state_dim=STATE_DIM, train_window_size=WINDOW_SIZE, max_window_steps=8)
+    model3.eval()
     S_base = torch.randn(1, WINDOW_SIZE, STATE_DIM)
     with torch.no_grad():
-        S_ref, _ = model.run_window_dynamics(S_base.clone())
-        S_vec, _ = vec_dyn(S_base.clone())
-
-    assert torch.isfinite(S_ref).all(), "sandbox baseline produced non-finite output"
+        S_simple, _ = model3.run_window_dynamics(S_base.clone())
+    vec_dyn3 = VectorizedWindowDynamics(state_dim=STATE_DIM, window_size=WINDOW_SIZE, num_heads=4, rank=16, max_steps=8)
+    model3.dynamics = vec_dyn3
+    with torch.no_grad():
+        S_vec, _ = model3.run_window_dynamics(S_base.clone())
+    assert torch.isfinite(S_simple).all(), "simple dynamics produced non-finite output"
     assert torch.isfinite(S_vec).all(), "vectorized dynamics produced non-finite output"
-    # Cosine similarity between final states — just report, no hard threshold
-    ref_flat = S_ref.reshape(-1)
+    ref_flat = S_simple.reshape(-1)
     vec_flat = S_vec.reshape(-1)
     cos = F.cosine_similarity(ref_flat.unsqueeze(0), vec_flat.unsqueeze(0)).item()
     l2 = (ref_flat - vec_flat).norm().item()
-    print(f"  test 3 PASS — both finite; cosine(ref,vec)={cos:.4f}  L2={l2:.4f}", flush=True)
+    print(f"  test 3 PASS — both finite; cosine(simple,vec)={cos:.4f}  L2={l2:.4f}", flush=True)
 
     # --- test 4: run_window_dynamics_vectorized drop-in -------------------
+    model4 = sb.TorchAttractorLanguageModel(sb.FULL_VOCAB, state_dim=STATE_DIM, train_window_size=WINDOW_SIZE, max_window_steps=8)
+    model4.eval()
+    vec_dyn4 = VectorizedWindowDynamics(state_dim=STATE_DIM, window_size=WINDOW_SIZE, num_heads=4, rank=16, max_steps=8)
     with torch.no_grad():
-        S_drop, logs = run_window_dynamics_vectorized(S_base.clone(), model, vec_dyn, collect_metrics=True)
+        S_drop, logs = run_window_dynamics_vectorized(S_base.clone(), model4, vec_dyn4, collect_metrics=True)
     assert torch.isfinite(S_drop).all(), "drop-in wrapper produced non-finite output"
-    assert hasattr(model, "_last_window_tension_curve"), "model._last_window_tension_curve not set"
-    print(f"  test 4 PASS — drop-in wrapper OK, tension_curve={model._last_window_tension_curve}", flush=True)
+    assert hasattr(model4, "_last_window_tension_curve"), "model._last_window_tension_curve not set"
+    print(f"  test 4 PASS — drop-in wrapper OK, tension_curve={model4._last_window_tension_curve}", flush=True)
 
     print("\n[wave-b] ALL PARITY TESTS PASSED", flush=True)

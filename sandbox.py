@@ -488,7 +488,7 @@ class TorchAttractorLanguageModel(nn.Module):
         logits = torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=-1e4)
         return logits
 
-    def compute_window_tension(self, state: torch.Tensor) -> torch.Tensor:
+    def compute_tension_window(self, state: torch.Tensor) -> torch.Tensor:
         """
         state: (B, W, D) normalized states
 
@@ -510,6 +510,10 @@ class TorchAttractorLanguageModel(nn.Module):
             entropy = -(probs * torch.log(probs + 1e-9)).sum(dim=-1)
             T = T + mu * entropy
         return T
+
+    def compute_window_tension(self, state: torch.Tensor) -> torch.Tensor:
+        """Legacy alias for :meth:`compute_tension_window`."""
+        return self.compute_tension_window(state)
 
     def _single_window_step(
         self,
@@ -590,7 +594,7 @@ class TorchAttractorLanguageModel(nn.Module):
             S = self._single_window_step(
                 S, context_ids=context_ids, context_tensor=context_tensor
             )
-            T = self.compute_window_tension(S)
+            T = self.compute_tension_window(S)
             t_mean = T.mean()
             self._last_window_tension_mean = t_mean.detach()
             self._last_adaptive_window_steps = step + 1
@@ -717,7 +721,7 @@ class TorchAttractorLanguageModel(nn.Module):
         S_pred, _ = self.run_window_dynamics(
             S_pred, collect_metrics=False, record_tension_log=True, context_ids=contexts
         )
-        self._last_traj_student_tension_mean = self.compute_window_tension(S_pred).mean().detach()
+        self._last_traj_student_tension_mean = self.compute_tension_window(S_pred).mean().detach()
         with torch.no_grad():
             S_tgt = torch.stack(
                 [
@@ -730,7 +734,7 @@ class TorchAttractorLanguageModel(nn.Module):
                 S_tgt, collect_metrics=False, record_tension_log=False
             )
         loss_traj = self.trajectory_contrastive_loss(S_pred, S_tgt)
-        T = self.compute_window_tension(S_pred).mean()
+        T = self.compute_tension_window(S_pred).mean()
         base_entropy_floor = torch.as_tensor(
             float(ENTROPY_FLOOR), device=S_pred.device, dtype=S_pred.dtype
         )
@@ -1679,6 +1683,12 @@ def main() -> None:
     # ---- Phase 9: dynamics ----
     parser.add_argument("--dynamics", choices=("simple", "vectorized"), default="simple",
         help="'simple': SimpleAttractorDynamics; 'vectorized': MultiHeadDynamics.")
+    parser.add_argument(
+        "--use-lorentz",
+        action="store_true",
+        dest="use_lorentz",
+        help="Vectorized dynamics only: Lorentz/hyperbolic step (tangent projection + curvature scaling).",
+    )
 
     args = parser.parse_args()
 
@@ -1761,15 +1771,26 @@ def main() -> None:
     if args.dynamics == "vectorized":
         try:
             from dynamics_vectorized import VectorizedWindowDynamics  # type: ignore[import]
-            model.dynamics = VectorizedWindowDynamics(model.state_dim).to(device)
+            model.dynamics = VectorizedWindowDynamics(
+                model.state_dim, use_lorentz=bool(args.use_lorentz)
+            ).to(device)
             print("[phase-9] VectorizedWindowDynamics active", flush=True)
         except Exception as _dyn_err:
             print(f"[phase-9] Warning: vectorized dynamics unavailable ({_dyn_err})", flush=True)
 
     if torch.cuda.is_available():
         try:
-            # Step 2: torch.compile for speed (Phase 1 scaling)
-            model.dynamics = torch.compile(model.dynamics, mode="reduce-overhead")
+            # Window path uses dynamics.step(B,W,D). VectorizedWindowDynamics.forward is
+            # disabled; compile _step only for vectorized. Simple path: compile module
+            # (forward used by evolve_token / token-level dynamics).
+            dyn = model.dynamics
+            if args.dynamics == "vectorized" and hasattr(dyn, "_step"):
+                try:
+                    dyn._step = torch.compile(dyn._step, mode="reduce-overhead")  # type: ignore[assignment]
+                except Exception as _ve:
+                    print(f"[step-2] Warning: vectorized _step compile skipped ({_ve})", flush=True)
+            else:
+                model.dynamics = torch.compile(model.dynamics, mode="reduce-overhead")
         except Exception as _comp_err:
             print(f"[step-2] Warning: torch.compile skipped ({_comp_err})", flush=True)
 

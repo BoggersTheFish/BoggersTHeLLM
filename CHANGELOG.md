@@ -7,6 +7,13 @@ The project is documented as **BoggersTheLanguageModel**; canonical source is [g
 
 ---
 
+## Dynamics — unified window loop, cache alignment, vectorized compile (Mar 2026)
+
+- **`sandbox.py`**: Single outer path **`run_window_dynamics`** for training and inference; window tension via **`compute_tension_window`** (alias **`compute_window_tension`**). With **`--dynamics vectorized`**, **`torch.compile`** targets **`dyn._step`** only.
+- **`dynamics_vectorized.py`**: **`VectorizedWindowDynamics.forward`** disabled; **`run_window_dynamics_vectorized`** swaps dynamics and delegates to **`model.run_window_dynamics`**.
+- **`state_cache.py`**: **`step()`** uses **`run_window_dynamics`** on **`(1, W, D)`** with row-normalized embeddings; **`logits()`** via **`readout`**; slow buffers **`.detach()`** before scalar reads to avoid autograd noise.
+- **`scripts/ts_workflow_smoke.py`**: Smoke test for cache + simple/vectorized window dynamics (run with **`.venv/bin/python scripts/ts_workflow_smoke.py`**).
+
 ## Data — Hugging Face corpora + training eval JSON (Mar 2026)
 
 - **`data/hf_remote_corpus.py`**: materialize TinyStories (`roneneldan/TinyStories`) or FineWeb-Edu (`HuggingFaceFW/fineweb-edu`, `sample-10BT`) into cached UTF-8 text; CLI `python data/hf_remote_corpus.py tinystories …`.

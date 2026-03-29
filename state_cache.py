@@ -1,20 +1,14 @@
 """
-Wave C — Rolling state cache for O(1)-per-token inference.
+Wave C — Rolling state cache for inference aligned with window dynamics.
 
-Replaces the re-embedding of the full W-token window every generation step with
-a rolling cache that maintains:
-  - fast_state : (D,) — most-recent evolved fast state
-  - slow_memory : (D,) — accumulated slow memory (decaying average)
-  - phrase_table : list[(ids: list[int], state: Tensor)] — sliding phrase memory
-
-On each new token:
-1. Update fast_state via one `step_state_batch` call on the new embedding.
-2. Update slow_memory with exponential decay: slow = (1 - slow_decay)*slow + slow_lr*fast.
-3. Append the new state to phrase_table and evict the oldest entry if len > window_size.
-4. Compute readout logits from the cached (fast, slow) without re-running dynamics.
-
-This keeps inference at O(1) per token while the full wave cycle continues in the
-background (long context = more phrase_table entries, not more per-step cost).
+Each ``step(token_id)`` builds the last-``W`` token ids (same padding as
+``TorchAttractorLanguageModel.window_ids_from_sequence``), embeds with
+``embedder`` + ``F.normalize`` per row (matches the prior single-token cache:
+no ``LayerNorm``), runs ``model.run_window_dynamics`` on ``S`` of shape
+``(1, W, D)`` so jitter / GOAT / high-tension behaviour matches training,
+then updates ``fast_state`` from the last window row and ``slow_memory`` with
+the same EMA as before. ``logits()`` still uses ``readout(combined)`` /
+``effective_temperature()`` (not ``readout_window``).
 
 Usage
 -----
@@ -22,9 +16,6 @@ Usage
 
     cache = AttractorStateCache(model)
     text = generate_with_cache(model, cache, prompt="the cat sat", max_tokens=30)
-
-The full wave-cycle dynamics still run during training via run_window_dynamics.
-The cache is inference-only and does not change any training code.
 """
 from __future__ import annotations
 
@@ -45,10 +36,10 @@ class AttractorStateCache:
 
     Attributes
     ----------
-    fast_state : Tensor (D,) — current fast attractor state.
+    fast_state : Tensor (D,) — last post-dynamics row of the rolling window (unit-norm).
     slow_memory : Tensor (D,) — slow decaying memory.
     phrase_table : list of (token_ids, state_snapshot) pairs — rolling window history.
-    token_history : flat list[int] of all generated token ids.
+    token_history : flat list[int] of all stepped token ids (including warmup).
     """
     model: "sb.TorchAttractorLanguageModel"
     fast_state: torch.Tensor = field(init=False)
@@ -75,39 +66,35 @@ class AttractorStateCache:
 
     def step(self, token_id: int) -> torch.Tensor:
         """
-        Evolve state with one new token (O(1)).
+        Evolve state with one new token via the same window pipeline as training
+        (``run_window_dynamics`` on ``(1, W, D)``), then EMA slow memory.
 
-        Returns the current fast_state after the update.
+        Returns the current ``fast_state`` ``(D,)`` after the update.
         """
         model = self.model
         device = self.fast_state.device
         dtype = self.fast_state.dtype
 
-        # 1. Embed the new token
+        seq = self.token_history + [token_id]
+        ids = model.window_ids_from_sequence(seq)
+
         with torch.no_grad():
-            emb = model.embedder(torch.tensor([token_id], device=device))[0]
-            emb = F.normalize(emb, dim=-1)
+            ids_t = torch.tensor(ids, device=device, dtype=torch.long)
+            emb = model.embedder(ids_t)
+            S = F.normalize(emb, dim=-1).unsqueeze(0)
+            S_out, _ = model.run_window_dynamics(
+                S,
+                collect_metrics=False,
+                record_tension_log=False,
+                context_ids=[ids],
+            )
+            if S_out.dim() == 2:
+                S_out = S_out.unsqueeze(0)
+            new_fast = S_out[0, -1, :].clone()
+            new_fast = F.normalize(new_fast, dim=-1)
 
-        # 2. Context-conditioned signal (fast + slow → direction)
-        slow_dec = float(model.slow_decay)
-        fast_n = torch.linalg.vector_norm(self.fast_state)
-        if fast_n > 1e-6:
-            ctx = self.fast_state / (fast_n + 1e-8)
-        else:
-            ctx = emb
-        gamma = float(model.gamma.detach())
-        signal = emb + gamma * ctx
-        n = torch.linalg.vector_norm(signal)
-        if n > 1e-12:
-            signal = signal / n
-
-        # 3. One dynamics step (reuse sandbox SimpleAttractorDynamics)
-        with torch.no_grad():
-            new_fast = model.dynamics(self.fast_state.unsqueeze(0), signal.unsqueeze(0)).squeeze(0)
-        new_fast = F.normalize(new_fast, dim=-1)
-
-        # 4. Slow memory update
-        slow_lr = float(model.slow_lr)
+        slow_lr = float(model.slow_lr.detach())
+        slow_dec = float(model.slow_decay.detach())
         new_slow = (1.0 - slow_dec) * self.slow_memory + slow_lr * new_fast
         slow_n = torch.linalg.vector_norm(new_slow)
         max_slow = 3.0
@@ -118,7 +105,6 @@ class AttractorStateCache:
         self.slow_memory = new_slow
         self.token_history.append(token_id)
 
-        # 5. Update phrase table (sliding window of model.train_window_size states)
         W = model.train_window_size
         self.phrase_table.append((token_id, new_fast.detach().clone()))
         if len(self.phrase_table) > W:
@@ -128,8 +114,8 @@ class AttractorStateCache:
 
     def logits(self) -> torch.Tensor:
         """
-        Compute readout logits from the current (fast, slow) state (O(1)).
-        Matches symplectic readout: combined = w_fast * fast + w_slow * slow (normalised).
+        Compute readout logits from the current (fast, slow) state.
+        Symplectic blend: combined = w_fast * fast + w_slow * slow (normalised).
         """
         model = self.model
         w_fast = float(model.w_fast)
@@ -153,7 +139,7 @@ class AttractorStateCache:
 
 
 # --------------------------------------------------------------------------
-# generate_with_cache — O(1)-per-token inference
+# generate_with_cache — rolling window inference
 # --------------------------------------------------------------------------
 
 def generate_with_cache(
@@ -168,7 +154,7 @@ def generate_with_cache(
     reset: bool = True,
 ) -> str:
     """
-    Generate text using the rolling state cache (O(1) per token).
+    Generate text using the rolling state cache.
 
     Parameters
     ----------
@@ -237,6 +223,7 @@ def generate_with_cache(
 if __name__ == "__main__":
     import sys
     from pathlib import Path
+
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import sandbox as sb  # type: ignore[import]
 

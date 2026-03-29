@@ -18,33 +18,35 @@ Corpus / Token stream
 │  embed_window(W ids) → (W, D) embedding matrix          │
 │         │                                               │
 │         ▼                                               │
-│  run_window_dynamics()  ← tension-adaptive Euler loop   │
+│  run_window_dynamics()  ← outer loop (max_window_steps) │
 │    ┌─ positional coupling + dynamics.step(S, signal)    │
 │    │     (SimpleAttractorDynamics or VectorizedWindow)  │
 │    ├─ optional GOAT activation_bonus → per-position signal│
-│    ├─ compute_window_tension  (geometry or entropy)     │
-│    └─ early-exit / noise / break on tension threshold   │
+│    ├─ compute_tension_window (geometry ± entropy)       │
+│    │     (alias: compute_window_tension)                │
+│    └─ masked jitter / GOAT transition / high-T renorm   │
 │         │                                               │
-│  readout_window() → logits → sample_next_token_id()     │
+│  readout_window() → logits (training / trajectory)      │
 └─────────────────────────────────────────────────────────┘
         │
         ▼
 ┌──────────────────────┐   ┌───────────────────────────┐
 │  AttractorStateCache │   │  LLMSubstrateNode          │
 │  (state_cache.py)    │   │  (llm_substrate_node.py)   │
-│  O(1) per token      │   │  TS-Core graph integration │
-│  fast + slow memory  │   │  Propagate → Evolve hook   │
+│  same run_window_    │   │  TS-Core graph integration │
+│  dynamics per step   │   │  Propagate → Evolve hook   │
+│  readout(fast/slow)  │   │                            │
 └──────────────────────┘   └───────────────────────────┘
 ```
 
 **No attention. No transformer blocks. No external model weights.**
 
 The network contains only:
-- A learnable diffusion matrix `A` (negative-definite, stable dynamics)
-- A `tanh`-bounded nonlinearity with damping
-- Fast memory (per-token evolved state) + slow memory (exponential average)
-- A linear readout from the symplectic midpoint of fast-start / fast-end states
-- A scalar tension `T ≈ |ΔE| + λ(1 − cos(fast, slow)) + μH(logits)` that controls step count, noise, and break events
+- A learnable diffusion matrix `A` (negative-definite, stable dynamics) in the **simple** path, or **low-rank multi-head** diffusion in **`--dynamics vectorized`**
+- A `tanh`-bounded (simple window step) or **cubic** (vectorized) nonlinearity with damping
+- **Window path:** state `S` is `(B, W, D)`; **token path** (`evolve_token`): fast/slow `(D,)` with symplectic blend for `readout`
+- **`readout_window`:** linear map `W·D → vocab` (training default); **`readout`:** `D → vocab` (cache / `next_token_logits`)
+- **Two tension scalars:** `compute_tension_window(S)` after each window step (geometry + optional entropy); `compute_tension(fast, slow, logits, …)` inside `evolve_token` (energy drift + alignment + entropy)
 
 ---
 
@@ -55,8 +57,9 @@ The network contains only:
 | `sandbox.py` | Phase 0 | **BoggersTheLanguageModel** core: training, generation, all dynamics |
 | `smoke_test.py` | Phase 0 | 5-assertion integration test (dynamics + TSCore wave cycle) |
 | `wave_a_tokenizer.py` | A | tiktoken BPE helpers; training uses `sandbox._build_tokenizer()` |
-| `dynamics_vectorized.py` | B | Vectorized `MultiHeadDynamics` window step; `torch.compile` wrapper |
-| `state_cache.py` | C | Rolling attractor state cache — O(1) per token at inference |
+| `dynamics_vectorized.py` | B | `VectorizedWindowDynamics`: `step(S, signal)` only; `forward` disabled; `run_window_dynamics_vectorized` → `model.run_window_dynamics` |
+| `state_cache.py` | C | Rolling cache: `run_window_dynamics` on `(1,W,D)` aligned with training; `logits()` via `readout` + fast/slow |
+| `scripts/ts_workflow_smoke.py` | — | Smoke: `AttractorStateCache` + simple/vectorized `run_window_dynamics` (`.venv/bin/python scripts/ts_workflow_smoke.py`) |
 | `data_pipeline.py` | D | Streaming sharded DataLoader (txt / JSONL, multi-worker) |
 | `data/generate_corpus.py` | — | Deterministic synthetic `.txt` corpus (tiktoken-sized); CLI + `sandbox` fallback |
 | `data/hf_remote_corpus.py` | — | TinyStories / FineWeb-Edu → cached `.txt` for training (`--dataset-source`) |
@@ -328,24 +331,26 @@ model.tokenizer = tok
 
 ### Wave B — Vectorized dynamics
 
-`dynamics_vectorized.py` provides `VectorizedWindowDynamics`, swappable with **`--dynamics vectorized`** (replaces `model.dynamics` after construction).
+`dynamics_vectorized.py` provides **`VectorizedWindowDynamics`**, swappable with **`--dynamics vectorized`** (replaces `model.dynamics` after construction).
 
-Both **`SimpleAttractorDynamics`** and **`VectorizedWindowDynamics`** implement the same **`step(S, signal) → S`** interface used inside `_single_window_step` (positional coupling first, then one dynamics step with the optional GOAT signal tensor).
+Both **`SimpleAttractorDynamics`** and **`VectorizedWindowDynamics`** implement the same **`step(S, signal) → S`** interface used inside **`run_window_dynamics`** (positional coupling first, then one dynamics step with the optional GOAT signal tensor).
 
-- Wraps `MultiHeadDynamics` from `vendor/ts-llm` (low-rank diffusion per head + cross-head coupling)
-- `run_window_dynamics_vectorized(S, model, vec_dyn)` remains available for alternate call sites
-- `torch.compile` wrapper via `get_compiled()` (cached by shape key)
-- Parity tests: both paths produce finite outputs; equations differ by design
+- Wraps **`MultiHeadDynamics`** from `vendor/ts-llm` (low-rank diffusion per head + cross-head coupling); window step uses **cubic** nonlinearity (simple path uses **`tanh`**).
+- **`forward` on `VectorizedWindowDynamics` is disabled** (`NotImplementedError`); use **`model.run_window_dynamics`** or **`run_window_dynamics_vectorized`**, which temporarily swaps dynamics and calls **`model.run_window_dynamics`**.
+- **`torch.compile`:** with **`--dynamics vectorized`**, only **`dyn._step`** is compiled (full-module compile is unreliable here).
+- **`get_compiled()`** caches compiled `_step` by shape key for smoke / benchmarks.
+- Parity tests: both paths produce finite outputs; equations differ by design.
 
 ### Wave C — State cache
 
-`state_cache.py` provides O(1)-per-token inference:
+`state_cache.py` provides **rolling-window** inference aligned with training:
 
-- `AttractorStateCache` holds `fast_state (D,)` + `slow_memory (D,)` + rolling `phrase_table`
-- `step(token_id)` — one dynamics step + slow memory update + phrase table eviction; no full-window re-embedding
-- `logits()` — symplectic readout from cached state; no window rebuild
-- `warmup(prompt_ids)` — seed cache from prompt before generation
-- `generate_with_cache(model, cache, prompt, ...)` — drop-in for `model.generate()`
+- `AttractorStateCache` holds **`fast_state (D,)`** + **`slow_memory (D,)`** + rolling **`phrase_table`**
+- **`step(token_id)`** — builds the last-**W** token ids, **`F.normalize`**-embeds each row, runs **`model.run_window_dynamics(S, context_ids=[ids], …)`** with **`S`** **`(1, W, D)`**, then updates fast/slow from the final row and phrase table
+- **`logits()`** — **`readout(combined)`** on the symplectic blend of fast/slow (same head as **`next_token_logits`**)
+- **`warmup(prompt_ids)`** — seed cache from prompt before generation
+- **`generate_with_cache(model, cache, prompt, ...)`** — drop-in for **`model.generate()`**
+- Smoke: **`python3 state_cache.py`**; training-aligned check: **`.venv/bin/python scripts/ts_workflow_smoke.py`**
 
 ```python
 from state_cache import AttractorStateCache, generate_with_cache
@@ -463,9 +468,9 @@ model.tokenizer = tok
 
 # Training path
 wids = model.window_ids_from_sequence(token_ids)
-S = model.embed_window(wids)
+S = model.embed_window(wids)  # (W, D); batched training uses (B, W, D)
 S, logs = model.run_window_dynamics(S, context_ids=wids)  # GOAT uses token ids if enabled
-logits = model.readout_window(S.reshape(1, -1))
+train_logits = model.readout_window(S.reshape(1, -1))  # primary training readout
 
 # Batched trajectory contrastive loss
 loss, logits = model.trajectory_contrastive_loss_and_logits(contexts, targets)
@@ -501,7 +506,7 @@ The single-state **`readout`** head is what inference and `AttractorStateCache` 
 
 ## Tension semantics
 
-Tension `T` is a scalar computed after each dynamics step:
+**Per-token path** (`evolve_token`): after each inner step, `compute_tension` returns:
 
 ```
 T = |ΔE_state| + λ · (1 − cos(fast, slow)) + μ · H(readout_logits)
@@ -512,11 +517,7 @@ T = |ΔE_state| + λ · (1 − cos(fast, slow)) + μ · H(readout_logits)
 | T > high | Inject noise — push out of shallow attractor |
 | T > break_thresh | Break perturbation — reset trajectory |
 
-Window-level tension uses geometry only by default (`WINDOW_TENSION_USE_ENTROPY = False`):
-
-```
-T_window = 1 − mean_cos(token_states, mean_direction)
-```
+**Window path** (`run_window_dynamics`): after each outer iteration, **`compute_tension_window`** (alias **`compute_window_tension`**) uses neighbor energy drift + misalignment + optional readout entropy (see `WINDOW_TENSION_USE_ENTROPY` in `sandbox.py`). The outer loop always runs up to **`max_window_steps`**; tension drives **masked jitter**, **GOAT transitions**, and **high-T row renorm**, not early exit of the whole window.
 
 ---
 
@@ -545,7 +546,7 @@ Data & tokenizer:
 Training:
   --window-size INT          Context window W (default: 6)
   --num-dynamics-steps INT   Max tension-adaptive steps per window (default: 16)
-  --trajectory-batch-size INT  Batch size for trajectory mode (default: 16, need ≥2)
+  --trajectory-batch-size INT  Batch size for trajectory mode (default: 64, need ≥2)
   --loss-mode {trajectory,ce}
   --token-aux-ce FLOAT       Aux CE on readout_window in trajectory mode (default: 0.2)
   --readout-aux-alpha FLOAT  Aux CE on single-state readout (default: 0.15; 0 = off)
@@ -563,6 +564,7 @@ Device & checkpointing:
 Integrations:
   --use-substrate            TSCore LLMSubstrateNode after each batch
   --use-goat-memory          GoatMemoryManager + window-path signal injection
+  --use-lorentz              Lorentzian positional coupling in window dynamics (default: off)
   --dynamics {simple,vectorized}
 
 Logging:

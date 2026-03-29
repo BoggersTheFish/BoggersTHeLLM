@@ -43,7 +43,7 @@ For runs on a **public or large text corpus** (Hugging Face TinyStories / FineWe
 | **mean_final_T** | Mean window tension at the **last** adaptive dynamics step each epoch—track drift via `--epoch-metrics-csv`. |
 | **tscore_evolves** / **tscore_last_tension** | With `--use-substrate`: per-epoch evolve delta and last TSCore tension. |
 
-Architecture changes will change absolute numbers—re-record baseline after major `sandbox.py` updates.
+Architecture changes will change absolute numbers—re-record baseline after major `sandbox.py` updates. Window dynamics and **`AttractorStateCache`** both go through **`run_window_dynamics`**; **`mean_final_T`** in CSV reflects **`compute_tension_window`** at the last outer step each window.
 
 ## v1 scale-up success check (agreed criteria)
 
