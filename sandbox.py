@@ -1408,7 +1408,7 @@ def _aux_ce_loss_batch(
 
 
 WINDOW_SIZE = 6
-NUM_EPOCHS = 25
+NUM_EPOCHS = 3
 ENTROPY_WEIGHT = 0.03  # subtracted from CE; keep small vs CE scale or the objective chases flat distributions
 CORPUS_EPOCH_COPIES = 2  # duplicate sentence list per epoch for more windows
 
@@ -1735,6 +1735,13 @@ def main() -> None:
             print("[phase-9] VectorizedWindowDynamics active", flush=True)
         except Exception as _dyn_err:
             print(f"[phase-9] Warning: vectorized dynamics unavailable ({_dyn_err})", flush=True)
+
+    if torch.cuda.is_available():
+        try:
+            # Step 2: torch.compile for speed (Phase 1 scaling)
+            model.dynamics = torch.compile(model.dynamics, mode="reduce-overhead")
+        except Exception as _comp_err:
+            print(f"[step-2] Warning: torch.compile skipped ({_comp_err})", flush=True)
 
     # ---- Phase 7: TSCore substrate ----
     substrate = None

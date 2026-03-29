@@ -89,6 +89,24 @@ def compute_mean_tension(
     return float(sum(tensions) / len(tensions)) if tensions else float("nan")
 
 
+def calculate_distinct_ngrams(text: str, n: int = 4) -> float:
+    """Distinct n-grams per token (whitespace tokens); 0 if too short."""
+    toks = text.split()
+    if len(toks) < n:
+        return 0.0
+    ngrams = [tuple(toks[i : i + n]) for i in range(len(toks) - n + 1)]
+    return len(set(ngrams)) / max(1, len(toks))
+
+
+def calculate_bigram_repetition_rate(text: str) -> float:
+    """1 - distinct_bigrams/total_bigrams over whitespace tokens."""
+    toks = text.split()
+    if len(toks) < 2:
+        return 0.0
+    pairs = [tuple(toks[i : i + 2]) for i in range(len(toks) - 1)]
+    return 1.0 - len(set(pairs)) / len(pairs)
+
+
 def compute_traj_contrast(
     model: "sb.TorchAttractorLanguageModel",
     dataset: list,
@@ -286,17 +304,38 @@ def main() -> None:
     post_traj = compute_traj_contrast(model, val_dataset, batch_size=args.batch_size)
     print(f"  post val_PPL={post_ppl:.2f}  mean_tension={post_tension:.4f}  traj_contrast={post_traj:.4f}")
 
+    generated_text = ""
+    try:
+        if model.tokenizer is not None:
+            generated_text = model.generate("the ", max_tokens=64)
+    except Exception:
+        generated_text = ""
+    # Step 2 diversity metrics
+    distinct_4grams_per_token = calculate_distinct_ngrams(generated_text, n=4)
+    bigram_repetition_rate = calculate_bigram_repetition_rate(generated_text)
+    _tsm = getattr(model, "_last_traj_student_tension_mean", None)
+    if _tsm is not None:
+        average_tension = float(_tsm.mean().item()) if _tsm.dim() > 0 else float(_tsm.item())
+    else:
+        average_tension = 0.0
+
     results = {
         "base": {
             "val_ppl": base_ppl,
             "mean_tension": base_tension,
             "traj_contrast": base_traj,
+            "distinct_4grams_per_token": distinct_4grams_per_token,
+            "bigram_repetition_rate": bigram_repetition_rate,
+            "average_tension": average_tension,
         },
         "wave_cycle": wave_result,
         "post": {
             "val_ppl": post_ppl,
             "mean_tension": post_tension,
             "traj_contrast": post_traj,
+            "distinct_4grams_per_token": distinct_4grams_per_token,
+            "bigram_repetition_rate": bigram_repetition_rate,
+            "average_tension": average_tension,
         },
         "config": {
             "corpus": str(corpus_path),
