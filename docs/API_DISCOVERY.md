@@ -13,10 +13,10 @@ Last verified: March 2026.
 | `Phase05Config` (`phase05_config.py`) | Instrumentation: log metrics, batch CSV path, adaptive window dt, neg-def diffusion, tension weights, trajectory negatives. |
 | `Phase1Config` (`phase1_config.py`) | Multi-head drift (`num_heads`, `head_dim_mode`), window interaction `C`, head diversity weight, per-head tension logging. |
 | `Phase2Config` (`phase2_config.py`) | Directional breaks, residual mixing gate, `C` regularisation / distance decay, head tension weighting, break memory. |
-| `TorchAttractorLanguageModel(vocab_size, …, phase05=, phase1=, phase2=)` | Core model; defaults construct `Phase05Config` / `Phase1Config` / `Phase2Config` if omitted. Set `model.tokenizer` for encode/decode. |
-| `run_window_dynamics(..., context_ids=…)` | Window loop; GOAT bonuses use `context_ids` when `--use-goat-memory` is enabled; Phase 2 directional breaks when enabled. |
-| `model.dynamics.step(S, signal)` | Unified step API on **`SimpleAttractorDynamics`** or **`VectorizedWindowDynamics`** (`--dynamics vectorized`). |
-| `phase05_batch_csv_values()` / `PHASE05_BATCH_CSV_HEADER` | Flat row + column names for `--phase05-batch-metrics-csv` (Phase 0.5 + 1 + 2 columns). |
+| `TorchAttractorLanguageModel(vocab_size, …, phase05=, phase1=, phase2=, convergence_epsilon=, min_attractor_steps=)` | Core model; defaults construct `Phase05Config` / `Phase1Config` / `Phase2Config` if omitted. Optional window early-exit knobs mirror CLI (`convergence_epsilon=0` runs all outer steps). Set `model.tokenizer` for encode/decode. |
+| `run_window_dynamics(..., context_ids=…, convergence_epsilon=, min_attractor_steps=)` | Outer time loop only; caches static coupling / `C` / GOAT tensors once per call. Optional early exit after `min_attractor_steps` when state delta or `|ΔT_mean|` &lt; epsilon (if epsilon &gt; 0). GOAT and Phase 2 breaks unchanged conceptually. |
+| `model.dynamics.step(S, signal)` | Unified step API on **`SimpleAttractorDynamics`** or **`VectorizedWindowDynamics`** (CLI default **`--dynamics vectorized`**). |
+| `phase05_batch_csv_values()` / `PHASE05_BATCH_CSV_HEADER` | Flat row + column names for `--phase05-batch-metrics-csv` (Phase 0.5 + 1 + 2 + optional attractor diagnostics: steps used, final tension, break count, convergence flag). |
 | `AttractorDataPipeline` (`data_pipeline.py`) | Streaming train batches when import succeeds; else legacy in-memory shuffle. |
 
 ---

@@ -169,6 +169,7 @@ def run_window_dynamics_vectorized(
     vec_dyn: VectorizedWindowDynamics,
     collect_metrics: bool = False,
     record_tension_log: bool = True,
+    **kwargs: object,
 ) -> tuple[torch.Tensor, list[dict] | None]:
     """
     Redirect to ``model.run_window_dynamics`` with ``model.dynamics`` temporarily set to
@@ -181,6 +182,7 @@ def run_window_dynamics_vectorized(
             S,
             collect_metrics=collect_metrics,
             record_tension_log=record_tension_log,
+            **kwargs,  # type: ignore[arg-type]
         )
     finally:
         model.dynamics = saved

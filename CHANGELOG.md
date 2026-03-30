@@ -7,6 +7,13 @@ The project is documented as **BoggersTheLanguageModel**; canonical source is [g
 
 ---
 
+## Engineering — window dynamics performance (Mar 2026)
+
+- **`sandbox.py`**: **`run_window_dynamics`** caches static per-window tensors (positional coupling weights, Phase‑1 **`C * mask`**, GOAT bonus vector) outside the outer step loop; optional **early convergence** via **`convergence_epsilon`** / **`min_attractor_steps`** (CLI **`--convergence-epsilon`**, **`--min-attractor-steps`**; default epsilon **`0`** preserves full **`max_window_steps`**). **`--dynamics`** default is **`vectorized`**; **`VectorizedWindowDynamics`** is constructed with **`state_dim`**, **`window_size`**, **`max_steps`**. On CUDA: **`torch.set_float32_matmul_precision("high")`**; **`torch.compile`** only **`dyn._step`** (vectorized) or **`dyn._step_rows`** (simple). Phase‑2 directional escape uses **`F.normalize`** on break directions. Last-run diagnostics: **`_last_attractor_steps_used`**, **`_last_final_window_tension_diag`**, **`_last_window_break_count`**, **`_last_convergence_triggered`**.
+- **`PHASE05_BATCH_CSV_HEADER`**: appended **`attractor_steps_used`**, **`final_window_tension_diag`**, **`break_count_window`**, **`convergence_triggered`** when batch CSV is enabled.
+- **`dynamics_vectorized.py`**: **`run_window_dynamics_vectorized(..., **kwargs)`** forwards extra kwargs to **`model.run_window_dynamics`**.
+- **`docs/DEVELOPMENT_ROADMAP.md`**: phased engineering vs validation vs training roadmap.
+
 ## Phase 2 — Directional breaks, residual mixing, stable window coupling (Mar 2026)
 
 - **`phase2_config.py`**: `Phase2Config` (directional vs legacy breaks, adaptive α, break rejection, residual head mixing gate, `‖C−I‖²` loss weight, optional distance decay on `C`, head-level `softmax(−T)` drift weighting, break memory buffers).

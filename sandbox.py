@@ -159,6 +159,10 @@ PHASE05_BATCH_CSV_HEADER = [
     "phase2_break_delta_alignment_mean",
     "phase2_head_weight_entropy",
     "phase2_interaction_reg_loss",
+    "attractor_steps_used",
+    "final_window_tension_diag",
+    "break_count_window",
+    "convergence_triggered",
 ]
 
 
@@ -203,6 +207,8 @@ class TorchAttractorLanguageModel(nn.Module):
         max_convergence_steps=MAX_CONVERGENCE_STEPS,
         train_window_size: int = 6,
         max_window_steps: int = MAX_WINDOW_STEPS,
+        convergence_epsilon: float = 0.0,
+        min_attractor_steps: int = 2,
         phase05: Phase05Config | None = None,
         phase1: Phase1Config | None = None,
         phase2: Phase2Config | None = None,
@@ -216,6 +222,9 @@ class TorchAttractorLanguageModel(nn.Module):
         self.state_dim = state_dim
         self.train_window_size = train_window_size
         self.max_window_steps = max_window_steps
+        # Early exit for window attractor (0 = disabled; see run_window_dynamics).
+        self.convergence_epsilon = float(convergence_epsilon)
+        self.min_attractor_steps = max(2, int(min_attractor_steps))
         _wtol = (
             WINDOW_TENSION_TOL_ENTROPY
             if WINDOW_TENSION_USE_ENTROPY
@@ -338,6 +347,11 @@ class TorchAttractorLanguageModel(nn.Module):
         self._phase2_last_break_post: torch.Tensor | None = None
         self._phase2_interaction_reg_logged: float = float("nan")
         self._phase2_head_weight_entropy_logged: float = float("nan")
+        # Last window run diagnostics (optional logging / CSV extensions).
+        self._last_attractor_steps_used: int = 0
+        self._last_final_window_tension_diag: float = float("nan")
+        self._last_window_break_count: int = 0
+        self._last_convergence_triggered: bool = False
 
     def _window_row_cos_mean(self, X: torch.Tensor) -> torch.Tensor:
         """Mean cosine between consecutive window rows (B, W, D)."""
@@ -384,8 +398,9 @@ class TorchAttractorLanguageModel(nn.Module):
             return S + legacy_scale * torch.randn_like(S)
         dn = torch.linalg.vector_norm(delta_ref, dim=-1, keepdim=True)
         rnd = torch.randn_like(delta_ref)
-        rn = torch.linalg.vector_norm(rnd, dim=-1, keepdim=True).clamp(min=1e-8)
-        dir_u = torch.where(dn >= 1e-6, delta_ref / dn.clamp(min=1e-8), rnd / rn)
+        dir_from_delta = F.normalize(delta_ref, dim=-1, eps=1e-8)
+        dir_from_rnd = F.normalize(rnd, dim=-1, eps=1e-8)
+        dir_u = torch.where(dn >= 1e-6, dir_from_delta, dir_from_rnd)
         alpha = self._phase2_break_alpha(t_mean)
         if not torch.is_tensor(alpha):
             alpha = torch.as_tensor(alpha, device=S.device, dtype=S.dtype)
@@ -412,20 +427,26 @@ class TorchAttractorLanguageModel(nn.Module):
         return (1.0, float(self.tension_lambda.item()), float(self.tension_mu.item()))
 
     def _phase1_global_interaction_step(
-        self, S: torch.Tensor
+        self,
+        S: torch.Tensor,
+        C_masked: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """
         Learnable cross-position mix: delta[b,j,d] = sum_i S[b,i,d] C[i,j]; add scale * delta.
         No softmax — linear routing only.
+        ``C_masked`` optional cached ``C * mask`` for the window (same each attractor step).
         """
         p = self.phase1_config
         if not p.enable_window_interaction:
             self._phase1_last_interaction_rms = None
             return S, None
-        C = self.phase1_window_C.to(device=S.device, dtype=S.dtype)
-        mask = self._phase2_C_dist_mask.to(device=S.device, dtype=S.dtype)
-        C = C * mask
-        delta = torch.einsum("bid,ij->bjd", S, C)
+        if C_masked is None:
+            C = self.phase1_window_C.to(device=S.device, dtype=S.dtype)
+            mask = self._phase2_C_dist_mask.to(device=S.device, dtype=S.dtype)
+            C_eff = C * mask
+        else:
+            C_eff = C_masked
+        delta = torch.einsum("bid,ij->bjd", S, C_eff)
         rms = torch.sqrt(delta.pow(2).mean() + 1e-12)
         self._phase1_last_interaction_rms = rms
         return S + float(p.interaction_scale) * delta, rms
@@ -804,6 +825,11 @@ class TorchAttractorLanguageModel(nn.Module):
         S: torch.Tensor,
         context_ids: list[list[int]] | None = None,
         context_tensor: torch.Tensor | None = None,
+        *,
+        pos_weights: torch.Tensor | None = None,
+        pos_wsum: torch.Tensor | None = None,
+        C_masked: torch.Tensor | None = None,
+        goat_bonus_vec: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """One coupling + relaxation step; S is (B, W, D).
 
@@ -812,6 +838,9 @@ class TorchAttractorLanguageModel(nn.Module):
 
         If GOAT memory is active and context_tensor is provided (B, W) long), an
         activation-bonus signal is gathered on GPU (no per-step Python over B×W).
+
+        Optional caches (fixed for one ``run_window_dynamics``): positional weights,
+        Phase-1 ``C * mask``, GOAT ``(V,)`` bonus vector.
         """
         B, W, D = S.shape
         assert W == self.train_window_size
@@ -822,7 +851,10 @@ class TorchAttractorLanguageModel(nn.Module):
             idt = idt * self._phase05_interaction_dt_scale.to(
                 device=idt.device, dtype=idt.dtype
             )
-        delta = positional_coupling_delta(S, pos_g, self.position_asym)
+        if pos_weights is not None and pos_wsum is not None:
+            delta = positional_coupling_delta_from_weights(S, pos_weights, pos_wsum)
+        else:
+            delta = positional_coupling_delta(S, pos_g, self.position_asym)
         S = S + idt * isc * delta
 
         # Build GOAT activation-bonus signal (Bug 1 fix).
@@ -831,7 +863,10 @@ class TorchAttractorLanguageModel(nn.Module):
             V = len(self._goat_mgr.nodes)
             valid = (context_tensor >= 0) & (context_tensor < V)
             safe = context_tensor.clamp(min=0, max=max(V - 1, 0))
-            bv = self._goat_mgr.bonus_tensor(S.device, S.dtype)
+            if goat_bonus_vec is not None:
+                bv = goat_bonus_vec
+            else:
+                bv = self._goat_mgr.bonus_tensor(S.device, S.dtype)
             bonuses_2d = bv[safe] * valid.to(dtype=S.dtype)
             signal = bonuses_2d.unsqueeze(-1).expand(B, W, D)
         else:
@@ -839,7 +874,7 @@ class TorchAttractorLanguageModel(nn.Module):
 
         # Local dynamics (per-position multi-head diffusion), then optional global C coupling.
         S = self.dynamics.step(S, signal)
-        S, _ = self._phase1_global_interaction_step(S)
+        S, _ = self._phase1_global_interaction_step(S, C_masked=C_masked)
         return S
 
     def run_window_dynamics(
@@ -848,6 +883,9 @@ class TorchAttractorLanguageModel(nn.Module):
         collect_metrics: bool = False,
         record_tension_log: bool = True,
         context_ids: list[list[int]] | None = None,
+        *,
+        convergence_epsilon: float | None = None,
+        min_attractor_steps: int | None = None,
     ) -> tuple[torch.Tensor, list[dict] | None]:
         """
         Tension-adaptive evolution: (W, D) or (B, W, D). Gradients flow through all steps.
@@ -856,6 +894,10 @@ class TorchAttractorLanguageModel(nn.Module):
 
         context_ids: list of per-batch token ID windows (B × W) used to compute
         GOAT activation bonuses inside each dynamics step.
+
+        Optional early exit (after ``min_attractor_steps``): state change norm or tension
+        stabilization below ``convergence_epsilon`` (0 disables). Uses model defaults
+        when kwargs are None.
         """
         single = S.dim() == 2
         if single:
@@ -907,11 +949,40 @@ class TorchAttractorLanguageModel(nn.Module):
             _n_p2_br = 0
         S_prev: torch.Tensor | None = None
         stag_eps = float(self.phase05_config.stagnation_delta_thresh)
+        # Per-window static tensors (parameters fixed for this forward).
+        pos_g_pre = F.softplus(self.position_gamma_raw) + 1e-6
+        pos_weights, pos_wsum = positional_coupling_weights_static(
+            W, pos_g_pre, self.position_asym, S.device, S.dtype
+        )
+        C_masked: torch.Tensor | None = None
+        if self.phase1_config.enable_window_interaction:
+            Cm = self.phase1_window_C.to(device=S.device, dtype=S.dtype)
+            maskm = self._phase2_C_dist_mask.to(device=S.device, dtype=S.dtype)
+            C_masked = Cm * maskm
+        goat_bonus_vec: torch.Tensor | None = None
+        if self._goat_mgr is not None and context_tensor is not None:
+            goat_bonus_vec = self._goat_mgr.bonus_tensor(S.device, S.dtype)
+        delta_buf = torch.empty_like(S)
+        conv_eps = float(self.convergence_epsilon if convergence_epsilon is None else convergence_epsilon)
+        min_steps = int(self.min_attractor_steps if min_attractor_steps is None else min_attractor_steps)
+        min_steps = max(2, min_steps)
+        convergence_triggered = False
+        break_count_window = 0
+        prev_t_mean: torch.Tensor | None = None
+        steps_used = 0
+        t_mean = torch.tensor(float("nan"), device=S.device, dtype=S.dtype)
         for step in range(self.max_window_steps):
+            steps_used = step + 1
             S_prev_outer = S
             S0 = S.detach().clone() if collect_metrics else None
             S = self._single_window_step(
-                S, context_ids=context_ids, context_tensor=context_tensor
+                S,
+                context_ids=context_ids,
+                context_tensor=context_tensor,
+                pos_weights=pos_weights,
+                pos_wsum=pos_wsum,
+                C_masked=C_masked,
+                goat_bonus_vec=goat_bonus_vec,
             )
             T, Te, Ta, Th = self.compute_tension_window_components(S)
             t_mean = T.mean()
@@ -989,6 +1060,7 @@ class TorchAttractorLanguageModel(nn.Module):
             need_jitter = is_low & (consecutive_low_t_steps_t >= 4)
             # Low-tension break: directional escape along (S − S_prev_outer) or legacy Gaussian jitter.
             if bool(need_jitter.item()):
+                break_count_window += 1
                 S_low_bef = S
                 delta_lo = S - S_prev_outer
                 T_pre_l = self.compute_tension_window(S_low_bef).mean().detach()
@@ -1034,6 +1106,7 @@ class TorchAttractorLanguageModel(nn.Module):
                 )
             high = (T > thigh).any()
             if bool(high.item()):
+                break_count_window += 1
                 S_h_bef = S
                 delta_h = S - S_prev_outer
                 T_pre_hm = self.compute_tension_window(S_h_bef).mean().detach()
@@ -1072,6 +1145,25 @@ class TorchAttractorLanguageModel(nn.Module):
                 t_af = self.compute_tension_window(S).mean().detach()
                 _t_post_h = _t_post_h + t_af
                 _n_h_ev += 1
+            if step + 1 >= min_steps and conv_eps > 0:
+                torch.sub(S, S_prev_outer, out=delta_buf)
+                state_delta = torch.linalg.vector_norm(
+                    delta_buf.reshape(B, -1), dim=-1
+                ).mean()
+                delta_ok = state_delta < conv_eps
+                tension_ok = torch.zeros((), device=S.device, dtype=torch.bool)
+                if prev_t_mean is not None:
+                    tension_ok = (t_mean.detach() - prev_t_mean).abs() < conv_eps
+                if bool(delta_ok.item()) or bool(tension_ok.item()):
+                    convergence_triggered = True
+                    break
+            prev_t_mean = t_mean.detach()
+        self._last_convergence_triggered = convergence_triggered
+        self._last_attractor_steps_used = steps_used
+        self._last_window_break_count = break_count_window
+        self._last_final_window_tension_diag = (
+            float(t_mean.detach().item()) if steps_used > 0 else float("nan")
+        )
         if trace and _n_trace > 0:
             nf = float(_n_trace)
             if _n_h_ev > 0:
@@ -1364,6 +1456,10 @@ class TorchAttractorLanguageModel(nn.Module):
             wt.get("phase2_break_delta_alignment_mean", float("nan")),
             getattr(self, "_phase2_head_weight_entropy_logged", float("nan")),
             getattr(self, "_phase2_interaction_reg_logged", float("nan")),
+            float(getattr(self, "_last_attractor_steps_used", 0)),
+            getattr(self, "_last_final_window_tension_diag", float("nan")),
+            float(getattr(self, "_last_window_break_count", 0)),
+            float(1 if getattr(self, "_last_convergence_triggered", False) else 0),
         ]
 
     @staticmethod
@@ -1601,14 +1697,14 @@ class SimpleAttractorDynamics(nn.Module):
         applied_signal_batch: torch.Tensor,
         noise_scale: torch.Tensor,
     ) -> torch.Tensor:
-        drift_lin = self.linear_drift(state_batch)
         c = state_batch - state_batch.mean(dim=-1, keepdim=True)
-        nonlinear = self.cubic_scale * float(WINDOW_NONLINEAR_GAIN) * torch.tanh(c)
-        scaled_signal = self.signal_scale * applied_signal_batch
+        cg = self.cubic_scale * float(WINDOW_NONLINEAR_GAIN)
+        drift_lin = self.linear_drift(state_batch)
+        # Single fused drift (fewer named temporaries than separate nonlinear + drift).
         drift = (
             drift_lin
-            + nonlinear
-            + self.beta * scaled_signal
+            + cg * torch.tanh(c)
+            + self.beta * (self.signal_scale * applied_signal_batch)
             - self.lambda_decay * state_batch
         )
         s = state_batch + self.dt * drift
@@ -1858,6 +1954,40 @@ def positional_coupling_delta(
         weights = weights * asym_fac.clamp(min=0.2)
     wsum = weights.sum(dim=1, keepdim=True)
     return (weights @ S) - wsum * S
+
+
+def positional_coupling_weights_static(
+    W: int,
+    position_gamma: torch.Tensor,
+    position_asym: torch.Tensor | None,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Coupling weights for one window (W, W); depends on parameters only, not state.
+    Matches :func:`positional_coupling_delta` for the 3D path.
+    """
+    idx = torch.arange(W, device=device, dtype=dtype)
+    rel = (idx.unsqueeze(0) - idx.unsqueeze(1)).abs()
+    weights = torch.exp(-position_gamma * rel) * (1.0 - torch.eye(W, device=device, dtype=dtype))
+    if position_asym is not None:
+        ji = idx.unsqueeze(0) - idx.unsqueeze(1)
+        sign_ji = torch.sign(ji)
+        sign_ji = torch.where(ji == 0, torch.zeros_like(sign_ji), sign_ji)
+        asym_fac = 1.0 + POSITION_ASYM_STRENGTH * torch.tanh(position_asym) * sign_ji
+        weights = weights * asym_fac.clamp(min=0.2)
+    wsum = weights.sum(dim=1, keepdim=True)
+    return weights, wsum
+
+
+def positional_coupling_delta_from_weights(
+    S: torch.Tensor,
+    weights: torch.Tensor,
+    wsum: torch.Tensor,
+) -> torch.Tensor:
+    """``sum_j w_ij (S_j - S_i)`` using precomputed ``weights`` (same as :func:`positional_coupling_delta` 3D)."""
+    weighted = torch.einsum("ij,bjd->bid", weights, S)
+    return weighted - wsum.unsqueeze(0) * S
 
 
 def _sequence_is_weak_or_repetitive(token_ids):
@@ -2407,6 +2537,18 @@ def main() -> None:
         help="Sliding context length W.")
     parser.add_argument("--num-dynamics-steps", type=int, default=MAX_WINDOW_STEPS,
         help="Max outer steps per window (tension-adaptive).")
+    parser.add_argument(
+        "--convergence-epsilon",
+        type=float,
+        default=0.0,
+        help="Early exit when per-step state delta or |ΔT| is below this (0 = run all outer steps; try 1e-3 on GPU).",
+    )
+    parser.add_argument(
+        "--min-attractor-steps",
+        type=int,
+        default=2,
+        help="Minimum outer attractor steps before early convergence may trigger (>=2).",
+    )
     parser.add_argument("--trajectory-batch-size", type=int, default=TRAJECTORY_BATCH_SIZE_DEFAULT,
         help="Batch size for trajectory contrastive training (need ≥2).")
     parser.add_argument("--quick-test", action="store_true",
@@ -2508,8 +2650,8 @@ def main() -> None:
     parser.add_argument("--use-goat-memory", "--use_goat_memory", action="store_true",
         dest="use_goat_memory", help="Enable GOAT-TS memory-state transitions (GoatMemoryManager).")
     # ---- Phase 9: dynamics ----
-    parser.add_argument("--dynamics", choices=("simple", "vectorized"), default="simple",
-        help="'simple': SimpleAttractorDynamics; 'vectorized': MultiHeadDynamics.")
+    parser.add_argument("--dynamics", choices=("simple", "vectorized"), default="vectorized",
+        help="'simple': SimpleAttractorDynamics; 'vectorized': MultiHeadDynamics (default).")
     parser.add_argument(
         "--use-lorentz",
         action="store_true",
@@ -2723,6 +2865,11 @@ def main() -> None:
     else:
         device = torch.device(args.device)
     print(f"Device: {device}", flush=True)
+    if device.type == "cuda":
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
 
     # ---- Phase 1: tokenizer ----
     tok = _build_tokenizer(mode=args.tokenizer, vocab_cap=args.vocab_cap)
@@ -2737,6 +2884,8 @@ def main() -> None:
         vocab_size,
         train_window_size=window_size,
         max_window_steps=args.num_dynamics_steps,
+        convergence_epsilon=float(args.convergence_epsilon),
+        min_attractor_steps=max(2, int(args.min_attractor_steps)),
         phase05=_p05,
         phase1=_p1,
         phase2=_p2,
@@ -2776,6 +2925,46 @@ def main() -> None:
             f"train_window={model.train_window_size}  max_window_steps={model.max_window_steps}",
         )
 
+    # ---- Phase 9: dynamics swap (vectorized default; fall back to simple on failure) ----
+    _dynamics_backend = str(args.dynamics)
+    if _dynamics_backend == "vectorized":
+        try:
+            from dynamics_vectorized import VectorizedWindowDynamics  # type: ignore[import]
+
+            model.dynamics = VectorizedWindowDynamics(
+                state_dim=model.state_dim,
+                window_size=model.train_window_size,
+                max_steps=model.max_window_steps,
+                use_lorentz=bool(args.use_lorentz),
+            ).to(device)
+            print("[phase-9] VectorizedWindowDynamics active", flush=True)
+        except Exception as _dyn_err:
+            print(f"[phase-9] Warning: vectorized dynamics unavailable ({_dyn_err}); using simple.", flush=True)
+            _dynamics_backend = "simple"
+
+    if torch.cuda.is_available():
+        try:
+            dyn = model.dynamics
+            if _dynamics_backend == "vectorized" and hasattr(dyn, "_step"):
+                try:
+                    dyn._step = torch.compile(dyn._step, mode="reduce-overhead")  # type: ignore[assignment]
+                    _compile_status = "vectorized _step"
+                except Exception as _ve:
+                    print(f"[step-2] Warning: vectorized _step compile skipped ({_ve})", flush=True)
+                    _compile_status = "vectorized _step failed"
+            elif hasattr(dyn, "_step_rows"):
+                try:
+                    dyn._step_rows = torch.compile(dyn._step_rows, mode="reduce-overhead")  # type: ignore[assignment]
+                    _compile_status = "simple _step_rows"
+                except Exception as _se:
+                    print(f"[step-2] Warning: simple _step_rows compile skipped ({_se})", flush=True)
+                    _compile_status = "simple _step_rows failed"
+            else:
+                _compile_status = "skipped (no inner step)"
+        except Exception as _comp_err:
+            print(f"[step-2] Warning: torch.compile skipped ({_comp_err})", flush=True)
+            _compile_status = f"error ({_comp_err})"
+
     if args.quick_test:
         if args.debug:
             _training_debug(True, "quick_test: window/context sanity checks then exit")
@@ -2787,37 +2976,6 @@ def main() -> None:
         lr_scheduler = torch.optim.lr_scheduler.StepLR(
             optimizer, step_size=args.lr_decay_every, gamma=args.lr_gamma
         )
-
-    # ---- Phase 9: dynamics swap ----
-    if args.dynamics == "vectorized":
-        try:
-            from dynamics_vectorized import VectorizedWindowDynamics  # type: ignore[import]
-            model.dynamics = VectorizedWindowDynamics(
-                model.state_dim, use_lorentz=bool(args.use_lorentz)
-            ).to(device)
-            print("[phase-9] VectorizedWindowDynamics active", flush=True)
-        except Exception as _dyn_err:
-            print(f"[phase-9] Warning: vectorized dynamics unavailable ({_dyn_err})", flush=True)
-
-    if torch.cuda.is_available():
-        try:
-            # Window path uses dynamics.step(B,W,D). VectorizedWindowDynamics.forward is
-            # disabled; compile _step only for vectorized. Simple path: compile module
-            # (forward used by evolve_token / token-level dynamics).
-            dyn = model.dynamics
-            if args.dynamics == "vectorized" and hasattr(dyn, "_step"):
-                try:
-                    dyn._step = torch.compile(dyn._step, mode="reduce-overhead")  # type: ignore[assignment]
-                    _compile_status = "vectorized _step"
-                except Exception as _ve:
-                    print(f"[step-2] Warning: vectorized _step compile skipped ({_ve})", flush=True)
-                    _compile_status = "vectorized _step failed"
-            else:
-                model.dynamics = torch.compile(model.dynamics, mode="reduce-overhead")
-                _compile_status = "full dynamics"
-        except Exception as _comp_err:
-            print(f"[step-2] Warning: torch.compile skipped ({_comp_err})", flush=True)
-            _compile_status = f"error ({_comp_err})"
 
     # ---- Phase 7: TSCore substrate ----
     substrate = None

@@ -18,7 +18,7 @@ Corpus / Token stream
 │  embed_window(W ids) → (W, D) embedding matrix          │
 │         │                                               │
 │         ▼                                               │
-│  run_window_dynamics()  ← outer loop (max_window_steps) │
+│  run_window_dynamics()  ← outer loop (≤ max_window_steps; optional early exit) │
 │    ┌─ positional coupling + dynamics.step(S, signal)    │
 │    │     (SimpleAttractorDynamics or VectorizedWindow)  │
 │    ├─ optional GOAT activation_bonus → per-position signal│
@@ -43,7 +43,7 @@ Corpus / Token stream
 **No attention. No transformer blocks. No external model weights.**
 
 The network contains only:
-- A learnable diffusion matrix `A` (negative-definite, stable dynamics) in the **simple** path, or **low-rank multi-head** diffusion in **`--dynamics vectorized`**
+- A learnable diffusion matrix `A` (negative-definite, stable dynamics) in the **simple** path (`--dynamics simple`), or **low-rank multi-head** diffusion in the **default** **`--dynamics vectorized`** path
 - A `tanh`-bounded (simple window step) or **cubic** (vectorized) nonlinearity with damping
 - **Window path:** state `S` is `(B, W, D)`; **token path** (`evolve_token`): fast/slow `(D,)` with symplectic blend for `readout`
 - **`readout_window`:** linear map `W·D → vocab` (training default); **`readout`:** `D → vocab` (cache / `next_token_logits`)
@@ -79,6 +79,7 @@ The network contains only:
 | `vendor/ts-llm` | — | Tokenizer, hierarchical dynamics, attractor LLM package (submodule) |
 | `docs/API_DISCOVERY.md` | — | Verified entrypoints for vendored repos + model config surface |
 | `docs/BASELINE.md` | — | Phase 0 baseline recording instructions |
+| `docs/DEVELOPMENT_ROADMAP.md` | — | Engineering vs validation phases (performance targets, dataset order) |
 | `scripts/plot_phase05_metrics.py` | — | Plots `--phase05-batch-metrics-csv` columns (incl. Phase 1–2 extras) |
 
 ---
@@ -250,7 +251,7 @@ This section is the operational manual — what to run, how data and validation 
 
 **Device and checkpoints.** `--device auto` picks CUDA when available. `--resume-checkpoint` restores weights and optimizer state. `--checkpoint-dir` and `--save-every` control where and how often numbered checkpoints are written.
 
-**Integrations.** `--use-substrate` attaches `LLMSubstrateNode` so language tension can drive TSCore propagation and logging. `--use-goat-memory` enables `GoatMemoryManager` and injects a per-position signal into window dynamics. `--dynamics vectorized` swaps in `VectorizedWindowDynamics` from `dynamics_vectorized.py`.
+**Integrations.** `--use-substrate` attaches `LLMSubstrateNode` so language tension can drive TSCore propagation and logging. `--use-goat-memory` enables `GoatMemoryManager` and injects a per-position signal into window dynamics. By default **`--dynamics vectorized`** loads `VectorizedWindowDynamics` from `dynamics_vectorized.py` (falls back to simple if import fails). Use **`--dynamics simple`** for the legacy `SimpleAttractorDynamics` path.
 
 ### Corpus, paths, and automatic synthetic text
 
@@ -319,12 +320,12 @@ python3 sandbox.py --corpus data/generated.txt
 
 - **Trajectory mode** requires **`--trajectory-batch-size` ≥ 2** (negatives are drawn inside the batch). Larger batches stabilise contrastive training but cost more memory.
 - **Window size** (`--window-size`): wider context increases compute per step roughly linearly in `W` (embedding is `W×D`, dynamics run up to **`--num-dynamics-steps`** outer steps). Start with the default or `8`; increase when data and VRAM allow.
-- **`--num-dynamics-steps`**: more steps mean deeper relaxation per window; dimishing returns once tension curves flatten—watch **`mean_final_step_tension`** in epoch CSV.
+- **`--num-dynamics-steps`**: hard cap on outer steps per window. Optional **`--convergence-epsilon`** (with **`--min-attractor-steps`**, default 2) can stop early when state change or tension is stable; default epsilon is **`0`** (full **`--num-dynamics-steps`** each window). More steps mean deeper relaxation; diminishing returns once tension curves flatten—watch **`mean_final_step_tension`** in epoch CSV.
 
 **Throughput and hardware**
 
-- Use **`--device cuda`** when available. **`torch.compile`** is applied automatically on CUDA (vectorized path compiles **`_step` only**); first epoch can be slower while kernels warm up.
-- **`--dynamics vectorized`** can help on GPU at larger `D`; simple dynamics are fine for CPU smoke tests and small models.
+- Use **`--device cuda`** when available. On CUDA, **`torch.set_float32_matmul_precision("high")`** is set, and **`torch.compile`** targets only the inner step (**`dyn._step`** for vectorized, **`dyn._step_rows`** for simple)—not the outer window loop. First epoch can be slower while kernels warm up.
+- **`--dynamics vectorized`** (default) can help on GPU at larger `D`; **`--dynamics simple`** is fine for CPU smoke tests and small models.
 
 **Optimisation and stability**
 
@@ -389,13 +390,13 @@ model.tokenizer = tok
 
 ### Wave B — Vectorized dynamics
 
-`dynamics_vectorized.py` provides **`VectorizedWindowDynamics`**, swappable with **`--dynamics vectorized`** (replaces `model.dynamics` after construction).
+`dynamics_vectorized.py` provides **`VectorizedWindowDynamics`**, selected by default via **`--dynamics vectorized`** (replaces `model.dynamics` after construction; use **`--dynamics simple`** for `SimpleAttractorDynamics`).
 
-Both **`SimpleAttractorDynamics`** and **`VectorizedWindowDynamics`** implement the same **`step(S, signal) → S`** interface used inside **`run_window_dynamics`** (positional coupling first, then one dynamics step with the optional GOAT signal tensor).
+Both **`SimpleAttractorDynamics`** and **`VectorizedWindowDynamics`** implement the same **`step(S, signal) → S`** interface used inside **`run_window_dynamics`** (positional coupling first, then one dynamics step with the optional GOAT signal tensor). **`run_window_dynamics`** caches per-window static work (positional weight matrix, **`C * mask`** for Phase 1, GOAT bonus vector) outside the time-step loop.
 
 - Wraps **`MultiHeadDynamics`** from `vendor/ts-llm` (low-rank diffusion per head + cross-head coupling); window step uses **cubic** nonlinearity (simple path uses **`tanh`**).
-- **`forward` on `VectorizedWindowDynamics` is disabled** (`NotImplementedError`); use **`model.run_window_dynamics`** or **`run_window_dynamics_vectorized`**, which temporarily swaps dynamics and calls **`model.run_window_dynamics`**.
-- **`torch.compile`:** with **`--dynamics vectorized`**, only **`dyn._step`** is compiled (full-module compile is unreliable here).
+- **`forward` on `VectorizedWindowDynamics` is disabled** (`NotImplementedError`); use **`model.run_window_dynamics`** or **`run_window_dynamics_vectorized`**, which temporarily swaps dynamics and calls **`model.run_window_dynamics`** (optional **`**kwargs`** forwarded to **`run_window_dynamics`**).
+- **`torch.compile`:** on CUDA, only **`dyn._step`** (vectorized) or **`dyn._step_rows`** (simple) is compiled—not the full dynamics module.
 - **`get_compiled()`** caches compiled `_step` by shape key for smoke / benchmarks.
 - Parity tests: both paths produce finite outputs; equations differ by design.
 
@@ -615,7 +616,7 @@ T = |ΔE_state| + λ · (1 − cos(fast, slow)) + μ · H(readout_logits)
 | T > high | Directional break (Phase 2 default) or Gaussian jitter (`--phase2-disable-directional-break`) |
 | T > break_thresh | Same break family on the token path |
 
-**Window path** (`run_window_dynamics`): after each outer iteration, **`compute_tension_window`** (alias **`compute_window_tension`**) uses neighbor energy drift + misalignment + optional readout entropy (see `WINDOW_TENSION_USE_ENTROPY` in `sandbox.py`). The outer loop always runs up to **`max_window_steps`**; tension drives **low-tension escape**, **high-tension breaks**, **GOAT transitions**, and **high-T row renorm**, not early exit of the whole window. Phase 2 breaks use **`state − prev_state`** (normalised) with tension-scaled magnitude; see [Phase 2](#phase-2--directional-breaks-and-stabilised-routing).
+**Window path** (`run_window_dynamics`): after each outer iteration, **`compute_tension_window`** (alias **`compute_window_tension`**) uses neighbor energy drift + misalignment + optional readout entropy (see `WINDOW_TENSION_USE_ENTROPY` in `sandbox.py`). The outer loop runs at most **`max_window_steps`** times; if **`convergence_epsilon > 0`** (CLI **`--convergence-epsilon`**, after **`--min-attractor-steps`**), the loop may exit early when state change or tension delta falls below epsilon. Otherwise (default epsilon **`0`**) the loop uses all **`max_window_steps`**. Tension still drives **low-tension escape**, **high-tension breaks**, **GOAT transitions**, and **high-T row renorm** inside each step. Phase 2 breaks use **`state − prev_state`** (**`F.normalize`**) with tension-scaled magnitude; see [Phase 2](#phase-2--directional-breaks-and-stabilised-routing).
 
 ---
 
@@ -643,7 +644,9 @@ Data & tokenizer:
 
 Training:
   --window-size INT          Context window W (default: 6)
-  --num-dynamics-steps INT   Max tension-adaptive steps per window (default: 16)
+  --num-dynamics-steps INT   Max outer attractor steps per window (default: 16)
+  --convergence-epsilon FLOAT  Early exit when ‖ΔS‖ or |ΔT_mean| below this after min steps (0 = use all num-dynamics-steps; try 1e-3 on GPU)
+  --min-attractor-steps INT  Minimum outer steps before early exit may trigger (default: 2, ≥2)
   --trajectory-batch-size INT  Batch size for trajectory mode (default: 64, need ≥2)
   --loss-mode {trajectory,ce}
   --token-aux-ce FLOAT       Aux CE on readout_window in trajectory mode (default: 0.2)
@@ -662,8 +665,8 @@ Device & checkpointing:
 Integrations:
   --use-substrate            TSCore LLMSubstrateNode after each batch
   --use-goat-memory          GoatMemoryManager + window-path signal injection
-  --use-lorentz              Lorentzian positional coupling in window dynamics (default: off)
-  --dynamics {simple,vectorized}
+  --use-lorentz              Lorentzian positional coupling in window dynamics (vectorized path only; default: off)
+  --dynamics {simple,vectorized}   Default: vectorized (MultiHeadDynamics); simple = legacy single-matrix drift
 
 Phase 0.5 (instrumentation):
   --phase05-log-metrics      Per-batch diagnostics + window trace for CSV
