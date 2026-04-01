@@ -4,7 +4,7 @@
 
 Tasks:
 
-* remove Python loops
+* remove Python loops (trajectory **`embed_windows_batch`**, vectorized **`_aux_ce_loss_batch`**; parity: **`tests/test_embed_windows_batch.py`**)
 * adaptive attractor convergence
 * cache static computations
 * vectorized dynamics default

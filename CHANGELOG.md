@@ -7,6 +7,12 @@ The project is documented as **BoggersTheLanguageModel**; canonical source is [g
 
 ---
 
+## Performance — batched trajectory embedding + aux CE (Mar 2026)
+
+- **`sandbox.py`**: **`embed_windows_batch(context_tensor)`** — one **`Embedding` + LayerNorm + row L2** pass for shape **`(B, W)`**; matches stacking **`embed_window`** per row. **`trajectory_contrastive_loss_and_logits`** and **`mean_trajectory_contrastive_eval`** use it for student and teacher (**shifted windows** via **`torch.cat([context[:, 1:], target.unsqueeze(1)], dim=1)`**). **`_aux_ce_loss_batch`** is **fully vectorized** over **`B`** (bigram bias, repeat penalties, entropy floor branch, **`cross_entropy(..., reduction="none")`**).
+- **`tests/test_embed_windows_batch.py`**: prints **`max_abs_diff`** between batched vs stacked embeddings; run with **`python3 tests/test_embed_windows_batch.py`**.
+- **`.gitignore`**: **`runs/`** for local experiment output.
+
 ## Engineering — window dynamics performance (Mar 2026)
 
 - **`sandbox.py`**: **`run_window_dynamics`** caches static per-window tensors (positional coupling weights, Phase‑1 **`C * mask`**, GOAT bonus vector) outside the outer step loop; optional **early convergence** via **`convergence_epsilon`** / **`min_attractor_steps`** (CLI **`--convergence-epsilon`**, **`--min-attractor-steps`**; default epsilon **`0`** preserves full **`max_window_steps`**). **`--dynamics`** default is **`vectorized`**; **`VectorizedWindowDynamics`** is constructed with **`state_dim`**, **`window_size`**, **`max_steps`**. On CUDA: **`torch.set_float32_matmul_precision("high")`**; **`torch.compile`** only **`dyn._step`** (vectorized) or **`dyn._step_rows`** (simple). Phase‑2 directional escape uses **`F.normalize`** on break directions. Last-run diagnostics: **`_last_attractor_steps_used`**, **`_last_final_window_tension_diag`**, **`_last_window_break_count`**, **`_last_convergence_triggered`**.

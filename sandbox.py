@@ -1280,6 +1280,23 @@ class TorchAttractorLanguageModel(nn.Module):
         n0 = torch.linalg.vector_norm(emb, dim=-1, keepdim=True).clamp(min=1e-12)
         return emb / n0
 
+    def embed_windows_batch(self, context_tensor: torch.Tensor) -> torch.Tensor:
+        """
+        (B, W) int64 token ids on any device -> (B, W, D) on embedder device.
+        Row b matches ``embed_window(context_tensor[b].tolist())`` (same norm + row L2).
+        """
+        if context_tensor.dim() != 2:
+            raise ValueError("context_tensor must be 2D (B, W)")
+        if context_tensor.size(1) != self.train_window_size:
+            raise ValueError(
+                f"context_tensor W={context_tensor.size(1)} != train_window_size={self.train_window_size}"
+            )
+        device = self.embedder.weight.device
+        ids = context_tensor.to(device=device, dtype=torch.long)
+        emb = self.norm(self.embedder(ids))
+        n0 = torch.linalg.vector_norm(emb, dim=-1, keepdim=True).clamp(min=1e-12)
+        return emb / n0
+
     def forward_training_window(
         self, context_ids: list[int], collect_dynamics_metrics: bool = False
     ) -> torch.Tensor:
@@ -1318,19 +1335,17 @@ class TorchAttractorLanguageModel(nn.Module):
             self._phase05_evolve_t_post_sum = 0.0
         if isinstance(self.dynamics, SimpleAttractorDynamics):
             self.dynamics._last_multihead_drifts = None
-        S_pred = torch.stack([self.embed_window(c) for c in contexts], dim=0)
+        device = self.embedder.weight.device
+        context_tensor = torch.as_tensor(contexts, dtype=torch.long, device=device)
+        S_pred = self.embed_windows_batch(context_tensor)
         S_pred, _ = self.run_window_dynamics(
             S_pred, collect_metrics=False, record_tension_log=True, context_ids=contexts
         )
         self._last_traj_student_tension_mean = self.compute_tension_window(S_pred).mean().detach()
         with torch.no_grad():
-            S_tgt = torch.stack(
-                [
-                    self.embed_window(self.shifted_next_window(c, t))
-                    for c, t in zip(contexts, targets, strict=True)
-                ],
-                dim=0,
-            )
+            tgt_col = torch.as_tensor(targets, dtype=torch.long, device=device).unsqueeze(1)
+            shifted_tensor = torch.cat([context_tensor[:, 1:], tgt_col], dim=1)
+            S_tgt = self.embed_windows_batch(shifted_tensor)
             S_tgt, _ = self.run_window_dynamics(
                 S_tgt, collect_metrics=False, record_tension_log=False
             )
@@ -2247,17 +2262,15 @@ def mean_trajectory_contrastive_eval(
             chunk = chunk + chunk
         contexts = [c for c, _t in chunk]
         targets = [t for _c, t in chunk]
-        S_pred = torch.stack([model.embed_window(c) for c in contexts], dim=0)
+        device = model.embedder.weight.device
+        context_tensor = torch.as_tensor(contexts, dtype=torch.long, device=device)
+        S_pred = model.embed_windows_batch(context_tensor)
         S_pred, _ = model.run_window_dynamics(
             S_pred, collect_metrics=False, record_tension_log=False
         )
-        S_tgt = torch.stack(
-            [
-                model.embed_window(model.shifted_next_window(c, t))
-                for c, t in zip(contexts, targets, strict=True)
-            ],
-            dim=0,
-        )
+        tgt_col = torch.as_tensor(targets, dtype=torch.long, device=device).unsqueeze(1)
+        shifted_tensor = torch.cat([context_tensor[:, 1:], tgt_col], dim=1)
+        S_tgt = model.embed_windows_batch(shifted_tensor)
         S_tgt, _ = model.run_window_dynamics(
             S_tgt, collect_metrics=False, record_tension_log=False
         )
@@ -2277,46 +2290,51 @@ def _aux_ce_loss_batch(
     contexts: list[list[int]],
     targets: list[int],
 ) -> torch.Tensor:
-    """Mean per-example CE − entropy bonus (matches single-window training shaping)."""
+    """Mean per-example CE − entropy bonus (matches single-window training shaping). Fully batched."""
     device = logits.device
-    acc = torch.zeros((), device=device, dtype=logits.dtype)
-    B = logits.size(0)
-    for bi in range(B):
-        lo = logits[bi]
-        prev_id = contexts[bi][-1]
-        lo = lo + BIGRAM_TRAIN_WEIGHT * torch.matmul(
-            model.embedder.weight, model.embedder.weight[prev_id]
+    dtype = logits.dtype
+    B, V = logits.shape
+    context_tensor = torch.as_tensor(contexts, dtype=torch.long, device=device)
+    targets_tensor = torch.as_tensor(targets, dtype=torch.long, device=device)
+    E = model.embedder.weight
+    prev_ids = context_tensor[:, -1]
+    e_prev = E[prev_ids]
+    lo = logits + BIGRAM_TRAIN_WEIGHT * torch.matmul(e_prev, E.T)
+    lo = lo.clone()
+    lo[torch.arange(B, device=device), prev_ids] -= 2.0
+    W = context_tensor.size(1)
+    last_k = min(3, W)
+    if last_k > 0:
+        tok_blk = context_tensor[:, -last_k:]
+        rb = torch.arange(B, device=device).unsqueeze(1).expand(B, last_k).reshape(-1)
+        lo[rb, tok_blk.reshape(-1)] -= 1.0
+    lo = lo + TRAIN_LOGIT_NOISE * torch.randn_like(lo)
+    probs_floor = F.softmax(lo, dim=-1)
+    ent_s = -(probs_floor * torch.log(probs_floor + 1e-9)).sum(dim=-1)
+    ts = getattr(model, "_last_traj_student_tension_mean", None)
+    base_entropy_floor = torch.as_tensor(float(ENTROPY_FLOOR), device=device, dtype=dtype)
+    if ts is not None:
+        tref = ts.to(device=device, dtype=dtype)
+        if tref.dim() > 0:
+            tref = tref.mean()
+        entropy_floor = base_entropy_floor * (
+            1.0 + 0.5 * (1.0 - torch.sigmoid(8.0 * (tref - 0.12)))
         )
-        lo = lo.clone()
-        lo[prev_id] -= 2.0
-        for t in contexts[bi][-3:]:
-            lo[t] -= 1.0
-        lo = lo + TRAIN_LOGIT_NOISE * torch.randn_like(lo)
-        probs_floor = F.softmax(lo, dim=-1)
-        ent_s = -(probs_floor * torch.log(probs_floor + 1e-9)).sum()
-        ts = getattr(model, "_last_traj_student_tension_mean", None)
-        base_entropy_floor = torch.as_tensor(float(ENTROPY_FLOOR), device=device, dtype=lo.dtype)
-        if ts is not None:
-            tref = ts.to(device=device, dtype=lo.dtype)
-            if tref.dim() > 0:
-                tref = tref.mean()
-            entropy_floor = base_entropy_floor * (
-                1.0 + 0.5 * (1.0 - torch.sigmoid(8.0 * (tref - 0.12)))
-            )
-        else:
-            entropy_floor = base_entropy_floor
-        if float(ent_s.detach()) < float(entropy_floor.detach()):
-            lo = lo + torch.randn_like(lo) * ENTROPY_FLOOR_NOISE
-            probs_for_entropy = F.softmax(lo, dim=-1)
-        else:
-            probs_for_entropy = probs_floor
-        tgt = torch.tensor([targets[bi]], device=device, dtype=torch.long)
-        loss_ce = F.cross_entropy(
-            lo.unsqueeze(0), tgt, label_smoothing=LABEL_SMOOTHING
-        )
-        entropy = -(probs_for_entropy * torch.log(probs_for_entropy + 1e-8)).sum()
-        acc = acc + (loss_ce - ENTROPY_WEIGHT * entropy)
-    return acc / B
+    else:
+        entropy_floor = base_entropy_floor
+    need_floor_noise = ent_s < entropy_floor
+    floor_noise = torch.randn_like(lo) * ENTROPY_FLOOR_NOISE
+    lo_for_ce = lo + torch.where(need_floor_noise.unsqueeze(-1), floor_noise, torch.zeros_like(lo))
+    probs_for_entropy = torch.where(
+        need_floor_noise.unsqueeze(-1),
+        F.softmax(lo_for_ce, dim=-1),
+        probs_floor,
+    )
+    loss_ce_vec = F.cross_entropy(
+        lo_for_ce, targets_tensor, label_smoothing=LABEL_SMOOTHING, reduction="none"
+    )
+    entropy_vec = -(probs_for_entropy * torch.log(probs_for_entropy + 1e-8)).sum(dim=-1)
+    return (loss_ce_vec - ENTROPY_WEIGHT * entropy_vec).mean()
 
 
 WINDOW_SIZE = 6

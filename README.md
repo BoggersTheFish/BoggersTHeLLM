@@ -15,7 +15,7 @@ Corpus / Token stream
 ┌─────────────────────────────────────────────────────────┐
 │  TorchAttractorLanguageModel  (sandbox.py)              │
 │                                                         │
-│  embed_window(W ids) → (W, D) embedding matrix          │
+│  embed_window / embed_windows_batch → (W, D) or (B, W, D) │
 │         │                                               │
 │         ▼                                               │
 │  run_window_dynamics()  ← outer loop (≤ max_window_steps; optional early exit) │
@@ -60,6 +60,7 @@ The network contains only:
 | `phase1_config.py` | 1 | `Phase1Config`: multi-head drift, window interaction matrix `C`, diversity loss |
 | `phase2_config.py` | 2 | `Phase2Config`: directional breaks, residual mixing, `C` reg, head tension weights |
 | `smoke_test.py` | Phase 0 | 5-assertion integration test (dynamics + TSCore wave cycle) |
+| `tests/test_embed_windows_batch.py` | — | Parity check: `embed_windows_batch` vs stacking `embed_window` per row |
 | `wave_a_tokenizer.py` | A | tiktoken BPE helpers; training uses `sandbox._build_tokenizer()` |
 | `dynamics_vectorized.py` | B | `VectorizedWindowDynamics`: `step(S, signal)` only; `forward` disabled; `run_window_dynamics_vectorized` → `model.run_window_dynamics` |
 | `state_cache.py` | C | Rolling cache: `run_window_dynamics` on `(1,W,D)` aligned with training; `logits()` via `readout` + fast/slow |
@@ -197,6 +198,16 @@ Verifies dynamics, tension, training step, and TSCore wave cycle all pass:
 python3 smoke_test.py
 ```
 
+### Embed batch parity (`embed_windows_batch`)
+
+Training uses a **single batched embedding** for trajectory windows (`embed_windows_batch` on `(B, W)` token ids). To verify it matches **row-wise** `embed_window` (same numerics as the old `torch.stack` loop):
+
+```bash
+python3 tests/test_embed_windows_batch.py
+```
+
+Prints **`max_abs_diff`**; asserts `allclose` at `1e-6`. Requires PyTorch (same env as training).
+
 ### Run the evaluation harness
 
 ```bash
@@ -291,6 +302,7 @@ python3 sandbox.py --corpus data/generated.txt
 | Command | Purpose |
 |--------|---------|
 | `python3 smoke_test.py` | Fast integration check: model + one dynamics pass + training step + TSCore wave cycle. Run after install or refactors. |
+| `python3 tests/test_embed_windows_batch.py` | Confirms batched window embedding matches per-row `embed_window` (prints max abs diff). |
 | `python3 eval_harness.py …` | Perplexity, mean tension, trajectory contrast, optional TSCore `WaveCycleRunner` metrics; writes JSON. Use `--dataset-source tinystories` / `fineweb-edu` to match Hub training data. |
 | `python3 inference_server.py` | FastAPI server: OpenAI-style `/v1/completions`, cache-backed generation, optional TSCore hooks. Needs `pip install fastapi uvicorn`. |
 | `python3 data/generate_corpus.py --out PATH --tokens N` | Offline synthetic corpus for tests or a fixed `data/generated.txt`. |
@@ -567,7 +579,9 @@ model.tokenizer = tok
 
 # Training path
 wids = model.window_ids_from_sequence(token_ids)
-S = model.embed_window(wids)  # (W, D); batched training uses (B, W, D)
+S = model.embed_window(wids)  # (W, D)
+# Batched: context_tensor (B, W) long -> (B, W, D), equivalent to stacking embed_window rows
+# S_b = model.embed_windows_batch(context_tensor)
 S, logs = model.run_window_dynamics(S, context_ids=wids)  # GOAT uses token ids if enabled
 train_logits = model.readout_window(S.reshape(1, -1))  # primary training readout
 
