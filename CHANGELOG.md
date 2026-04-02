@@ -7,6 +7,13 @@ The project is documented as **BoggersTheLanguageModel**; canonical source is [g
 
 ---
 
+## Trajectory-guided training + pipeline API (Apr 2026)
+
+- **`phase05_config.py`**: `trajectory_guidance_nudge_scale`, `trajectory_guidance_mse_weight` — optional nudge toward precomputed **`(B, W, D)`** targets each outer `run_window_dynamics` step, and optional MSE term on final student state vs those targets.
+- **`sandbox.py`**: `run_window_dynamics(..., target_states=None)`; `trajectory_contrastive_loss_and_logits(..., target_states=None)`; `precompute_stream_target_states_embed()` for building **`(n_windows, W, D)`** from embeddings. CLI: **`--trajectory-guidance-nudge-scale`**, **`--trajectory-guidance-mse-weight`**, **`--trajectory-guidance-states`**, **`--trajectory-guidance-from-embed`**, **`--trajectory-guidance-embed-batch-size`**. Warns when guidance weights are on but the pipeline has no stored targets.
+- **`data_pipeline.py`**: optional ctor **`train_target_states`**; **`epoch_batches`** yields **`(contexts, targets, target_states_batch)`** (third entry **`None`** without targets or in line mode). Requires **`torch`** at import time for tensor indexing.
+- **Docs**: README (Wave D, reproducibility, training objective, CLI), **`docs/API_DISCOVERY.md`**, **`docs/PROJECT_STATUS.md`**.
+
 ## Documentation + multi-wave stack snapshot (Apr 2026)
 
 - **README.md**: Architecture overview rewritten for **multi-wave** state, **per-wave energy heads**, **window energy descent** (not `dynamics.step` per outer step), **`readout_window_logits`** + optional fusion, **`wave_dynamics` / `wave_interaction`** on **`evolve_token`**, and accurate **`--dynamics simple` vs `vectorized`** description.
@@ -88,7 +95,7 @@ The project is documented as **BoggersTheLanguageModel**; canonical source is [g
 
 - **Default training path:** entire corpus file(s) → one token stream → sliding windows; line boundaries no longer gate training.
 - **Validation:** token-level split (`train_tokens` / `val_tokens`); `build_dataset_from_token_ids` for val windows.
-- **`AttractorDataPipeline`:** `streaming_dataset=True` (default), optional `train_token_ids` from sandbox; `epoch_batches` shuffles window indices per epoch.
+- **`AttractorDataPipeline`:** `streaming_dataset=True` (default), optional `train_token_ids` from sandbox; optional `train_target_states` for trajectory guidance; `epoch_batches` yields three values `(contexts, targets, target_states_batch)` and shuffles window indices per epoch.
 - **`--no-streaming-dataset`:** restores legacy per-line filtering.
 - Logging: `total_tokens`, `train_windows`, `val_windows` instead of “usable lines”.
 - Train/val **gap** of `window_size` tokens (no cross-split window leakage). **`epoch_batches(epoch_index)`** shuffles with `seed + epoch_index`. Stream mode **ignores `--epoch-copies`**. Warn when **`val_windows < 50`** (unreliable metrics); tiny-corpus note for GOAT A/B interpretation.

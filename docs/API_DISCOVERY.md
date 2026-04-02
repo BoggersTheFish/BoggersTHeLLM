@@ -10,19 +10,19 @@ Last verified: April 2026 (Boggers integration table refreshed for multi-wave st
 | Entry | Role |
 |-------|------|
 | `_build_tokenizer(mode, vocab_cap)` | Loads `AttractorTokenizer` from `vendor/ts-llm` (`tiktoken` or `fallback` cap). |
-| `Phase05Config` (`phase05_config.py`) | Tension / anchor / batch CSV / adaptive window & attractor dt / **anchor freeze** (`enable_anchor_freeze`, `anchor_freeze_threshold`, `anchor_freeze_max_age`) / trajectory CE weight / energy reg. |
+| `Phase05Config` (`phase05_config.py`) | Tension / anchor / batch CSV / adaptive window & attractor dt / **anchor freeze** (`enable_anchor_freeze`, `anchor_freeze_threshold`, `anchor_freeze_max_age`) / trajectory CE weight / **trajectory guidance** (`trajectory_guidance_nudge_scale`, `trajectory_guidance_mse_weight`) / energy reg. |
 | `Phase1Config` (`phase1_config.py`) | Window interaction `C`, head diversity, per-head tension logging. |
 | `Phase2Config` (`phase2_config.py`) | Directional breaks, residual mixing, `C` regularisation / decay, head tension weighting, break memory. |
 | `TorchAttractorLanguageModel(..., num_waves=, use_readout_fusion=, wave_interaction_strength=, …)` | Core model. State **`D`** splits into **`num_waves × wave_dim`**. Default **`model.dynamics`** is **`None`**; **`wave_dynamics`** (per-wave **`WaveDynamics`**) + **`wave_interaction`** act on **`evolve_token`**. **`energy_heads`**: one MLP per wave for window energy. |
 | `embed_window` / `embed_windows_batch` | **`(W,)→(W,D)`** vs **`(B,W)→(B,W,D)`** with identical geometry to stacked single windows. |
-| `run_window_dynamics` | Outer loop: coupling → GOAT → anchor pull → **inner energy gradient step** (sum of per-wave energies + optional λ·tension + anchor distance) → Phase 1 interaction → optional normalize. **Optional anchor freeze** zeros ∇ on frozen wave slices. **Not** `dynamics.step` per outer step. |
+| `run_window_dynamics` | Outer loop: optional **trajectory nudge** `S ← S + β(T.detach() − S)` when `target_states` `(B,W,D)` and `trajectory_guidance_nudge_scale` > 0; then coupling → GOAT → anchor pull → **inner energy gradient step** (sum of per-wave energies + optional λ·tension + anchor distance) → Phase 1 interaction → optional normalize. **Optional anchor freeze** zeros ∇ on frozen wave slices. **Not** `dynamics.step` per outer step. |
 | `readout_window_logits(S)` / `_readout_window_logits` | Canonical training readout path: normalize to **`(B,W,D)`** → optional **`readout_fusion` Linear(D,D)** per position → **`readout_window`**. |
 | `readout_window` | Final **`Linear(W·D, V)`**; calling it alone **skips** fusion. |
 | `model.dynamics.step(S, signal)` | Used in **`evolve_token`** when **`VectorizedWindowDynamics`** is attached (**`--dynamics vectorized`**); operates on **`wave_dim`** slices. |
 | `phase05_batch_csv_values` / `PHASE05_BATCH_CSV_HEADER` | Includes attractor diagnostics, **`energy_per_wave_means`**, **`frozen_fraction_mean` / `frozen_fraction_std`** when freeze enabled, Phase 1–2 columns. |
-| `AttractorDataPipeline` (`data_pipeline.py`) | Streaming train batches when import succeeds. |
+| `AttractorDataPipeline` (`data_pipeline.py`) | Streaming train batches when import succeeds. **`epoch_batches` → `(contexts, targets, target_states_batch)`**; optional **`train_target_states`** `(n_windows, W, D)` CPU for trajectory-guided batches (stream mode only). |
 | `mean_cross_entropy_eval` | Batched **`embed_windows_batch → run_window_dynamics → readout_window_logits`** + eval shaping (bigram, repeats, label smoothing). |
-| `trajectory_contrastive_loss_and_logits` | Main training forward; teacher path optional fewer steps via **`teacher_steps`**. |
+| `trajectory_contrastive_loss_and_logits` | Main training forward; teacher path optional fewer steps via **`teacher_steps`**. Optional **`target_states`** `(B,W,D)` for nudge + MSE when Phase05 guidance weights set; teacher dynamics **not** nudged. |
 | `load_model_from_checkpoint` | Rebuilds **`VectorizedWindowDynamics`** when **`dynamics.mhd.*`** in state dict; tolerates missing **`energy_heads`**, **`wave_interaction`**, **`readout_fusion`**; broadcasts legacy **`energy_head.*`** into every **`energy_heads[i]`**. |
 | `generate` | **`forward_training_window` → `readout_window_logits` / `effective_temperature`**. |
 
@@ -244,7 +244,7 @@ Full model with explicit fast/slow timescale split. Used as the architectural re
 | A tokenizer | `AttractorTokenizer.encode`, `AttractorTokenizer.decode` |
 | B vectorize | `MultiHeadDynamics.forward`, `MultiHeadDynamics.drift` |
 | C cache | Internal `fast_state` / `slow_memory` tensors from `sandbox.py` |
-| D data | `AttractorDataPipeline` (wave D) feeding `trajectory_contrastive_loss_and_logits` |
+| D data | `AttractorDataPipeline` (3-tuple batches, optional `train_target_states`) feeding `trajectory_contrastive_loss_and_logits` |
 | E shim | `TSCore.add_node`, `TSCore.propagate_wave`, `TSCore.factory_evolve` |
 | F memory | `memory_tick`, `MemoryState`, `ACTIVE_THRESHOLD` / `DORMANT_THRESHOLD` |
 | G serve | `TSCore` sidecar in `inference_server.py` |

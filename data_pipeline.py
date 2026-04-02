@@ -7,8 +7,9 @@ streaming DataLoader that:
   1. Accepts any iterable of JSONL / plain-text / corpus files (or directories).
   2. Tokenises each line lazily (word-list or tiktoken via wave_a_tokenizer).
   3. Builds sliding-window (context, target) pairs on-the-fly.
-  4. Yields mini-batches of (contexts, targets) compatible with
-     model.trajectory_contrastive_loss_and_logits(contexts, targets).
+  4. Yields mini-batches of (contexts, targets, target_state_batch) compatible with
+     model.trajectory_contrastive_loss_and_logits(..., target_states=...).
+     The third element is None unless ``train_target_states`` is set on the pipeline.
   5. Supports multi-shard round-robin by holding one file handle per shard.
 
 Usage
@@ -25,8 +26,10 @@ Usage
     )
 
     for epoch in range(NUM_EPOCHS):
-        for contexts, targets in pipe.epoch_batches(epoch_index=0):
-            loss, _ = model.trajectory_contrastive_loss_and_logits(contexts, targets)
+        for contexts, targets, tgt_states in pipe.epoch_batches(epoch_index=0):
+            loss, _ = model.trajectory_contrastive_loss_and_logits(
+                contexts, targets, target_states=tgt_states
+            )
             ...
 
 For single-machine operation (no Redis), shuffle_buffer controls in-memory
@@ -39,6 +42,8 @@ import random
 from collections import deque
 from pathlib import Path
 from typing import TYPE_CHECKING, Generator, Iterable, Optional
+
+import torch
 
 if TYPE_CHECKING:
     import sandbox as sb  # type: ignore[import]
@@ -158,6 +163,9 @@ class AttractorDataPipeline:
     shard_id / num_shards : for multi-worker data parallelism (each worker
         receives every num_shards-th file starting from shard_id)
     seed : random seed for shuffle
+    train_target_states : optional ``(n_windows, W, D)`` float tensor (CPU), one row per
+        sliding window in stream order (``start`` 0 .. len(tokens)-W-1), aligned with
+        ``epoch_batches`` window indexing.
     """
 
     def __init__(
@@ -170,6 +178,7 @@ class AttractorDataPipeline:
         tokenizer: Optional[object] = None,
         streaming_dataset: bool = True,
         train_token_ids: Optional[list[int]] = None,
+        train_target_states: Optional[torch.Tensor] = None,
         shard_id: int = 0,
         num_shards: int = 1,
         seed: int = 42,
@@ -224,6 +233,28 @@ class AttractorDataPipeline:
                     f"got {len(self._stream_tokens)}."
                 )
 
+        self._train_target_states: Optional[torch.Tensor] = None
+        if train_target_states is not None:
+            if self._stream_tokens is None:
+                raise ValueError(
+                    "train_target_states requires stream token mode (train_token_ids or "
+                    "streaming full-file encode), not line-only buffering."
+                )
+            n_win = len(self._stream_tokens) - self.window_size
+            ts = train_target_states
+            if not isinstance(ts, torch.Tensor):
+                ts = torch.as_tensor(ts, dtype=torch.float32)
+            else:
+                ts = ts.to(dtype=torch.float32)
+            Wm = self.window_size
+            Dm = int(model.state_dim)
+            if ts.dim() != 3 or ts.shape[0] != n_win or ts.shape[1] != Wm or ts.shape[2] != Dm:
+                raise ValueError(
+                    "train_target_states must have shape "
+                    f"(n_windows, W, D)=({n_win}, {Wm}, {Dm}); got {tuple(ts.shape)}"
+                )
+            self._train_target_states = ts.detach().cpu().contiguous()
+
     # ------------------------------------------------------------------
     def _num_stream_windows(self) -> int:
         assert self._stream_tokens is not None
@@ -243,9 +274,15 @@ class AttractorDataPipeline:
     def epoch_batches(
         self,
         epoch_index: int = 0,
-    ) -> Generator[tuple[list[list[int]], list[int]], None, None]:
+    ) -> Generator[
+        tuple[list[list[int]], list[int], Optional[torch.Tensor]], None, None
+    ]:
         """
-        Yield (contexts, targets) mini-batches for one epoch.
+        Yield (contexts, targets, target_states_batch) mini-batches for one epoch.
+
+        ``target_states_batch`` is ``None`` unless ``train_target_states`` was passed at
+        construction; then it is ``(B, W, D)`` float CPU for the same window indices as
+        ``contexts``.
 
         Stream mode: shuffles window start indices, then batches. Uses
         ``random.Random(self.seed + epoch_index)`` so each epoch gets a
@@ -282,7 +319,7 @@ class AttractorDataPipeline:
                     chunk = chunk * 2
                 contexts = [c for c, _t in chunk]
                 targets = [_t for _c, _t in chunk]
-                yield contexts, targets
+                yield contexts, targets, None
 
             buf_list = []
             _fill(self.shuffle_buffer)
@@ -291,7 +328,9 @@ class AttractorDataPipeline:
 
     def _epoch_batches_stream(
         self, *, epoch_index: int = 0
-    ) -> Generator[tuple[list[list[int]], list[int]], None, None]:
+    ) -> Generator[
+        tuple[list[list[int]], list[int], Optional[torch.Tensor]], None, None
+    ]:
         """One full pass over all sliding windows with shuffled order."""
         rng = random.Random(self.seed + int(epoch_index))
         toks = self._stream_tokens
@@ -303,14 +342,21 @@ class AttractorDataPipeline:
         idxs = list(range(n_win))
         rng.shuffle(idxs)
         bs = self.batch_size
+        ts_all = self._train_target_states
         for i in range(0, len(idxs), bs):
             batch_i = idxs[i : i + bs]
             contexts = [toks[j : j + W] for j in batch_i]
             targets = [toks[j + W] for j in batch_i]
+            ts_batch: Optional[torch.Tensor] = None
+            if ts_all is not None:
+                bi = torch.as_tensor(batch_i, dtype=torch.long)
+                ts_batch = ts_all[bi].clone()
             if len(contexts) < 2:
                 contexts = contexts * 2
                 targets = targets * 2
-            yield contexts, targets
+                if ts_batch is not None:
+                    ts_batch = ts_batch.repeat(2, 1, 1)
+            yield contexts, targets, ts_batch
 
     def epoch_count_estimate(self) -> int:
         """Approximate batches per epoch."""
@@ -356,7 +402,7 @@ if __name__ == "__main__":
 
     count = 0
     total_contexts = 0
-    for contexts, targets in pipe.epoch_batches(epoch_index=0):
+    for contexts, targets, _ts in pipe.epoch_batches(epoch_index=0):
         assert len(contexts) == len(targets), "contexts/targets length mismatch"
         assert len(contexts) >= 2, "batch too small for trajectory contrastive loss"
         total_contexts += len(contexts)

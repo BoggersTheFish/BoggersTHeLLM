@@ -39,7 +39,7 @@ For runs on a **public or large text corpus** (Hugging Face TinyStories / FineWe
 |--------|--------|
 | **train_ce** (CSV / log) | Mean **per-batch** CE on `readout_window` logits vs targets during training (trajectory mode). **Not** the same as `val_ce`. |
 | **val_ce** (CSV / log) | Held-out **`mean_cross_entropy_eval`**. It now runs in batches through `embed_windows_batch -> run_window_dynamics -> readout_window` with the same eval-time shaping as training-side validation. **Ignore absolute value** when the val set is tiny; use trend after scale-up. **Val PPL** ≈ `exp(val_ce)`. |
-| **mean_loss** (last epoch) | With `--loss-mode trajectory` (default): full step objective (trajectory contrastive + token aux CE + readout aux weights). |
+| **mean_loss** (last epoch) | With `--loss-mode trajectory` (default): full step objective (trajectory contrastive + token aux CE + readout aux + optional **trajectory-guidance MSE** when precomputed batch targets are present and `--trajectory-guidance-mse-weight` > 0). |
 | **train_traj_contrast** | Trajectory contrastive loss on the **last training batch** of the epoch (diagnostic). |
 | **val_traj_contrast** | Mean trajectory contrastive loss over the **full validation** set (when val exists). |
 | **mean_final_T** | Mean window tension at the **last** adaptive dynamics step each epoch—track drift via `--epoch-metrics-csv`. |

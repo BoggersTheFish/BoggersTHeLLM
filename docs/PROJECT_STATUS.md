@@ -15,6 +15,7 @@ A **continuous attractor language model** without transformer attention: window 
 | Area | Status | Notes |
 |------|--------|--------|
 | **Streaming data + train/val split** | Stable | Token-level split, gap `W`, shuffled windows per epoch |
+| **Trajectory-guided supervision** | Optional | Precomputed **`(n_windows, W, D)`** on **`AttractorDataPipeline`**, batch nudge + MSE in **`trajectory_contrastive_loss_and_logits`**; CLI **`--trajectory-guidance-*`** (stream mode) |
 | **Batched embedding** | Stable | `embed_windows_batch` parity-tested vs stacked `embed_window` |
 | **Window dynamics** | Stable | Outer loop in `run_window_dynamics`; inner step is **energy descent** on sum of per-wave energies + optional λ·tension + anchor distance (not `dynamics.step`) |
 | **Multi-wave layout** | Stable | `D = num_waves × wave_dim`; contiguous wave blocks in `D` |
@@ -34,7 +35,7 @@ A **continuous attractor language model** without transformer attention: window 
 
 ## Gaps and risks
 
-1. **Documentation lag** — Older README sections may still mention `run_window_dynamics` calling `dynamics.step` every outer step; the **window** path is primarily **energy + coupling**. Token path uses `step` / `wave_dynamics`.
+1. **Documentation lag** — Older notes may still mention `run_window_dynamics` calling `dynamics.step` every outer step; the **window** path is primarily **energy + coupling**. Token path uses `step` / `wave_dynamics`. External tutorials must use the **3-tuple** `epoch_batches` API when copying pipeline examples.
 2. **Hyperparameter surface** — `num_waves`, `wave_interaction_strength`, `anchor_freeze_threshold`, `readout_fusion`, and per-wave energy heads multiply knobs; **re-baseline** after architectural toggles.
 3. **GPU performance** — Roadmap targets (batch &lt; 1 s, etc.) are **aspirational** until measured on your hardware; profile with `scripts/profile_training_step.py`.
 4. **Eval vs training** — `state_cache` / `readout(D)` is **not** training-parity decoding; use **`generate`** for real samples.

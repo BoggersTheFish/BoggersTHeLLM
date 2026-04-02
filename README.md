@@ -309,7 +309,7 @@ python3 sandbox.py --corpus data/generated.txt
 
 **Global seed.** `--seed` seeds Python’s `random` module at process start.
 
-**Per-epoch batch order (stream mode).** `AttractorDataPipeline.epoch_batches(epoch_index=epoch)` uses `random.Random(seed + epoch_index)` to shuffle window start indices. Fixing `--seed` fixes the entire sequence of batch orders across epochs; changing the epoch index changes the shuffle, so epochs are not identical copies of the same ordering.
+**Per-epoch batch order (stream mode).** `AttractorDataPipeline.epoch_batches(epoch_index=epoch)` uses `random.Random(seed + epoch_index)` to shuffle window start indices. Each yield is a **3-tuple** `(contexts, targets, target_states_batch)`: the third element is `None` unless the pipeline was constructed with precomputed **`train_target_states`** (trajectory-guided training). Fixing `--seed` fixes the entire sequence of batch orders across epochs; changing the epoch index changes the shuffle, so epochs are not identical copies of the same ordering.
 
 **No stream duplication.** Training does not multiply the train token list by `epoch_copies` in stream mode; multiple passes are real epochs over reshuffled windows.
 
@@ -456,6 +456,8 @@ text = generate_with_cache(model, cache, prompt="the cat sat", max_tokens=30)
 
 - **Stream mode (default):** the corpus is read as **full text** (whole `.txt` files; `.jsonl` records concatenated), then `tokenizer.encode(full_text)` produces **one continuous token sequence**. Sliding windows `(context, target)` use `tokens[i : i+W]` → target `tokens[i+W]`. Each epoch shuffles all window start indices, then batches.
 - **`train_token_ids=`** — sandbox passes the train split after **token-level** train/val cut with a **gap of `window_size` tokens** between train and val so no sliding window shares context across the split.
+- **`train_target_states=`** — optional **`(n_windows, W, D)`** float tensor on CPU, one row per sliding window in **stream order** (window starting at token index `j` for `j = 0 … len(tokens)−W−1`). When set, `epoch_batches` yields **`(contexts, targets, batch_targets)`** with **`batch_targets`** shaped **`(B, W, D)`** aligned to the same shuffled window indices as **`contexts`**. Line-based mode does not support this field (third tuple element is always `None`).
+- **Trajectory guidance (sandbox CLI):** in **stream** training, you can precompute targets with **`--trajectory-guidance-from-embed`** or load **`--trajectory-guidance-states PATH.pt`**, then set **`--trajectory-guidance-nudge-scale`** (per–outer-step nudge in `run_window_dynamics`) and/or **`--trajectory-guidance-mse-weight`** (MSE term in the trajectory loss). See [Training objective](#training-objective).
 - **Shuffle:** `epoch_batches(epoch_index=epoch)` uses `Random(seed + epoch_index)` so each epoch has a **deterministic but different** batch order (reproducible runs).
 - **Stream mode** ignores **`--epoch-copies`** (use **`--max-epochs`** instead); duplicating the token stream is not applied.
 - **Legacy line mode:** `streaming_dataset=False` keeps per-line encoding (short lines dropped); `shuffle_buffer` refills between batch groups.
@@ -469,8 +471,11 @@ from data_pipeline import AttractorDataPipeline
 pipe = AttractorDataPipeline(
     sources=["data/corpus.txt"], model=model, batch_size=16, streaming_dataset=True
 )
-for contexts, targets in pipe.epoch_batches():
-    loss, _ = model.trajectory_contrastive_loss_and_logits(contexts, targets)
+for contexts, targets, target_states in pipe.epoch_batches():
+    # target_states is None unless train_target_states= was passed to AttractorDataPipeline
+    loss, _ = model.trajectory_contrastive_loss_and_logits(
+        contexts, targets, target_states=target_states
+    )
 ```
 
 ### Wave E — TS-OS integration shim
@@ -555,6 +560,7 @@ Configuration: **`Phase05Config`** in `phase05_config.py`, passed to **`TorchAtt
 - **`--phase05-adaptive-window-dt`**: EMA-scaled positional timestep from window tension.
 - **`--phase05-tension-w w1,w2,w3`**: override weights in `T_total = w1·T_energy + w2·T_align + w3·T_entropy`.
 - **`--phase05-multi-negative` / `--phase05-num-negatives` / `--phase05-traj-temperature`**: trajectory contrastive negatives and temperature.
+- **Trajectory-guided targets** (also configured via **`Phase05Config`**): **`--trajectory-guidance-nudge-scale`** and **`--trajectory-guidance-mse-weight`** act when the data pipeline supplies precomputed **`train_target_states`**; see [Wave D](#wave-d--data-pipeline) and [CLI reference](#cli-reference).
 
 ### Phase 1 — Multi-head diffusion and window interaction
 
@@ -608,11 +614,16 @@ wids = model.window_ids_from_sequence(token_ids)
 S = model.embed_window(wids)  # (W, D)
 # Batched: context_tensor (B, W) long -> (B, W, D), equivalent to stacking embed_window rows
 # S_b = model.embed_windows_batch(context_tensor)
-S, logs = model.run_window_dynamics(S, context_ids=wids)  # GOAT uses token ids if enabled
+S, logs, _ = model.run_window_dynamics(S, context_ids=wids)  # GOAT uses token ids if enabled
+# Optional trajectory guidance: target_states (B, W, D) same shape as batched S;
+# nudge each outer step when phase05 trajectory_guidance_nudge_scale > 0
+# S, _, _ = model.run_window_dynamics(S_b, context_ids=contexts, target_states=targets_tensor)
 train_logits = model.readout_window_logits(S)  # primary training readout (optional fusion)
 
-# Batched trajectory contrastive loss
-loss, logits = model.trajectory_contrastive_loss_and_logits(contexts, targets)
+# Batched trajectory contrastive loss (optional precomputed targets per window)
+loss, logits = model.trajectory_contrastive_loss_and_logits(
+    contexts, targets, target_states=maybe_precomputed_B_W_D
+)
 
 # Generation (readout_window_logits path)
 text = model.generate("the quick brown fox", max_tokens=40)
@@ -631,7 +642,7 @@ sb.compare_prompts(model, "cats eat fish", "fish eat cats")
 Default: **trajectory contrastive loss** with optional auxiliary terms.
 
 ```
-L = L_traj + w_token · L_token_aux + α · L_readout_aux
+L = L_traj + w_token · L_token_aux + α · L_readout_aux + w_guide · L_traj_mse + …
 
 L_traj = mean(ReLU(0.2 − cos(pred, teacher) + cos(pred, negative)))
   pred   = evolved(context window)
@@ -640,6 +651,12 @@ L_traj = mean(ReLU(0.2 − cos(pred, teacher) + cos(pred, negative)))
 
 L_token_aux = CE on readout_window_logits(pred window) vs target  (--token-aux-ce, default 0.2)
 L_readout_aux = CE on readout(final token row of pred) vs target     (--readout-aux-alpha, default 0.15)
+
+L_traj_mse = MSE(pred, T)  when batch target states T (B, W, D) are provided and
+  --trajectory-guidance-mse-weight > 0  (Phase05Config.trajectory_guidance_mse_weight).
+  During evolution, each outer step can apply  S ← S + β (T.detach() − S)  before coupling
+  / energy descent when  --trajectory-guidance-nudge-scale β > 0  and T is passed into
+  run_window_dynamics / trajectory_contrastive_loss_and_logits. Teacher path is not nudged.
 ```
 
 **Primary next-token signal:** **`readout_window_logits(S)`** → **`readout_window`** (training + **`model.generate`**). Avoid calling **`readout_window`** alone if **`--readout-fusion`** is enabled. The single-vector **`readout`** head is for aux loss (**`--readout-aux-alpha`**), tension entropy, and legacy **`next_token_logits`** / **`state_cache`** — not the default decoding path. Use `--loss-mode ce` for classic next-token CE only.
@@ -693,6 +710,12 @@ Training:
   --min-attractor-steps INT  Minimum outer steps before early exit may trigger (default: 2, ≥2)
   --trajectory-batch-size INT  Batch size for trajectory mode (default: 64, need ≥2)
   --loss-mode {trajectory,ce}
+  --trajectory-intermediate-ce-weight W   Add W * mean CE over outer dynamics steps (default: 0)
+  --trajectory-guidance-nudge-scale BETA  Per outer step: S <- S + beta * (T - S) when batch targets T exist (default: 0)
+  --trajectory-guidance-mse-weight W      Add W * MSE(S_pred, T) when batch targets T exist (default: 0)
+  --trajectory-guidance-states PATH.pt    Load [n_train_windows, W, D] aligned with stream windows (mutually exclusive with from-embed)
+  --trajectory-guidance-from-embed        Precompute T from token embeddings (stream training only)
+  --trajectory-guidance-embed-batch-size N  Batch size for from-embed precompute (default: 256)
   --token-aux-ce FLOAT       Aux CE on readout_window_logits path in trajectory mode (default: 0.2)
   --readout-aux-alpha FLOAT  Aux CE on single-state readout (default: 0.15; 0 = off)
   --grad-clip FLOAT          Optional global grad-norm clip (default: off)

@@ -1421,6 +1421,7 @@ class TorchAttractorLanguageModel(nn.Module):
         collect_metrics: bool = False,
         record_tension_log: bool = True,
         context_ids: list[list[int]] | None = None,
+        target_states: torch.Tensor | None = None,
         *,
         convergence_epsilon: float | None = None,
         min_attractor_steps: int | None = None,
@@ -1436,6 +1437,10 @@ class TorchAttractorLanguageModel(nn.Module):
 
         context_ids: list of per-batch token ID windows (B × W) used to compute
         GOAT activation bonuses inside each dynamics step.
+
+        target_states: optional ``(B, W, D)`` same layout as batched ``S`` (after any batch
+        unsqueeze). When set and ``phase05_config.trajectory_guidance_nudge_scale > 0``, each
+        outer step applies ``S <- S + β * (T.detach() - S)`` before coupling and energy descent.
 
         Optional early exit (after ``min_attractor_steps``): if ``convergence_epsilon > 0``,
         stop when the batch-mean window potential (``_window_energy_per_batch_row``) changes
@@ -1460,7 +1465,15 @@ class TorchAttractorLanguageModel(nn.Module):
             # Wrap single window in a batch list so _single_window_step can index it.
             if context_ids is not None and len(context_ids) > 0 and not isinstance(context_ids[0], list):
                 context_ids = [context_ids]  # type: ignore[list-item]
+            if target_states is not None and target_states.dim() == 2:
+                target_states = target_states.unsqueeze(0)
         B, W, D = S.shape
+        if target_states is not None:
+            if target_states.shape != S.shape:
+                raise ValueError(
+                    f"target_states shape {tuple(target_states.shape)} must match state "
+                    f"{tuple(S.shape)}"
+                )
         assert W == self.train_window_size
         self._last_energy_descent_base = None
         self._last_energy_descent_tension = None
@@ -1565,9 +1578,13 @@ class TorchAttractorLanguageModel(nn.Module):
         _acc_ff_mean = 0.0
         _acc_ff_std = 0.0
         _n_ff = 0
+        _guide_beta = float(self.phase05_config.trajectory_guidance_nudge_scale)
         for step in range(self.max_window_steps):
             steps_used = step + 1
             S_prev_outer = S
+            if target_states is not None and _guide_beta > 0.0:
+                ts_n = target_states.to(device=S.device, dtype=S.dtype)
+                S = S + _guide_beta * (ts_n.detach() - S)
             S0 = S.detach().clone() if collect_metrics else None
             S = self._single_window_step(
                 S,
@@ -2103,6 +2120,7 @@ class TorchAttractorLanguageModel(nn.Module):
         targets: list[int],
         teacher_steps: int | None = None,
         update_repulsion_memory: bool = True,
+        target_states: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Batched trajectory contrastive loss + readout logits from pred state.
@@ -2116,6 +2134,11 @@ class TorchAttractorLanguageModel(nn.Module):
 
         With ``anchor_contrastive_weight > 0``, adds contrastive anchor loss on ``S_pred[:, -1, :]``
         vs the target token embedding and random negative embeddings (see :meth:`anchor_contrastive_loss`).
+
+        ``target_states``: optional ``(B, W, D)`` precomputed trajectory targets (same device/dtype
+        as embeddings). Used for nudging inside :meth:`run_window_dynamics` when
+        ``trajectory_guidance_nudge_scale > 0``, and for ``trajectory_guidance_mse_weight * MSE``
+        vs ``S_pred`` when that weight is positive.
         """
         B = len(contexts)
         assert B == len(targets) and B >= 1
@@ -2130,12 +2153,25 @@ class TorchAttractorLanguageModel(nn.Module):
         context_tensor = torch.as_tensor(contexts, dtype=torch.long, device=device)
         targets_tensor_tj = torch.as_tensor(targets, dtype=torch.long, device=device)
         w_ce = float(self.phase05_config.trajectory_intermediate_ce_weight)
+        w_tg = float(self.phase05_config.trajectory_guidance_mse_weight)
+        beta = float(self.phase05_config.trajectory_guidance_nudge_scale)
+        ts_dyn: torch.Tensor | None = None
+        if target_states is not None:
+            ts_dyn = target_states.to(device=device, dtype=self.embedder.weight.dtype)
+            if ts_dyn.shape != (B, self.train_window_size, self.state_dim):
+                raise ValueError(
+                    f"target_states must be (B, W, D)=({B}, {self.train_window_size}, "
+                    f"{self.state_dim}), got {tuple(ts_dyn.shape)}"
+                )
+            if beta <= 0.0:
+                ts_dyn = None
         S_pred = self.embed_windows_batch(context_tensor)
         S_pred, _, states_pred = self.run_window_dynamics(
             S_pred,
             collect_metrics=False,
             record_tension_log=True,
             context_ids=contexts,
+            target_states=ts_dyn,
             return_intermediate_states=(w_ce > 0.0),
         )
         al_cfg = float(self.phase05_config.anchor_lambda)
@@ -2217,6 +2253,14 @@ class TorchAttractorLanguageModel(nn.Module):
         w_er = float(self.phase05_config.energy_reg_weight)
         if w_er != 0.0:
             loss_traj = loss_traj + w_er * energy_reg
+        traj_mse: torch.Tensor | None = None
+        if w_tg > 0.0 and target_states is not None:
+            ts_m = target_states.to(device=S_pred.device, dtype=S_pred.dtype)
+            traj_mse = F.mse_loss(S_pred, ts_m.detach())
+            loss_traj = loss_traj + w_tg * traj_mse
+        self._phase05_traj_guidance_mse = (
+            float(traj_mse.detach().item()) if traj_mse is not None else float("nan")
+        )
         w_ac = float(self.phase05_config.anchor_contrastive_weight)
         anchor_contrast: torch.Tensor | None = None
         if w_ac != 0.0:
@@ -3281,6 +3325,46 @@ def mean_cross_entropy_eval(
 
 
 @torch.no_grad()
+def precompute_stream_target_states_embed(
+    model: TorchAttractorLanguageModel,
+    train_token_ids: list[int],
+    window_size: int,
+    *,
+    device: torch.device,
+    embed_batch_size: int = 256,
+) -> torch.Tensor:
+    """
+    One target row per sliding window start ``j`` in ``train_token_ids``: embed
+    ``ids[j : j + W]`` via :meth:`TorchAttractorLanguageModel.embed_windows_batch`.
+
+    Returns ``(n_windows, W, D)`` float32 CPU.
+    """
+    W = window_size
+    toks = train_token_ids
+    n_win = len(toks) - W
+    D = model.state_dim
+    if n_win <= 0:
+        return torch.empty((0, W, D), dtype=torch.float32)
+    was_training = model.training
+    model.eval()
+    outs: list[torch.Tensor] = []
+    bs = max(1, int(embed_batch_size))
+    try:
+        rows: list[list[int]] = []
+        for j in range(n_win):
+            rows.append(toks[j : j + W])
+            if len(rows) >= bs or j == n_win - 1:
+                ct = torch.tensor(rows, dtype=torch.long, device=device)
+                emb = model.embed_windows_batch(ct)
+                outs.append(emb.detach().float().cpu())
+                rows = []
+    finally:
+        if was_training:
+            model.train()
+    return torch.cat(outs, dim=0)
+
+
+@torch.no_grad()
 def mean_trajectory_contrastive_eval(
     model: TorchAttractorLanguageModel,
     dataset: list,
@@ -3700,6 +3784,12 @@ def phase05_config_from_args(args: argparse.Namespace) -> Phase05Config:
         trajectory_intermediate_ce_weight=float(
             getattr(args, "trajectory_intermediate_ce_weight", 0.0)
         ),
+        trajectory_guidance_nudge_scale=float(
+            getattr(args, "trajectory_guidance_nudge_scale", 0.0)
+        ),
+        trajectory_guidance_mse_weight=float(
+            getattr(args, "trajectory_guidance_mse_weight", 0.0)
+        ),
         enable_state_normalization=not bool(
             getattr(args, "disable_state_normalization", False)
         ),
@@ -3832,6 +3922,41 @@ def main() -> None:
         dest="trajectory_intermediate_ce_weight",
         metavar="W",
         help="trajectory mode: add W * mean(CE per outer dynamics step) to trajectory loss.",
+    )
+    parser.add_argument(
+        "--trajectory-guidance-nudge-scale",
+        type=float,
+        default=0.0,
+        dest="trajectory_guidance_nudge_scale",
+        metavar="BETA",
+        help="trajectory mode: each outer step S <- S + beta * (target - S) before dynamics "
+        "(requires precomputed batch target_states from pipeline). 0 = off.",
+    )
+    parser.add_argument(
+        "--trajectory-guidance-mse-weight",
+        type=float,
+        default=0.0,
+        dest="trajectory_guidance_mse_weight",
+        metavar="W",
+        help="trajectory mode: add W * MSE(S_pred, target_states) when targets are in the batch.",
+    )
+    parser.add_argument(
+        "--trajectory-guidance-states",
+        type=Path,
+        default=None,
+        help="Optional .pt tensor [n_train_windows, W, D] aligned with stream sliding windows.",
+    )
+    parser.add_argument(
+        "--trajectory-guidance-from-embed",
+        action="store_true",
+        help="Precompute target states from current token embeddings (stream pipeline only).",
+    )
+    parser.add_argument(
+        "--trajectory-guidance-embed-batch-size",
+        type=int,
+        default=256,
+        metavar="N",
+        help="Batch size when building targets with --trajectory-guidance-from-embed.",
     )
     parser.add_argument("--lr", type=float, default=0.001)
     parser.add_argument(
@@ -4619,6 +4744,55 @@ def main() -> None:
         _tmp_f.close()
         _tmp_train_path = Path(_tmp_f.name)
 
+    train_guidance_tensor: torch.Tensor | None = None
+    if streaming_dataset and stream_train_ids is not None:
+        tg_path = getattr(args, "trajectory_guidance_states", None)
+        tg_embed = bool(getattr(args, "trajectory_guidance_from_embed", False))
+        if tg_path is not None and tg_embed:
+            raise SystemExit(
+                "Use only one of --trajectory-guidance-states and --trajectory-guidance-from-embed."
+            )
+        n_win_exp = max(0, len(stream_train_ids) - window_size)
+        Wm, Dm = window_size, int(model.state_dim)
+        if tg_path is not None:
+            if not tg_path.is_file():
+                raise SystemExit(f"--trajectory-guidance-states not found: {tg_path}")
+            try:
+                loaded = torch.load(tg_path, map_location="cpu", weights_only=True)
+            except TypeError:
+                loaded = torch.load(tg_path, map_location="cpu")
+            ts = loaded if isinstance(loaded, torch.Tensor) else torch.as_tensor(
+                loaded, dtype=torch.float32
+            )
+            ts = ts.to(dtype=torch.float32).contiguous()
+            if ts.dim() != 3 or ts.shape[0] != n_win_exp or ts.shape[1] != Wm or ts.shape[2] != Dm:
+                raise SystemExit(
+                    f"--trajectory-guidance-states: expected shape ({n_win_exp}, {Wm}, {Dm}), "
+                    f"got {tuple(ts.shape)}"
+                )
+            train_guidance_tensor = ts
+            print(
+                f"Loaded trajectory guidance tensor {tuple(train_guidance_tensor.shape)} from {tg_path}",
+                flush=True,
+            )
+        elif tg_embed:
+            if n_win_exp <= 0:
+                raise SystemExit(
+                    "--trajectory-guidance-from-embed: no training windows (corpus too short)."
+                )
+            eb = max(1, int(getattr(args, "trajectory_guidance_embed_batch_size", 256)))
+            train_guidance_tensor = precompute_stream_target_states_embed(
+                model,
+                stream_train_ids,
+                window_size,
+                device=device,
+                embed_batch_size=eb,
+            )
+            print(
+                f"Precomputed trajectory guidance targets embed: shape={tuple(train_guidance_tensor.shape)}",
+                flush=True,
+            )
+
     pipeline = None
     try:
         from data_pipeline import AttractorDataPipeline  # type: ignore[import]
@@ -4633,6 +4807,7 @@ def main() -> None:
                 seed=args.seed,
                 streaming_dataset=True,
                 train_token_ids=stream_train_ids,
+                train_target_states=train_guidance_tensor,
             )
         else:
             assert _tmp_train_path is not None
@@ -4650,6 +4825,18 @@ def main() -> None:
         print(
             f"Warning: data pipeline unavailable ({_pipe_err}), "
             "falling back to legacy in-memory loader.",
+            flush=True,
+        )
+
+    _tg_mse = float(model.phase05_config.trajectory_guidance_mse_weight)
+    _tg_nudge = float(model.phase05_config.trajectory_guidance_nudge_scale)
+    if (_tg_mse > 0.0 or _tg_nudge > 0.0) and (
+        pipeline is None or getattr(pipeline, "_train_target_states", None) is None
+    ):
+        print(
+            "Warning: trajectory guidance MSE/nudge weights are > 0 but the data pipeline has "
+            "no train_target_states — guidance is inactive. Use stream mode with "
+            "--trajectory-guidance-from-embed or --trajectory-guidance-states PATH.pt.",
             flush=True,
         )
 
@@ -4760,7 +4947,7 @@ def main() -> None:
                     chunk = legacy_dataset[_start : _start + _bs]
                     if len(chunk) < 2:
                         chunk = chunk * 2
-                    yield [c for c, _ in chunk], [t for _, t in chunk]
+                    yield [c for c, _ in chunk], [t for _, t in chunk], None
 
             batch_iter = _legacy_batch_iter()
             n_est = max(1, (len(legacy_dataset) + _bs - 1) // _bs)
@@ -4784,9 +4971,10 @@ def main() -> None:
         # Last batch data for train_traj_contrast (Bug 3).
         _last_batch_contexts: list[list[int]] = []
         _last_batch_targets: list[int] = []
+        _last_batch_target_states: torch.Tensor | None = None
 
         if args.loss_mode == "trajectory":
-            for batch_idx, (contexts, targets) in tqdm(
+            for batch_idx, (contexts, targets, target_states_batch) in tqdm(
                 enumerate(batch_iter),
                 total=n_est,
                 desc=f"epoch {epoch + 1}/{num_epochs}",
@@ -4794,14 +4982,24 @@ def main() -> None:
                 if len(contexts) < 2:
                     contexts = contexts * 2
                     targets = targets * 2
+                    if target_states_batch is not None:
+                        target_states_batch = target_states_batch.repeat(2, 1, 1)
 
                 # Phase 3: targets tensor on device
                 targets_tensor = torch.tensor(targets, device=device, dtype=torch.long)
                 _last_batch_contexts = contexts
                 _last_batch_targets = targets
+                ts_b: torch.Tensor | None = None
+                if target_states_batch is not None:
+                    ts_b = target_states_batch.to(
+                        device=device, dtype=model.embedder.weight.dtype
+                    )
+                _last_batch_target_states = (
+                    ts_b.detach().cpu() if ts_b is not None else None
+                )
 
                 loss_traj, logits = model.trajectory_contrastive_loss_and_logits(
-                    contexts, targets
+                    contexts, targets, target_states=ts_b
                 )
                 loss = loss_traj
 
@@ -4963,7 +5161,7 @@ def main() -> None:
             n_windows = (batch_idx + 1) * traj_batch_size
 
         else:  # CE mode
-            for batch_idx, (contexts, targets) in tqdm(
+            for batch_idx, (contexts, targets, _tg_unused) in tqdm(
                 enumerate(batch_iter),
                 total=n_est,
                 desc=f"epoch {epoch + 1}/{num_epochs}",
@@ -5049,8 +5247,17 @@ def main() -> None:
                 with torch.no_grad():
                     _tc_contexts = [c for c, _ in _tc_data]
                     _tc_targets = [t for _, t in _tc_data]
+                    _ts_cpu = _last_batch_target_states
+                    _ts_eval = (
+                        _ts_cpu.to(device=device, dtype=model.embedder.weight.dtype)
+                        if _ts_cpu is not None
+                        else None
+                    )
                     _tl, _ = model.trajectory_contrastive_loss_and_logits(
-                        _tc_contexts, _tc_targets, update_repulsion_memory=False
+                        _tc_contexts,
+                        _tc_targets,
+                        update_repulsion_memory=False,
+                        target_states=_ts_eval,
                     )
                     train_traj_contrast = float(_tl.detach())
 

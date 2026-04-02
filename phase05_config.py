@@ -112,6 +112,19 @@ class Phase05Config:
     dynamics steps ``S_k`` (same target each step). 0 disables.
     """
 
+    trajectory_guidance_nudge_scale: float = 0.0
+    """
+    Each outer dynamics step, before coupling / energy descent:
+    ``S <- S + β * (T.detach() - S)`` when :meth:`~sandbox.TorchAttractorLanguageModel.run_window_dynamics`
+    receives ``target_states`` (same shape as ``S``). 0 disables nudging.
+    """
+
+    trajectory_guidance_mse_weight: float = 0.0
+    """
+    Trajectory training: add ``weight * MSE(S_pred, T.detach())`` when batch ``target_states``
+    are provided (typically precomputed ``(B, W, D)`` per window). 0 disables.
+    """
+
     enable_state_normalization: bool = True
     """
     If True, apply ``F.normalize(S, dim=-1)`` after each window dynamics step (and after
