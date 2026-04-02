@@ -1693,7 +1693,7 @@ class SimpleAttractorDynamics(nn.Module):
         N, dim = state_batch.shape
         H = self.num_heads
         if self.head_dim_mode == "split":
-            x = state_batch.view(N, H, self.dh)
+            x = state_batch.reshape(N, H, self.dh)
             drifts = torch.einsum("nhd,hde->nhe", x, self.diffusion_heads)
         else:
             drifts = torch.einsum("nd,hde->nhe", state_batch, self.diffusion_heads)
@@ -1706,7 +1706,7 @@ class SimpleAttractorDynamics(nn.Module):
             and dim % H == 0
         )
         if use_ht:
-            parts = state_batch.view(N, H, dim // H)
+            parts = state_batch.reshape(N, H, dim // H)
             T_h = parts.pow(2).mean(dim=-1)
             w = F.softmax(-T_h, dim=-1)
             self._last_head_weight_entropy = (
@@ -1755,7 +1755,7 @@ class SimpleAttractorDynamics(nn.Module):
 
     def forward(self, state, signal, noise_scale_mul=1.0):
         ns = self.noise_scale * noise_scale_mul
-        drift_lin = self.linear_drift(state.view(1, -1)).view(-1)
+        drift_lin = self.linear_drift(state.reshape(1, -1)).reshape(-1)
         c = state - state.mean()
         nonlinear = self.cubic_scale * torch.tanh(c)
         scaled_signal = self.signal_scale * signal
