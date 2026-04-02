@@ -49,6 +49,7 @@ def _build_model(
         train_window_size=window_size,
         max_window_steps=max_steps,
         convergence_epsilon=0.0,
+        num_waves=1,
         phase05=p05,
     )
     model = model.to(device)
@@ -79,7 +80,11 @@ def main() -> None:
     ap.add_argument("--warmup", type=int, default=2)
     ap.add_argument("--active", type=int, default=3, help="Profiled steps after warmup")
     ap.add_argument("--vectorized", action="store_true", default=True)
-    ap.add_argument("--simple-dynamics", action="store_true", help="Use SimpleAttractorDynamics")
+    ap.add_argument(
+        "--simple-dynamics",
+        action="store_true",
+        help="Disable VectorizedWindowDynamics; use per-wave WaveDynamics (token evolve path).",
+    )
     ap.add_argument("--report", type=Path, default=None, help="Write text summary here")
     args = ap.parse_args()
 

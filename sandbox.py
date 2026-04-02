@@ -160,9 +160,21 @@ PHASE05_BATCH_CSV_HEADER = [
     "phase2_head_weight_entropy",
     "phase2_interaction_reg_loss",
     "attractor_steps_used",
+    "attractor_steps_mean_lifetime",
     "final_window_tension_diag",
     "break_count_window",
     "convergence_triggered",
+    "energy_descent_base_mean",
+    "energy_descent_tension_mean",
+    "energy_descent_total_mean",
+    "energy_per_wave_means",
+    "energy_potential_mean",
+    "energy_reg_mean_sq",
+    "energy_reg_weighted",
+    "anchor_energy_mean",
+    "anchor_energy_std",
+    "frozen_fraction_mean",
+    "frozen_fraction_std",
 ]
 
 
@@ -209,6 +221,9 @@ class TorchAttractorLanguageModel(nn.Module):
         max_window_steps: int = MAX_WINDOW_STEPS,
         convergence_epsilon: float = 0.0,
         min_attractor_steps: int = 2,
+        num_waves: int = 8,
+        wave_interaction_strength: float = 0.05,
+        use_readout_fusion: bool = False,
         phase05: Phase05Config | None = None,
         phase1: Phase1Config | None = None,
         phase2: Phase2Config | None = None,
@@ -220,6 +235,12 @@ class TorchAttractorLanguageModel(nn.Module):
         self.register_buffer("_phase05_interaction_dt_scale", torch.tensor(1.0))
         self.vocab_size = vocab_size
         self.state_dim = state_dim
+        self.num_waves = max(1, int(num_waves))
+        if self.state_dim % self.num_waves != 0:
+            raise ValueError(
+                f"state_dim={self.state_dim} must be divisible by num_waves={self.num_waves}"
+            )
+        self.wave_dim = self.state_dim // self.num_waves
         self.train_window_size = train_window_size
         self.max_window_steps = max_window_steps
         # Early exit for window attractor (0 = disabled; see run_window_dynamics).
@@ -251,12 +272,18 @@ class TorchAttractorLanguageModel(nn.Module):
         self.register_buffer("generation_temperature", torch.tensor(float(generation_temperature)))
         # Context-dependent signal injection strength (trajectory sensitivity).
         self.register_buffer("signal_eps", torch.tensor(1e-6))
-        self.dynamics = SimpleAttractorDynamics(
-            state_dim,
-            enforce_negative_definite=self.phase05_config.enforce_negative_definite_diffusion,
-            phase1=self.phase1_config,
-            phase2=self.phase2_config,
+        self.wave_dynamics = nn.ModuleList(
+            [WaveDynamics(self.wave_dim) for _ in range(self.num_waves)]
         )
+        _wc = self.num_waves * self.wave_dim
+        self.wave_interaction = nn.Linear(_wc, _wc, bias=True)
+        nn.init.normal_(self.wave_interaction.weight, std=0.02)
+        nn.init.zeros_(self.wave_interaction.bias)
+        self.register_buffer(
+            "wave_interaction_strength",
+            torch.tensor(float(wave_interaction_strength)),
+        )
+        self.dynamics: nn.Module | None = None
         _w = train_window_size
         _tau = self.phase2_config.interaction_decay_tau
         if _tau is not None and _tau > 0:
@@ -278,9 +305,34 @@ class TorchAttractorLanguageModel(nn.Module):
         self.embedder = nn.Embedding(self.vocab_size, state_dim)
         self.norm = nn.LayerNorm(state_dim, elementwise_affine=False)
         self.readout = nn.Linear(self.state_dim, self.vocab_size, bias=False)
-        # Training: readout from full converged window tensor flattened (context interaction path).
+        # Training: W·D → V. Prefer :meth:`readout_window_logits` / :meth:`_readout_window_logits` so
+        # optional :attr:`readout_fusion` is applied; calling this layer alone skips fusion.
         self.readout_window = nn.Linear(
             train_window_size * state_dim, self.vocab_size, bias=False
+        )
+        self.use_readout_fusion = bool(use_readout_fusion)
+        if self.use_readout_fusion:
+            self.readout_fusion = nn.Linear(state_dim, state_dim, bias=True)
+            nn.init.xavier_uniform_(self.readout_fusion.weight)
+            nn.init.zeros_(self.readout_fusion.bias)
+        else:
+            self.readout_fusion = None
+        # One small MLP per wave: E_i = head_i(wave slice); total head energy = sum_i E_i (grad w.r.t. wave i only from E_i).
+        def _one_energy_head() -> nn.Sequential:
+            m = nn.Sequential(
+                nn.Linear(self.wave_dim, self.wave_dim),
+                nn.Tanh(),
+                nn.Linear(self.wave_dim, 1),
+            )
+            for _em in m.modules():
+                if isinstance(_em, nn.Linear):
+                    nn.init.xavier_uniform_(_em.weight)
+                    if _em.bias is not None:
+                        nn.init.zeros_(_em.bias)
+            return m
+
+        self.energy_heads = nn.ModuleList(
+            [_one_energy_head() for _ in range(self.num_waves)]
         )
         # Positional interaction strength (softplus > 0); left/right differ via |i−j|.
         self.position_gamma_raw = nn.Parameter(
@@ -352,12 +404,426 @@ class TorchAttractorLanguageModel(nn.Module):
         self._last_final_window_tension_diag: float = float("nan")
         self._last_window_break_count: int = 0
         self._last_convergence_triggered: bool = False
+        self._attractor_steps_cumulative_sum: float = 0.0
+        self._attractor_steps_cumulative_count: int = 0
+        # Last inner energy-descent step (updated when logging/metrics enabled).
+        self._last_energy_descent_base: float | None = None
+        self._last_energy_descent_tension: float | None = None
+        self._last_energy_descent_total: float | None = None
+        self._last_energy_descent_anchor_mean: float = float("nan")
+        self._last_energy_descent_anchor_std: float = float("nan")
+        # Mean per-wave scalar energy on last inner descent leaf (B,W averaged); set with record_metrics.
+        self._last_energy_descent_per_wave: list[float] | None = None
+        # Nearest-anchor stats on student ``S_pred`` (trajectory batch CSV).
+        self._phase05_anchor_energy_mean: float = float("nan")
+        self._phase05_anchor_energy_std: float = float("nan")
+        self._phase05_anchor_contrast_loss: float = float("nan")
+        # Per-batch window potential stats (``trajectory_contrastive_loss_and_logits``).
+        self._last_batch_energy_mean: float = float("nan")
+        self._last_batch_energy_variance: float = float("nan")
+        self._last_batch_energy_min: float = float("nan")
+        self._last_batch_energy_max: float = float("nan")
+        # Adaptive inner dt (shape (B,) during ``run_window_dynamics`` when enabled).
+        self._attractor_dt_per_batch: torch.Tensor | None = None
+        self._attractor_max_dt_per_batch: torch.Tensor | None = None
+        self._last_attractor_dt_curve: list[float] = []
+
+    def _reshape_waves_flat(self, S: torch.Tensor) -> torch.Tensor:
+        """``(B, W, D) -> (B * W * num_waves, wave_dim)`` (contiguous wave blocks in D)."""
+        B, W, D = S.shape
+        if D != self.state_dim:
+            raise ValueError(f"expected last dim {self.state_dim}, got {D}")
+        return S.reshape(B * W * self.num_waves, self.wave_dim)
+
+    def _window_coupling_flat(self, S: torch.Tensor) -> torch.Tensor:
+        """``(B, W, D) -> (B * num_waves, W, wave_dim)`` for per-wave positional coupling."""
+        B, W, D = S.shape
+        return S.reshape(B, W, self.num_waves, self.wave_dim).permute(0, 2, 1, 3).reshape(
+            B * self.num_waves, W, self.wave_dim
+        )
+
+    def _from_window_coupling_flat(self, Sfw: torch.Tensor, B: int) -> torch.Tensor:
+        """Inverse of :meth:`_window_coupling_flat`."""
+        nw, W, wd = self.num_waves, self.train_window_size, self.wave_dim
+        return Sfw.reshape(B, nw, W, wd).permute(0, 2, 1, 3).reshape(B, W, self.state_dim)
+
+    def _window_batch_full_state(self, S: torch.Tensor) -> torch.Tensor:
+        """
+        Normalize to ``(B, W, D)`` with ``W = train_window_size``, ``D = state_dim``.
+        Accepts single window ``(W, D)``, batched flat ``(B, W * D)``, or ``(B, W, D)``.
+        Wave channels are contiguous in ``D`` (same layout as dynamics / embedding).
+        """
+        Wm, Dtot = self.train_window_size, self.state_dim
+        if S.dim() == 2:
+            if S.shape[0] == Wm and S.shape[1] == Dtot:
+                return S.unsqueeze(0)
+            if S.shape[1] == Wm * Dtot:
+                B = S.shape[0]
+                return S.reshape(B, Wm, Dtot)
+            raise ValueError(
+                f"window state: expected ({Wm}, {Dtot}) or (B, {Wm * Dtot}), got {tuple(S.shape)}"
+            )
+        if S.dim() == 3:
+            if S.shape[1] != Wm or S.shape[2] != Dtot:
+                raise ValueError(
+                    f"window state: expected (B, {Wm}, {Dtot}), got {tuple(S.shape)}"
+                )
+            return S
+        raise ValueError(f"window state expects 2D or 3D tensor, got dim {S.dim()}")
+
+    def _readout_window_logits(self, S: torch.Tensor) -> torch.Tensor:
+        """
+        Full-window state (all wave channels in ``D``) → vocab logits ``(B, V)``.
+        Optional :attr:`readout_fusion` ``Linear(D, D)`` on the last dim per position, then
+        existing :attr:`readout_window` on ``flatten(B, W, D)``.
+        """
+        Sb = self._window_batch_full_state(S)
+        if self.readout_fusion is not None:
+            Sb = self.readout_fusion(Sb)
+        B = Sb.size(0)
+        return self.readout_window(
+            Sb.reshape(B, self.train_window_size * self.state_dim)
+        )
+
+    def readout_window_logits(self, S: torch.Tensor) -> torch.Tensor:
+        """Public alias for :meth:`_readout_window_logits` (training / inference parity)."""
+        return self._readout_window_logits(S)
+
+    def _per_wave_energy_scalars(self, S: torch.Tensor) -> torch.Tensor:
+        """
+        Per-wave scalar energy before summing: ``(B, W, num_waves)``.
+        ``[..., i] = energy_heads[i](S[..., i, :])`` — gradients from ``E_i`` hit only wave ``i``.
+        """
+        B, W, D = S.shape
+        if D != self.state_dim:
+            raise ValueError(f"expected state_dim {self.state_dim}, got {D}")
+        Sw = S.reshape(B, W, self.num_waves, self.wave_dim)
+        parts: list[torch.Tensor] = []
+        for i in range(self.num_waves):
+            xi = Sw[:, :, i, :].reshape(B * W, self.wave_dim)
+            ei = self.energy_heads[i](xi).view(B, W)
+            parts.append(ei)
+        return torch.stack(parts, dim=2)
+
+    def _wave_energy_head_per_batch_row(self, S: torch.Tensor) -> torch.Tensor:
+        """Per batch row: mean over window of total head energy ``sum_i E_i`` → ``(B,)``."""
+        ew = self._per_wave_energy_scalars(S)
+        total_bw = ew.sum(dim=2)
+        return total_bw.mean(dim=1)
+
+    def _wave_energy_head_global_mean(self, S: torch.Tensor) -> torch.Tensor:
+        """Scalar mean over (B, W) of ``sum_i E_i``."""
+        ew = self._per_wave_energy_scalars(S)
+        return ew.sum(dim=2).mean()
+
+    def _clamp_window_waves_norm(
+        self, S: torch.Tensor, floor: float, ceiling: float | None
+    ) -> torch.Tensor:
+        """L2 clamp on each ``(wave_dim,)`` sub-vector (per batch row, time, wave)."""
+        B, W, D = S.shape
+        Sfw = self._window_coupling_flat(S)
+        out = self._clamp_window_rows_norm(Sfw, floor, ceiling)
+        return self._from_window_coupling_flat(out, B)
+
+    def energy(self, window_states: torch.Tensor) -> torch.Tensor:
+        """
+        Total learned potential per window position: ``(B, W, D) -> (B, W, 1)``.
+        ``E = sum_i energy_heads[i](wave_i)`` (per-wave heads; gradient from ``E`` to wave ``i``
+        flows only through ``energy_heads[i]``).
+        """
+        if window_states.dim() != 3:
+            raise ValueError(f"energy expects (B, W, D), got shape {tuple(window_states.shape)}")
+        b, w, d = window_states.shape
+        if d != self.state_dim:
+            raise ValueError(f"energy: last dim {d} != state_dim {self.state_dim}")
+        ew = self._per_wave_energy_scalars(window_states)
+        return ew.sum(dim=2, keepdim=True)
+
+    def _dynamics_euler_dt(self) -> float:
+        """Step size used for window inner updates (matches previous ``dynamics.step`` Euler ``dt``)."""
+        d = self.dynamics
+        raw = getattr(d, "dt", None)
+        if raw is not None:
+            return float(raw.detach().item() if isinstance(raw, torch.Tensor) else raw)
+        mhd = getattr(d, "mhd", None)
+        if mhd is not None:
+            raw = getattr(mhd, "dt", None)
+            if raw is not None:
+                return float(raw.detach().item() if isinstance(raw, torch.Tensor) else raw)
+        return 0.09
+
+    def _readout_window_logits_for_anchors(self, S: torch.Tensor) -> torch.Tensor:
+        """``readout_window`` logits (B, V), temperature-scaled — same shaping as training readout."""
+        logits = self._readout_window_logits(S)
+        return torch.nan_to_num(
+            logits / self.effective_temperature(),
+            nan=0.0,
+            posinf=0.0,
+            neginf=-1e4,
+        )
+
+    def _window_anchor_candidate_embeds(self, S: torch.Tensor) -> torch.Tensor:
+        """
+        Per batch row, top-``k`` token rows from ``readout_window`` logits (embeddings detached).
+        Returns ``(B, k, D)`` with ``k = min(anchor_search_topk, V)``.
+        """
+        if S.dim() != 3:
+            raise ValueError(f"anchor candidates expect (B, W, D), got {tuple(S.shape)}")
+        B, W, D = S.shape
+        if W != self.train_window_size:
+            raise ValueError(
+                f"anchor candidates: W={W} != train_window_size={self.train_window_size}"
+            )
+        k = min(
+            max(1, int(self.phase05_config.anchor_search_topk)),
+            self.vocab_size,
+        )
+        logits = self._readout_window_logits_for_anchors(S)
+        _vals, topk_idx = logits.topk(k=k, dim=-1)
+        embed = self.embedder.weight.detach().to(device=S.device, dtype=S.dtype)
+        return embed[topk_idx]
+
+    def _window_anchor_nearest_among_candidates(
+        self, S: torch.Tensor, cand: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        ``S`` (B, W, D), ``cand`` (B, k, D) detached → min L2 distance (B, W) and nearest vector (B, W, D).
+        """
+        diff = S.unsqueeze(2) - cand.unsqueeze(1)
+        dist = torch.linalg.vector_norm(diff, dim=-1)
+        _min_d, argmin_k = dist.min(dim=2)
+        B, W = S.shape[0], S.shape[1]
+        b_ar = torch.arange(B, device=S.device, dtype=torch.long).unsqueeze(1).expand(B, W)
+        nearest_vec = cand[b_ar, argmin_k, :]
+        return _min_d, nearest_vec
+
+    def _apply_token_anchor_force(self, S: torch.Tensor) -> torch.Tensor:
+        """
+        Pull each (B, W) position toward the nearest **readout top-k** token embedding (detached).
+        ``S <- S - strength * (S - anchor[nearest])``. No-op when ``anchor_force_strength`` is 0.
+        """
+        fs = float(self.phase05_config.anchor_force_strength)
+        if fs == 0.0:
+            return S
+        if S.dim() != 3:
+            raise ValueError(f"anchor force expects (B, W, D), got {tuple(S.shape)}")
+        cand = self._window_anchor_candidate_embeds(S)
+        _d, nearest_vec = self._window_anchor_nearest_among_candidates(S, cand)
+        return S - fs * (S - nearest_vec)
+
+    def _window_anchor_nearest_distances(self, S: torch.Tensor) -> torch.Tensor:
+        """
+        Per position L2 distance to nearest **readout top-k** token embedding (anchors detached).
+        ``S``: (B, W, D) → ``(B, W)``.
+        """
+        if S.dim() != 3:
+            raise ValueError(f"anchor distances expect (B, W, D), got {tuple(S.shape)}")
+        cand = self._window_anchor_candidate_embeds(S)
+        min_dist, _ = self._window_anchor_nearest_among_candidates(S, cand)
+        return min_dist
+
+    def _window_anchor_nearest_distances_per_wave(self, S: torch.Tensor) -> torch.Tensor:
+        """
+        Per (batch, position, wave) L2 distance from ``S``'s wave slice to the nearest top-``k``
+        anchor's **same** wave slice (anchors detached). ``S``: ``(B, W, D)`` → ``(B, W, num_waves)``.
+        """
+        if S.dim() != 3:
+            raise ValueError(
+                f"per-wave anchor distances expect (B, W, D), got {tuple(S.shape)}"
+            )
+        B, W, D = S.shape
+        if D != self.state_dim:
+            raise ValueError(f"last dim {D} != state_dim {self.state_dim}")
+        cand = self._window_anchor_candidate_embeds(S)
+        nw, wd = self.num_waves, self.wave_dim
+        S_w = S.reshape(B, W, nw, wd)
+        C_w = cand.reshape(B, -1, nw, wd)
+        diff = S_w.unsqueeze(2) - C_w.unsqueeze(1)
+        dist_k = torch.linalg.vector_norm(diff, dim=-1)
+        nearest_dist, _ = dist_k.min(dim=2)
+        return nearest_dist
+
+    def _window_anchor_energy_per_batch_row(self, S: torch.Tensor) -> torch.Tensor:
+        """Mean nearest-anchor distance over window positions, per batch row: (B,)."""
+        return self._window_anchor_nearest_distances(S).mean(dim=1)
+
+    def _window_energy_per_batch_row(self, S: torch.Tensor) -> torch.Tensor:
+        """
+        Same potential as mean descent objective, reduced per batch row: (B,).
+        ``mean(rows)`` matches the scalar loss used for ``autograd.grad``.
+
+        ``E = e_head + λ·T + anchor_λ·anchor_energy_row`` (tension / anchor terms omitted when
+        their lambdas are 0).
+        """
+        lam = float(self.phase05_config.tension_lambda)
+        al = float(self.phase05_config.anchor_lambda)
+        e_head = self._wave_energy_head_per_batch_row(S)
+        out = e_head
+        if S.dim() == 3 and S.size(1) >= 2:
+            if lam != 0.0:
+                T = self.compute_tension_window(S)
+                lam_t = torch.as_tensor(lam, device=S.device, dtype=S.dtype)
+                out = out + lam_t * T
+        if al != 0.0:
+            ae = self._window_anchor_energy_per_batch_row(S)
+            al_t = torch.as_tensor(al, device=S.device, dtype=S.dtype)
+            out = out + al_t * ae
+        return out
+
+    @staticmethod
+    def _clamp_window_rows_norm(
+        S: torch.Tensor, floor: float, ceiling: float | None
+    ) -> torch.Tensor:
+        """Per-row L2 norm clamp on ``(B, W, D)`` (same idea as vectorized ``_clamp_norm``)."""
+        n = torch.linalg.vector_norm(S, dim=-1, keepdim=True)
+        out = S
+        if floor > 0:
+            out = torch.where(n < floor, out * (floor / (n + 1e-15)), out)
+            n = torch.linalg.vector_norm(out, dim=-1, keepdim=True)
+        if ceiling is not None:
+            out = torch.where(n > ceiling, out * (ceiling / n), out)
+        return out
+
+    def _window_energy_gradient_step(
+        self,
+        S_prep: torch.Tensor,
+        *,
+        record_metrics: bool = False,
+        attractor_dt_per_batch: torch.Tensor | None = None,
+        anchor_freeze_wave: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        One descent step: ``S <- S - dt * ∇_S E(S)`` with
+        ``E = mean(sum_i energy_heads[i](wave_i)) + λ * mean(T) + anchor_λ * mean(anchor_dist)``
+        where ``T`` is ``compute_tension_window`` (``λ = phase05_config.tension_lambda``, 0 off) and
+        anchor distances use detached ``embedder.weight`` (``anchor_lambda``, 0 off).
+        Uses a short inner graph each call to avoid unbounded backprop through time.
+
+        If ``attractor_dt_per_batch`` is a ``(B,)`` tensor, uses per-row ``dt`` and updates it
+        from energy before vs after the step (see ``phase05_config.enable_adaptive_attractor_dt``).
+
+        If ``anchor_freeze_wave`` is ``(B, W, num_waves)`` bool (``True`` = frozen), zero gradient
+        on the corresponding wave slices so only unstable slices receive ``-dt * grad`` updates.
+        """
+        B = S_prep.size(0)
+        grad_enabled = torch.is_grad_enabled()
+        use_adaptive = attractor_dt_per_batch is not None
+        lam = float(self.phase05_config.tension_lambda)
+
+        def _scalar_energy(st_leaf: torch.Tensor) -> torch.Tensor:
+            return self._window_energy_per_batch_row(st_leaf).mean()
+
+        def _run_step(st_leaf: torch.Tensor, *, create_graph: bool) -> torch.Tensor:
+            E_before = self._window_energy_per_batch_row(st_leaf).detach()
+            energy = _scalar_energy(st_leaf)
+            if record_metrics:
+                ew = self._per_wave_energy_scalars(st_leaf)
+                base_energy = ew.sum(dim=2).mean()
+                with torch.no_grad():
+                    pwm = ew.mean(dim=(0, 1))
+                    self._last_energy_descent_per_wave = [
+                        float(pwm[i].detach().item()) for i in range(self.num_waves)
+                    ]
+                if st_leaf.size(1) >= 2:
+                    tension = self.compute_tension_window(st_leaf).mean()
+                else:
+                    tension = st_leaf.new_zeros(())
+                self._last_energy_descent_base = float(base_energy.detach().item())
+                self._last_energy_descent_tension = (
+                    float(tension.detach().item())
+                    if st_leaf.size(1) >= 2
+                    else float("nan")
+                )
+                self._last_energy_descent_total = float(energy.detach().item())
+                al = float(self.phase05_config.anchor_lambda)
+                if al != 0.0:
+                    with torch.no_grad():
+                        nd = self._window_anchor_nearest_distances(st_leaf)
+                        ndf = nd.reshape(-1)
+                        self._last_energy_descent_anchor_mean = float(ndf.mean().item())
+                        self._last_energy_descent_anchor_std = float(
+                            ndf.std(unbiased=False).item()
+                        )
+                else:
+                    self._last_energy_descent_anchor_mean = float("nan")
+                    self._last_energy_descent_anchor_std = float("nan")
+            grad_st = torch.autograd.grad(
+                energy,
+                st_leaf,
+                create_graph=create_graph,
+                retain_graph=False,
+            )[0]
+            if anchor_freeze_wave is not None:
+                Ws = st_leaf.size(1)
+                m = (~anchor_freeze_wave).to(dtype=grad_st.dtype)
+                m = m.unsqueeze(-1).expand(B, Ws, self.num_waves, self.wave_dim).reshape(
+                    B, Ws, self.state_dim
+                )
+                grad_st = grad_st * m
+            if use_adaptive:
+                dt_b = attractor_dt_per_batch.view(B, 1, 1).to(
+                    device=st_leaf.device, dtype=st_leaf.dtype
+                )
+            else:
+                dt0 = self._dynamics_euler_dt()
+                dt_b = st_leaf.new_full((B, 1, 1), dt0, dtype=st_leaf.dtype)
+            S_raw = st_leaf - dt_b * grad_st
+            S_mid = torch.nan_to_num(S_raw, nan=0.0, posinf=0.0, neginf=0.0)
+            if use_adaptive or grad_enabled:
+                S_mid = self._clamp_window_waves_norm(S_mid, 1e-3, 12.0)
+            if use_adaptive:
+                cfg = self.phase05_config
+                max_d = self._attractor_max_dt_per_batch
+                if max_d is None:
+                    raise RuntimeError(
+                        "adaptive attractor dt requires _attractor_max_dt_per_batch"
+                    )
+                with torch.no_grad():
+                    E_after = self._window_energy_per_batch_row(S_mid)
+                    shrink = E_after > E_before
+                    rel = float(cfg.adaptive_attractor_energy_rel_thresh)
+                    decr = E_before - E_after
+                    grow = (~shrink) & (decr > rel * (torch.abs(E_before) + 1e-8))
+                    shrink_f = float(cfg.adaptive_attractor_dt_shrink)
+                    grow_f = float(cfg.adaptive_attractor_dt_grow)
+                    min_dt = float(cfg.adaptive_attractor_dt_min)
+                    new_dt = torch.where(
+                        shrink, attractor_dt_per_batch * shrink_f, attractor_dt_per_batch
+                    )
+                    new_dt = torch.where(
+                        grow,
+                        torch.minimum(attractor_dt_per_batch * grow_f, max_d),
+                        new_dt,
+                    )
+                    new_dt.clamp_(min=min_dt)
+                    attractor_dt_per_batch.copy_(new_dt)
+            return S_mid
+
+        if not grad_enabled:
+            st = S_prep.detach().requires_grad_(True)
+            with torch.enable_grad():
+                S_out = _run_step(st, create_graph=False)
+            if use_adaptive:
+                return S_out
+            return torch.nan_to_num(S_out, nan=0.0, posinf=0.0, neginf=0.0)
+
+        st = S_prep.detach().requires_grad_(True)
+        return _run_step(st, create_graph=True)
 
     def _window_row_cos_mean(self, X: torch.Tensor) -> torch.Tensor:
         """Mean cosine between consecutive window rows (B, W, D)."""
         if X.dim() != 3 or X.size(1) < 2:
             return X.new_zeros(())
         return F.cosine_similarity(X[:, 1:], X[:, :-1], dim=-1).mean()
+
+    def _normalize_window_state_if_enabled(self, S: torch.Tensor) -> torch.Tensor:
+        """L2-normalize each ``(wave_dim,)`` sub-vector when config enables it."""
+        if not self.phase05_config.enable_state_normalization:
+            return S
+        B, W, D = S.shape
+        Sw = S.reshape(B, W, self.num_waves, self.wave_dim)
+        Sw = F.normalize(Sw, dim=-1, eps=1e-12)
+        return Sw.reshape(B, W, D)
 
     def _phase2_break_alpha(self, t_mean: torch.Tensor) -> torch.Tensor:
         """Scalar α = base * clamp((T_tgt - T)/T_tgt, min, max); low T → larger α."""
@@ -647,6 +1113,38 @@ class TorchAttractorLanguageModel(nn.Module):
             slow_state = torch.zeros(self.state_dim, device=self.embedder.weight.device, dtype=self.embedder.weight.dtype)
         return fast_state, slow_state
 
+    def _wave_dynamics_evolve(
+        self,
+        fw: torch.Tensor,
+        sigw: torch.Tensor,
+        noise_scale_mul: float | torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply :class:`WaveDynamics` per channel; ``fw`` / ``sigw`` are ``(num_waves, wave_dim)``."""
+        outs: list[torch.Tensor] = []
+        for i in range(self.num_waves):
+            x = fw[i : i + 1].unsqueeze(0)
+            s = sigw[i : i + 1].unsqueeze(0)
+            y = self.wave_dynamics[i](x, s, noise_scale_mul=noise_scale_mul)
+            outs.append(y.squeeze(0))
+        return torch.cat(outs, dim=0)
+
+    def _apply_wave_cross_interaction(self, fw: torch.Tensor) -> torch.Tensor:
+        """
+        Weak mixing across wave channels after local dynamics.
+
+        ``interaction = linear(concat(waves))`` reshaped back to ``(num_waves, wave_dim)``,
+        then ``fw + wave_interaction_strength * interaction`` (gradients through Linear).
+        """
+        if fw.dim() != 2 or fw.shape[0] != self.num_waves or fw.shape[1] != self.wave_dim:
+            raise ValueError(
+                f"_apply_wave_cross_interaction expected ({self.num_waves}, {self.wave_dim}), "
+                f"got {tuple(fw.shape)}"
+            )
+        flat = fw.reshape(-1)
+        inter = self.wave_interaction(flat).view(self.num_waves, self.wave_dim)
+        alpha = self.wave_interaction_strength.to(device=fw.device, dtype=fw.dtype)
+        return fw + alpha * inter
+
     def evolve_token(self, fast_state, slow_state, signal, num_steps=None):
         """Tension-adaptive inner steps on fast_state, then slow memory; symplectic readout uses token start/end fast."""
         fast_state, slow_state = self._init_dual_state(fast_state, slow_state)
@@ -663,7 +1161,19 @@ class TorchAttractorLanguageModel(nn.Module):
             fast_before_dyn = fast_state
             t_prev = self._last_tension_val
             noise_mul = (1.0 + F.softplus(self.tension_noise_gain) * min(t_prev, 3.0)).detach()
-            fast_state = self.dynamics(fast_state, signal, noise_scale_mul=noise_mul)
+            fw = fast_state.view(self.num_waves, self.wave_dim)
+            sigw = signal.view(self.num_waves, self.wave_dim)
+            dyn = self.dynamics
+            if dyn is not None and getattr(dyn, "mhd", None) is not None:
+                fw_b = fw.unsqueeze(1)
+                sig_b = sigw.unsqueeze(1)
+                fw_out = dyn.step(fw_b, sig_b).squeeze(1)
+            elif dyn is not None:
+                fw_out = dyn.step(fw, sigw)
+            else:
+                fw_out = self._wave_dynamics_evolve(fw, sigw, noise_mul)
+            fw_out = self._apply_wave_cross_interaction(fw_out)
+            fast_state = fw_out.reshape(self.state_dim)
             logits_t = self._logits_for_tension(fast_state, slow_state)
             T, _de, _div, _H = self.compute_tension(
                 fast_state, slow_state, logits_t, prev_energy
@@ -799,8 +1309,7 @@ class TorchAttractorLanguageModel(nn.Module):
         cos = F.cosine_similarity(state[:, 1:], state[:, :-1], dim=-1)
         T_alignment = (1.0 - cos).mean(dim=1)
         if WINDOW_TENSION_USE_ENTROPY:
-            flat = state.reshape(state.size(0), -1)
-            logits = self.readout_window(flat)
+            logits = self._readout_window_logits(state)
             probs = F.softmax(logits, dim=-1)
             T_entropy = -(probs * torch.log(probs + 1e-9)).sum(dim=-1)
         else:
@@ -813,7 +1322,9 @@ class TorchAttractorLanguageModel(nn.Module):
         state: (B, W, D) normalized states
 
         Returns:
-            scalar tension per batch (B,)
+            scalar tension per batch (B,). Also enters window energy descent as
+            ``λ * mean(T)`` when ``phase05_config.tension_lambda`` is non-zero
+            (see :meth:`_window_energy_gradient_step`).
         """
         T, _, _, _ = self.compute_tension_window_components(state)
         return T
@@ -832,20 +1343,30 @@ class TorchAttractorLanguageModel(nn.Module):
         pos_wsum: torch.Tensor | None = None,
         C_masked: torch.Tensor | None = None,
         goat_bonus_vec: torch.Tensor | None = None,
+        log_energy_metrics: bool = False,
+        attractor_dt_per_batch: torch.Tensor | None = None,
+        anchor_freeze_wave: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """One coupling + relaxation step; S is (B, W, D).
 
-        Uses the unified dynamics.step() interface so both SimpleAttractorDynamics
-        and VectorizedWindowDynamics work without attribute access.
+        Positional coupling and optional GOAT signal are applied additively to the
+        state, then (if ``phase05_config.anchor_force_strength > 0``) each position
+        is pulled toward its nearest detached token embedding, then the window descends
+        the learned potential via ``S <- S - dt * ∇ E(S)`` with ``E`` from
+        :meth:`_window_energy_gradient_step`. Phase-1 global interaction runs after that step.
 
         If GOAT memory is active and context_tensor is provided (B, W) long), an
         activation-bonus signal is gathered on GPU (no per-step Python over B×W).
 
         Optional caches (fixed for one ``run_window_dynamics``): positional weights,
         Phase-1 ``C * mask``, GOAT ``(V,)`` bonus vector.
+
+        When ``phase05_config.enable_state_normalization`` is True, applies
+        ``F.normalize(S, dim=-1)`` before returning (differentiable).
         """
         B, W, D = S.shape
         assert W == self.train_window_size
+        assert D == self.state_dim
         pos_g = F.softplus(self.position_gamma_raw) + 1e-6
         isc = F.softplus(self.interaction_scale_raw)
         idt = F.softplus(self.interaction_dt_raw)
@@ -853,11 +1374,13 @@ class TorchAttractorLanguageModel(nn.Module):
             idt = idt * self._phase05_interaction_dt_scale.to(
                 device=idt.device, dtype=idt.dtype
             )
+        Sfw = self._window_coupling_flat(S)
         if pos_weights is not None and pos_wsum is not None:
-            delta = positional_coupling_delta_from_weights(S, pos_weights, pos_wsum)
+            delta = positional_coupling_delta_from_weights(Sfw, pos_weights, pos_wsum)
         else:
-            delta = positional_coupling_delta(S, pos_g, self.position_asym)
-        S = S + idt * isc * delta
+            delta = positional_coupling_delta(Sfw, pos_g, self.position_asym)
+        Sfw = Sfw + idt * isc * delta
+        S = self._from_window_coupling_flat(Sfw, B)
 
         # Build GOAT activation-bonus signal (Bug 1 fix).
         # bonuses[b, t] is a scalar; we broadcast it across the D dimension.
@@ -874,10 +1397,23 @@ class TorchAttractorLanguageModel(nn.Module):
         else:
             signal = None
 
-        # Local dynamics (per-position multi-head diffusion), then optional global C coupling.
-        S = self.dynamics.step(S, signal)
+        # Inject coupling positions + GOAT signal, optional anchor pull, then energy descent.
+        if signal is not None:
+            S_prep = S + signal
+        else:
+            S_prep = S
+        S_prep = self._apply_token_anchor_force(S_prep)
+        S = self._window_energy_gradient_step(
+            S_prep,
+            record_metrics=log_energy_metrics,
+            attractor_dt_per_batch=attractor_dt_per_batch,
+            anchor_freeze_wave=anchor_freeze_wave,
+        )
+        if not torch.is_grad_enabled() and attractor_dt_per_batch is None:
+            S = self._clamp_window_waves_norm(S, 1e-3, 12.0)
+
         S, _ = self._phase1_global_interaction_step(S, C_masked=C_masked)
-        return S
+        return self._normalize_window_state_if_enabled(S)
 
     def run_window_dynamics(
         self,
@@ -888,18 +1424,35 @@ class TorchAttractorLanguageModel(nn.Module):
         *,
         convergence_epsilon: float | None = None,
         min_attractor_steps: int | None = None,
-    ) -> tuple[torch.Tensor, list[dict] | None]:
+        return_intermediate_states: bool = False,
+    ) -> tuple[torch.Tensor, list[dict] | None, list[torch.Tensor] | None]:
         """
-        Tension-adaptive evolution: (W, D) or (B, W, D). Gradients flow through all steps.
+        Tension-adaptive evolution: (W, D) or (B, W, D). Each outer step applies coupling,
+        optional GOAT signal, optional token-anchor pull (:meth:`_apply_token_anchor_force`),
+        then energy-head gradient descent with a detached state leaf so backprop does not
+        chain across steps (``energy_heads`` parameters still receive gradients when training).
         If record_tension_log, fills _last_window_tension_curve with mean(T) after each step
         (use False on teacher-only passes so the student curve is preserved).
 
         context_ids: list of per-batch token ID windows (B × W) used to compute
         GOAT activation bonuses inside each dynamics step.
 
-        Optional early exit (after ``min_attractor_steps``): state change norm or tension
-        stabilization below ``convergence_epsilon`` (0 disables). Uses model defaults
-        when kwargs are None.
+        Optional early exit (after ``min_attractor_steps``): if ``convergence_epsilon > 0``,
+        stop when the batch-mean window potential (``_window_energy_per_batch_row``) changes
+        by less than epsilon versus the previous outer step. ``0`` disables early exit.
+        ``max_window_steps`` remains a hard cap. Uses model defaults when kwargs are None.
+        Updates ``_attractor_steps_cumulative_*`` for a running mean step count across calls.
+
+        If ``return_intermediate_states``, also returns each post-step window tensor
+        ``(B, W, D)`` (after tension/jitter for that outer step), excluding the initial embed.
+
+        With ``phase05_config.enable_adaptive_attractor_dt``, each batch row carries its own
+        inner step size ``dt`` (initialized from dynamics ``dt``, capped at that value when
+        growing). See ``_last_attractor_dt_curve`` and window trace dt fields when logging.
+
+        With ``phase05_config.enable_anchor_freeze``, after each outer step per-wave distances to
+        the nearest readout top-``k`` anchor slice gate energy gradients on the next step
+        (coupling and anchor pull still update the full state).
         """
         single = S.dim() == 2
         if single:
@@ -909,6 +1462,10 @@ class TorchAttractorLanguageModel(nn.Module):
                 context_ids = [context_ids]  # type: ignore[list-item]
         B, W, D = S.shape
         assert W == self.train_window_size
+        self._last_energy_descent_base = None
+        self._last_energy_descent_tension = None
+        self._last_energy_descent_total = None
+        self._last_energy_descent_per_wave = None
         step_logs: list[dict] | None = [] if collect_metrics else None
         step_log_tensors: list[dict[str, torch.Tensor]] | None = [] if collect_metrics else None
         tension_curve_tensors: list[torch.Tensor] | None = [] if record_tension_log else None
@@ -965,15 +1522,49 @@ class TorchAttractorLanguageModel(nn.Module):
         goat_bonus_vec: torch.Tensor | None = None
         if self._goat_mgr is not None and context_tensor is not None:
             goat_bonus_vec = self._goat_mgr.bonus_tensor(S.device, S.dtype)
-        delta_buf = torch.empty_like(S)
         conv_eps = float(self.convergence_epsilon if convergence_epsilon is None else convergence_epsilon)
         min_steps = int(self.min_attractor_steps if min_attractor_steps is None else min_attractor_steps)
         min_steps = max(2, min_steps)
         convergence_triggered = False
         break_count_window = 0
-        prev_t_mean: torch.Tensor | None = None
+        energy_trace = bool(trace or collect_metrics)
+        _acc_e_base = 0.0
+        _acc_e_tension = 0.0
+        _acc_e_total = 0.0
+        _n_energy = 0
+        _acc_e_anchor_mean = 0.0
+        _acc_e_anchor_std = 0.0
+        _n_e_anchor = 0
+        _acc_e_per_wave = [0.0] * self.num_waves
+        prev_energy: float | None = None
         steps_used = 0
         t_mean = torch.tensor(float("nan"), device=S.device, dtype=S.dtype)
+        intermediate_states: list[torch.Tensor] | None = (
+            [] if return_intermediate_states else None
+        )
+        self._last_attractor_dt_curve = []
+        self._attractor_dt_per_batch = None
+        self._attractor_max_dt_per_batch = None
+        _acc_adt_mean = 0.0
+        _acc_adt_min = float("inf")
+        _acc_adt_max = float("-inf")
+        _n_adt = 0
+        if self.phase05_config.enable_adaptive_attractor_dt:
+            _bd = float(self._dynamics_euler_dt())
+            self._attractor_max_dt_per_batch = S.new_full((B,), _bd)
+            self._attractor_dt_per_batch = self._attractor_max_dt_per_batch.clone()
+        _freeze_enabled = bool(self.phase05_config.enable_anchor_freeze)
+        _anchor_freeze_wave: torch.Tensor | None = None
+        _freeze_age: torch.Tensor | None = None
+        if _freeze_enabled:
+            _freeze_age = torch.zeros(
+                B, self.train_window_size, self.num_waves,
+                device=S.device,
+                dtype=torch.long,
+            )
+        _acc_ff_mean = 0.0
+        _acc_ff_std = 0.0
+        _n_ff = 0
         for step in range(self.max_window_steps):
             steps_used = step + 1
             S_prev_outer = S
@@ -986,7 +1577,75 @@ class TorchAttractorLanguageModel(nn.Module):
                 pos_wsum=pos_wsum,
                 C_masked=C_masked,
                 goat_bonus_vec=goat_bonus_vec,
+                log_energy_metrics=energy_trace,
+                attractor_dt_per_batch=self._attractor_dt_per_batch,
+                anchor_freeze_wave=_anchor_freeze_wave,
             )
+            if self._attractor_dt_per_batch is not None:
+                _dm = float(self._attractor_dt_per_batch.mean().detach().item())
+                self._last_attractor_dt_curve.append(_dm)
+                if trace:
+                    _acc_adt_mean += _dm
+                    _acc_adt_min = min(
+                        _acc_adt_min,
+                        float(self._attractor_dt_per_batch.min().detach().item()),
+                    )
+                    _acc_adt_max = max(
+                        _acc_adt_max,
+                        float(self._attractor_dt_per_batch.max().detach().item()),
+                    )
+                    _n_adt += 1
+            if _freeze_enabled and _freeze_age is not None:
+                with torch.no_grad():
+                    _dist_pw = self._window_anchor_nearest_distances_per_wave(S)
+                    _thr = torch.as_tensor(
+                        float(self.phase05_config.anchor_freeze_threshold),
+                        device=S.device,
+                        dtype=_dist_pw.dtype,
+                    )
+                    _stable = _dist_pw < _thr
+                    _freeze_age = torch.where(
+                        _stable,
+                        _freeze_age + 1,
+                        torch.zeros_like(_freeze_age),
+                    )
+                    _max_age = int(self.phase05_config.anchor_freeze_max_age)
+                    if _max_age > 0:
+                        _anchor_freeze_wave = _stable & (_freeze_age <= _max_age)
+                    else:
+                        _anchor_freeze_wave = _stable
+                _row_ff = _anchor_freeze_wave.float().mean(dim=(1, 2))
+                _ff_m = float(_row_ff.mean().item())
+                _ff_s = (
+                    float(_row_ff.std(unbiased=False).item())
+                    if B > 1
+                    else 0.0
+                )
+                _acc_ff_mean += _ff_m
+                _acc_ff_std += _ff_s
+                _n_ff += 1
+            if energy_trace and self._last_energy_descent_total is not None:
+                _acc_e_base += float(self._last_energy_descent_base or 0.0)
+                _te = self._last_energy_descent_tension
+                if _te is not None and math.isfinite(_te):
+                    _acc_e_tension += _te
+                _acc_e_total += float(self._last_energy_descent_total)
+                _n_energy += 1
+                _pw = self._last_energy_descent_per_wave
+                if _pw is not None and len(_pw) == self.num_waves:
+                    for _iw in range(self.num_waves):
+                        _acc_e_per_wave[_iw] += float(_pw[_iw])
+                if float(self.phase05_config.anchor_lambda) != 0.0:
+                    _am = getattr(
+                        self, "_last_energy_descent_anchor_mean", float("nan")
+                    )
+                    _asd = getattr(
+                        self, "_last_energy_descent_anchor_std", float("nan")
+                    )
+                    if math.isfinite(_am) and math.isfinite(_asd):
+                        _acc_e_anchor_mean += _am
+                        _acc_e_anchor_std += _asd
+                        _n_e_anchor += 1
             T, Te, Ta, Th = self.compute_tension_window_components(S)
             t_mean = T.mean()
             self._last_window_tension_mean = t_mean.detach()
@@ -1043,20 +1702,45 @@ class TorchAttractorLanguageModel(nn.Module):
             ):
                 with torch.no_grad():
                     diff = S - S0
-                    step_log_tensors.append(
-                        {
-                            "norm_delta": torch.linalg.vector_norm(diff).detach(),
-                            "token_var_mean": S.var(
-                                dim=(0, 1), unbiased=False
-                            ).mean().detach(),
-                            "cosine_to_prev": F.cosine_similarity(
-                                S.flatten(), S0.flatten(), dim=0
-                            ).detach(),
-                            "mean_row_norm": torch.linalg.vector_norm(
-                                S, dim=-1
-                            ).mean().detach(),
-                        }
-                    )
+                    _eb = self._last_energy_descent_base
+                    _et = self._last_energy_descent_tension
+                    _eo = self._last_energy_descent_total
+                    _elog: dict[str, torch.Tensor] = {
+                        "norm_delta": torch.linalg.vector_norm(diff).detach(),
+                        "token_var_mean": S.var(
+                            dim=(0, 1), unbiased=False
+                        ).mean().detach(),
+                        "cosine_to_prev": F.cosine_similarity(
+                            S.flatten(), S0.flatten(), dim=0
+                        ).detach(),
+                        "mean_row_norm": torch.linalg.vector_norm(
+                            S, dim=-1
+                        ).mean().detach(),
+                        "energy_descent_base": torch.as_tensor(
+                            float(_eb) if _eb is not None else float("nan"),
+                            device=S.device,
+                            dtype=S.dtype,
+                        ),
+                        "energy_descent_tension": torch.as_tensor(
+                            float(_et) if _et is not None else float("nan"),
+                            device=S.device,
+                            dtype=S.dtype,
+                        ),
+                        "energy_descent_total": torch.as_tensor(
+                            float(_eo) if _eo is not None else float("nan"),
+                            device=S.device,
+                            dtype=S.dtype,
+                        ),
+                    }
+                    _lpw = self._last_energy_descent_per_wave
+                    if _lpw is not None:
+                        for _wi, _v in enumerate(_lpw):
+                            _elog[f"energy_wave_{_wi}"] = torch.as_tensor(
+                                float(_v),
+                                device=S.device,
+                                dtype=S.dtype,
+                            )
+                    step_log_tensors.append(_elog)
             is_low = t_mean < 0.08
             consecutive_low_t_steps_t = torch.where(
                 is_low,
@@ -1084,7 +1768,7 @@ class TorchAttractorLanguageModel(nn.Module):
                     reject_l = (T_post_l > T_pre_l) & (cos_post_l < cos_pre_l)
                     if bool(torch.any(reject_l)):
                         S_try_l = S_low_bef
-                S = S_try_l
+                S = self._normalize_window_state_if_enabled(S_try_l)
                 if trace:
                     _br_low += 1
                     with torch.no_grad():
@@ -1144,28 +1828,24 @@ class TorchAttractorLanguageModel(nn.Module):
                 if self.phase2_config.store_break_memory:
                     self._phase2_last_break_pre = S_h_bef.detach().clone()
                     self._phase2_last_break_post = S_hi.detach().clone()
-                S = S_hi
+                S = self._normalize_window_state_if_enabled(S_hi)
             if trace and bool(torch.any(high)):
                 t_af = self.compute_tension_window(S).mean().detach()
                 _t_post_h = _t_post_h + t_af
                 _n_h_ev += 1
-            # Early convergence only for batch size 1: with B>1, mean delta/T masks
-            # per-row heterogeneity and any scalar "ok" would stop the whole batch.
-            if step + 1 >= min_steps and conv_eps > 0 and B == 1:
-                torch.sub(S, S_prev_outer, out=delta_buf)
-                state_delta = torch.linalg.vector_norm(
-                    delta_buf.reshape(B, -1), dim=-1
-                ).mean()
-                delta_ok = state_delta < conv_eps
-                tension_ok = torch.zeros((), device=S.device, dtype=torch.bool)
-                if prev_t_mean is not None:
-                    tension_ok = (t_mean.detach() - prev_t_mean).abs() < conv_eps
-                if bool(torch.any(delta_ok | tension_ok)):
+            if intermediate_states is not None:
+                intermediate_states.append(S.clone())
+            with torch.no_grad():
+                energy_now = float(self._window_energy_per_batch_row(S).mean().item())
+            if step + 1 >= min_steps and conv_eps > 0:
+                if prev_energy is not None and abs(prev_energy - energy_now) < conv_eps:
                     convergence_triggered = True
                     break
-            prev_t_mean = t_mean.detach()
+            prev_energy = energy_now
         self._last_convergence_triggered = convergence_triggered
         self._last_attractor_steps_used = steps_used
+        self._attractor_steps_cumulative_sum += float(steps_used)
+        self._attractor_steps_cumulative_count += 1
         self._last_window_break_count = break_count_window
         self._last_final_window_tension_diag = (
             float(t_mean.detach().item()) if steps_used > 0 else float("nan")
@@ -1225,6 +1905,61 @@ class TorchAttractorLanguageModel(nn.Module):
                 )
                 if _n_p2_br > 0
                 else float("nan"),
+                "energy_descent_base_mean": float(_acc_e_base / float(_n_energy))
+                if _n_energy > 0
+                else float("nan"),
+                "energy_descent_tension_mean": float(_acc_e_tension / float(_n_energy))
+                if _n_energy > 0
+                else float("nan"),
+                "energy_descent_total_mean": float(_acc_e_total / float(_n_energy))
+                if _n_energy > 0
+                else float("nan"),
+                "energy_per_wave_means": [
+                    float(_acc_e_per_wave[i] / float(_n_energy))
+                    for i in range(self.num_waves)
+                ]
+                if _n_energy > 0
+                else [float("nan")] * self.num_waves,
+                "anchor_energy_mean": float(_acc_e_anchor_mean / float(_n_e_anchor))
+                if _n_e_anchor > 0
+                else float("nan"),
+                "anchor_energy_std": float(_acc_e_anchor_std / float(_n_e_anchor))
+                if _n_e_anchor > 0
+                else float("nan"),
+                "frozen_fraction_mean": float(_acc_ff_mean / float(_n_ff))
+                if _n_ff > 0
+                else float("nan"),
+                "frozen_fraction_std": float(_acc_ff_std / float(_n_ff))
+                if _n_ff > 0
+                else float("nan"),
+                "attractor_dt_mean_over_steps": float(_acc_adt_mean / float(_n_adt))
+                if _n_adt > 0
+                else float("nan"),
+                "attractor_dt_min_seen": float(_acc_adt_min)
+                if _n_adt > 0 and math.isfinite(_acc_adt_min)
+                else float("nan"),
+                "attractor_dt_max_seen": float(_acc_adt_max)
+                if _n_adt > 0 and math.isfinite(_acc_adt_max)
+                else float("nan"),
+                "attractor_dt_mean_final": float(
+                    self._attractor_dt_per_batch.mean().detach().item()
+                )
+                if self._attractor_dt_per_batch is not None
+                else float("nan"),
+                "attractor_dt_min_final": float(
+                    self._attractor_dt_per_batch.min().detach().item()
+                )
+                if self._attractor_dt_per_batch is not None
+                else float("nan"),
+                "attractor_dt_max_final": float(
+                    self._attractor_dt_per_batch.max().detach().item()
+                )
+                if self._attractor_dt_per_batch is not None
+                else float("nan"),
+                "attractor_steps_mean_lifetime": float(
+                    self._attractor_steps_cumulative_sum
+                    / max(float(self._attractor_steps_cumulative_count), 1.0)
+                ),
             }
         elif trace:
             self._phase05_last_window_trace = {}
@@ -1237,7 +1972,9 @@ class TorchAttractorLanguageModel(nn.Module):
             self._last_window_tension_curve = []
         if single:
             S = S.squeeze(0)
-        return S, step_logs
+            if intermediate_states is not None:
+                intermediate_states = [s.squeeze(0) for s in intermediate_states]
+        return S, step_logs, intermediate_states
 
     def trajectory_contrastive_loss(
         self, state_a: torch.Tensor, state_b: torch.Tensor
@@ -1269,6 +2006,36 @@ class TorchAttractorLanguageModel(nn.Module):
             self._last_traj_cos_neg = float(neg.mean().item())
             self._last_traj_margin = float((pos - neg).mean().item())
         return F.relu(margin).mean() * tau
+
+    def anchor_contrastive_loss(
+        self, state: torch.Tensor, target_ids: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Pull ``state`` toward target token embeddings and away from random negatives (squared L2).
+
+        ``state``: (B, D), ``target_ids``: (B,) int64. Loss is
+        ``mean_b ( ‖s_b - e_{t_b}‖² - mean_k ‖s_b - ñ_{b,k}‖² )`` where ``ñ`` are detached
+        embedding rows for vocab indices sampled uniformly from ``{0…V-1} \\ {t_b}``.
+        """
+        if state.dim() != 2:
+            raise ValueError(f"anchor_contrastive_loss expects state (B, D), got {tuple(state.shape)}")
+        B, D = state.shape
+        if target_ids.shape != (B,):
+            raise ValueError(
+                f"anchor_contrastive_loss expects target_ids (B,), got {tuple(target_ids.shape)}"
+            )
+        V = self.vocab_size
+        target_anchor = self.embedder(target_ids)
+        pos_dist = (state - target_anchor).pow(2).sum(dim=-1)
+        if V <= 1:
+            return pos_dist.mean()
+        K = max(1, int(self.phase05_config.anchor_contrastive_num_negatives))
+        r = torch.randint(0, V - 1, (B, K), device=state.device, dtype=torch.long)
+        t = target_ids.unsqueeze(1).expand(B, K)
+        neg_idx = r + (r >= t).long()
+        neg_anchors = self.embedder.weight.detach()[neg_idx]
+        neg_dist = (state.unsqueeze(1) - neg_anchors).pow(2).sum(dim=-1)
+        return (pos_dist - neg_dist.mean(dim=1)).mean()
 
     def window_ids_from_sequence(self, seq_ids: list[int]) -> list[int]:
         """Last W token ids; left-pad with seq_ids[0] if shorter than window (full window for dynamics)."""
@@ -1315,11 +2082,13 @@ class TorchAttractorLanguageModel(nn.Module):
         """
         assert len(context_ids) == self.train_window_size
         S = self.embed_window(context_ids)
-        S, dyn_logs = self.run_window_dynamics(
+        S, dyn_logs, _ = self.run_window_dynamics(
             S, collect_metrics=collect_dynamics_metrics, context_ids=context_ids
         )
         self._last_dynamics_logs = dyn_logs
-        logits = self.readout_window(S.reshape(-1))
+        logits = self._readout_window_logits(S)
+        if logits.dim() == 2 and logits.size(0) == 1:
+            logits = logits.squeeze(0)
         logits = logits / self.effective_temperature()
         return torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=-1e4)
 
@@ -1338,6 +2107,15 @@ class TorchAttractorLanguageModel(nn.Module):
         """
         Batched trajectory contrastive loss + readout logits from pred state.
         Teacher states are detached (no grad through shifted window).
+
+        When ``phase05_config.trajectory_intermediate_ce_weight > 0``, also adds
+        ``weight * mean_k CE(readout_window(S_k), target)`` over post-step states
+        from ``run_window_dynamics(..., return_intermediate_states=True)``.
+
+        Adds ``energy_reg_weight * mean(E^2)`` for ``E = _window_energy_per_batch_row(S_pred)``.
+
+        With ``anchor_contrastive_weight > 0``, adds contrastive anchor loss on ``S_pred[:, -1, :]``
+        vs the target token embedding and random negative embeddings (see :meth:`anchor_contrastive_loss`).
         """
         B = len(contexts)
         assert B == len(targets) and B >= 1
@@ -1350,26 +2128,62 @@ class TorchAttractorLanguageModel(nn.Module):
             self.dynamics._last_multihead_drifts = None
         device = self.embedder.weight.device
         context_tensor = torch.as_tensor(contexts, dtype=torch.long, device=device)
+        targets_tensor_tj = torch.as_tensor(targets, dtype=torch.long, device=device)
+        w_ce = float(self.phase05_config.trajectory_intermediate_ce_weight)
         S_pred = self.embed_windows_batch(context_tensor)
-        S_pred, _ = self.run_window_dynamics(
-            S_pred, collect_metrics=False, record_tension_log=True, context_ids=contexts
+        S_pred, _, states_pred = self.run_window_dynamics(
+            S_pred,
+            collect_metrics=False,
+            record_tension_log=True,
+            context_ids=contexts,
+            return_intermediate_states=(w_ce > 0.0),
         )
+        al_cfg = float(self.phase05_config.anchor_lambda)
+        if al_cfg != 0.0:
+            with torch.no_grad():
+                nd = self._window_anchor_nearest_distances(S_pred)
+                ndf = nd.reshape(-1)
+                self._phase05_anchor_energy_mean = float(ndf.mean().item())
+                self._phase05_anchor_energy_std = float(ndf.std(unbiased=False).item())
+        else:
+            self._phase05_anchor_energy_mean = float("nan")
+            self._phase05_anchor_energy_std = float("nan")
         self._last_traj_student_tension_mean = self.compute_tension_window(S_pred).mean().detach()
         with torch.no_grad():
-            tgt_col = torch.as_tensor(targets, dtype=torch.long, device=device).unsqueeze(1)
+            tgt_col = targets_tensor_tj.unsqueeze(1)
             shifted_tensor = torch.cat([context_tensor[:, 1:], tgt_col], dim=1)
             S_tgt = self.embed_windows_batch(shifted_tensor)
             orig_steps = self.max_window_steps
             try:
                 if teacher_steps is not None:
                     self.max_window_steps = max(1, int(teacher_steps))
-                S_tgt, _ = self.run_window_dynamics(
+                S_tgt, _, _ = self.run_window_dynamics(
                     S_tgt, collect_metrics=False, record_tension_log=False
                 )
             finally:
                 self.max_window_steps = orig_steps
         loss_core = self.trajectory_contrastive_loss(S_pred, S_tgt)
         self._phase05_loss_traj_core = float(loss_core.detach().item())
+        loss_ce_intermediate: torch.Tensor | None = None
+        if w_ce > 0.0 and states_pred:
+            per_step_ce: list[torch.Tensor] = []
+            for Sk in states_pred:
+                Sk_b = Sk.unsqueeze(0) if Sk.dim() == 2 else Sk
+                Bk = Sk_b.size(0)
+                logits_k = (
+                    self._readout_window_logits(Sk_b) / self.effective_temperature()
+                )
+                logits_k = torch.nan_to_num(
+                    logits_k, nan=0.0, posinf=0.0, neginf=-1e4
+                )
+                per_step_ce.append(
+                    F.cross_entropy(
+                        logits_k,
+                        targets_tensor_tj,
+                        label_smoothing=LABEL_SMOOTHING,
+                    )
+                )
+            loss_ce_intermediate = torch.stack(per_step_ce).mean()
         T = self.compute_tension_window(S_pred).mean()
         base_entropy_floor = torch.as_tensor(
             float(ENTROPY_FLOOR), device=S_pred.device, dtype=S_pred.dtype
@@ -1387,25 +2201,61 @@ class TorchAttractorLanguageModel(nn.Module):
             )
         else:
             repulsion = torch.zeros((), device=S_pred.device, dtype=S_pred.dtype)
-        # Repulsion term to push away from previous states and break basin collapse
-        loss_traj = loss_core + entropy_floor - repulsion
+        # Contrastive core + optional mean CE over outer dynamics steps + existing aux terms.
+        loss_traj = loss_core
+        if loss_ce_intermediate is not None:
+            loss_traj = loss_traj + w_ce * loss_ce_intermediate
+        loss_traj = loss_traj + entropy_floor - repulsion
         div = self.phase1_head_diversity_loss()
         if self.phase1_config.head_diversity_weight > 0.0:
             loss_traj = loss_traj + self.phase1_config.head_diversity_weight * div
         reg_c = self.phase2_interaction_reg_loss()
         if self.phase2_config.interaction_reg_weight > 0.0:
             loss_traj = loss_traj + self.phase2_config.interaction_reg_weight * reg_c
+        E_row = self._window_energy_per_batch_row(S_pred)
+        energy_reg = (E_row**2).mean()
+        w_er = float(self.phase05_config.energy_reg_weight)
+        if w_er != 0.0:
+            loss_traj = loss_traj + w_er * energy_reg
+        w_ac = float(self.phase05_config.anchor_contrastive_weight)
+        anchor_contrast: torch.Tensor | None = None
+        if w_ac != 0.0:
+            anchor_contrast = self.anchor_contrastive_loss(
+                S_pred[:, -1, :], targets_tensor_tj
+            )
+            loss_traj = loss_traj + w_ac * anchor_contrast
+        with torch.no_grad():
+            _e_mean = float(E_row.mean().item())
+            self._last_batch_energy_mean = _e_mean
+            self._last_batch_energy_variance = (
+                float(E_row.var(unbiased=False).item()) if B > 1 else 0.0
+            )
+            self._last_batch_energy_min = float(E_row.min().item())
+            self._last_batch_energy_max = float(E_row.max().item())
+        self._phase05_energy_potential_mean = _e_mean
+        self._phase05_energy_reg_mean_sq = float(energy_reg.detach().item())
+        self._phase05_energy_reg_weighted = float((w_er * energy_reg).detach().item())
         if update_repulsion_memory:
             with torch.no_grad():
                 self._repulsion_prev_states.append(fast_state.detach().clone())
                 if len(self._repulsion_prev_states) > 8:
                     self._repulsion_prev_states.pop(0)
-        logits = self.readout_window(S_pred.reshape(B, -1)) / self.effective_temperature()
+        logits = self._readout_window_logits(S_pred) / self.effective_temperature()
         logits = torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=-1e4)
         # Store final-position single state for auxiliary readout training (Phase 5).
         self._last_pred_final_state = S_pred[:, -1, :]  # (B, D)
+        if anchor_contrast is not None:
+            self._phase05_anchor_contrast_loss = float(anchor_contrast.detach().item())
+        else:
+            self._phase05_anchor_contrast_loss = float("nan")
         if self.phase05_config.log_metrics:
             self._phase05_loss_traj_full = float(loss_traj.detach().item())
+            if loss_ce_intermediate is not None:
+                self._phase05_loss_traj_intermediate_ce = float(
+                    loss_ce_intermediate.detach().item()
+                )
+            else:
+                self._phase05_loss_traj_intermediate_ce = float("nan")
             _, t_te, t_ta, t_th = self.compute_tension_window_components(S_pred)
             self._phase05_last_student_T_components = (
                 float(T.detach().item()),
@@ -1423,7 +2273,12 @@ class TorchAttractorLanguageModel(nn.Module):
                 if self.phase2_config.interaction_reg_weight > 0.0
                 else float("nan")
             )
-            _he = getattr(self.dynamics, "_last_head_weight_entropy", None)
+            _dyn = self.dynamics
+            _he = (
+                getattr(_dyn, "_last_head_weight_entropy", None)
+                if _dyn is not None
+                else None
+            )
             self._phase2_head_weight_entropy_logged = (
                 float(_he.detach().item())
                 if isinstance(_he, torch.Tensor)
@@ -1450,6 +2305,11 @@ class TorchAttractorLanguageModel(nn.Module):
         ev_post = self._phase05_evolve_t_post_sum / ev_n if ev_n > 0 else float("nan")
         curve = self._last_window_tension_curve
         t_final = float(curve[-1]) if curve else float("nan")
+        _epw_trace = wt.get("energy_per_wave_means")
+        if isinstance(_epw_trace, list) and len(_epw_trace) > 0:
+            _energy_per_wave_csv = ";".join(f"{float(x):.6g}" for x in _epw_trace)
+        else:
+            _energy_per_wave_csv = ""
         return [
             epoch + 1,
             batch_idx,
@@ -1492,9 +2352,28 @@ class TorchAttractorLanguageModel(nn.Module):
             getattr(self, "_phase2_head_weight_entropy_logged", float("nan")),
             getattr(self, "_phase2_interaction_reg_logged", float("nan")),
             float(getattr(self, "_last_attractor_steps_used", 0)),
+            (
+                float(
+                    getattr(self, "_attractor_steps_cumulative_sum", 0.0)
+                    / float(getattr(self, "_attractor_steps_cumulative_count", 0))
+                )
+                if getattr(self, "_attractor_steps_cumulative_count", 0) > 0
+                else float("nan")
+            ),
             getattr(self, "_last_final_window_tension_diag", float("nan")),
             float(getattr(self, "_last_window_break_count", 0)),
             float(1 if getattr(self, "_last_convergence_triggered", False) else 0),
+            wt.get("energy_descent_base_mean", float("nan")),
+            wt.get("energy_descent_tension_mean", float("nan")),
+            wt.get("energy_descent_total_mean", float("nan")),
+            _energy_per_wave_csv,
+            getattr(self, "_phase05_energy_potential_mean", float("nan")),
+            getattr(self, "_phase05_energy_reg_mean_sq", float("nan")),
+            getattr(self, "_phase05_energy_reg_weighted", float("nan")),
+            getattr(self, "_phase05_anchor_energy_mean", float("nan")),
+            getattr(self, "_phase05_anchor_energy_std", float("nan")),
+            wt.get("frozen_fraction_mean", float("nan")),
+            wt.get("frozen_fraction_std", float("nan")),
         ]
 
     @staticmethod
@@ -1505,13 +2384,51 @@ class TorchAttractorLanguageModel(nn.Module):
         tvs = [x["token_var_mean"] for x in logs]
         coss = [x["cosine_to_prev"] for x in logs]
         mns = [x["mean_row_norm"] for x in logs]
-        return (
+        base = (
             f"steps={len(logs)}  "
             f"mean|Δ|={statistics.mean(nds):.4f}  "
             f"mean_var={statistics.mean(tvs):.6f}  "
             f"mean_cos(step)={statistics.mean(coss):.4f}  "
             f"mean||row||={statistics.mean(mns):.4f}"
         )
+        if logs and "energy_descent_total" in logs[0]:
+            ebs = [x["energy_descent_base"] for x in logs]
+            ets = [x["energy_descent_tension"] for x in logs]
+            eos = [x["energy_descent_total"] for x in logs]
+            finite = [v for v in ebs if math.isfinite(v)]
+            base += (
+                f"  E_base={statistics.mean(finite):.4f}"
+                if finite
+                else "  E_base=nan"
+            )
+            finite_t = [v for v in ets if math.isfinite(v)]
+            base += (
+                f"  T_step={statistics.mean(finite_t):.4f}"
+                if finite_t
+                else "  T_step=nan"
+            )
+            finite_o = [v for v in eos if math.isfinite(v)]
+            base += (
+                f"  E_tot={statistics.mean(finite_o):.4f}"
+                if finite_o
+                else "  E_tot=nan"
+            )
+        if logs:
+            _wk = sorted(
+                k for k in logs[0] if str(k).startswith("energy_wave_")
+            )
+            if _wk:
+                _parts: list[str] = []
+                for _k in _wk:
+                    _vs = [x[_k] for x in logs if _k in x]
+                    _fin = [v for v in _vs if math.isfinite(v)]
+                    if _fin:
+                        _parts.append(
+                            f"{_k}={statistics.mean(_fin):.4f}"
+                        )
+                if _parts:
+                    base += "  " + " ".join(_parts)
+        return base
 
     def encode_prompt(self, prompt: str) -> torch.Tensor:
         """Run window dynamics on the trailing context; return converged state (W, D)."""
@@ -1525,7 +2442,7 @@ class TorchAttractorLanguageModel(nn.Module):
         wid = self.window_ids_from_sequence(input_ids)
         with torch.inference_mode():
             S = self.embed_window(wid)
-            S, _ = self.run_window_dynamics(S, collect_metrics=False)
+            S, _, _ = self.run_window_dynamics(S, collect_metrics=False)
         return S
 
     def _print_attractor_diversity(self, top_k: int = 5):
@@ -1597,8 +2514,15 @@ class TorchAttractorLanguageModel(nn.Module):
                             if curve
                             else "[]"
                         )
+                        _adc = self._last_attractor_dt_curve
+                        adt_s = (
+                            "[" + ", ".join(f"{x:.5g}" for x in _adc) + "]"
+                            if _adc
+                            else "[]"
+                        )
                         print(
                             f"  [dyn t={ti}] tension_curve={curve_s}  "
+                            f"attractor_dt_mean={adt_s}  "
                             f"steps={self._last_adaptive_window_steps}  {summ}"
                         )
                 next_id = sample_next_token_id(
@@ -1619,6 +2543,54 @@ class TorchAttractorLanguageModel(nn.Module):
         if self.tokenizer is not None:
             return self.tokenizer.decode(generated_ids)
         return " ".join(str(i) for i in generated_ids)
+
+
+class WaveDynamics(nn.Module):
+    """
+    Small residual MLP on one wave channel. Operates on ``(B, W, wave_dim)`` (vectorized over
+    batch and window); optional additive ``signal`` with the same shape.
+    """
+
+    def __init__(
+        self,
+        wave_dim: int,
+        hidden_mult: int = 2,
+        noise_scale: float = 1e-3,
+    ) -> None:
+        super().__init__()
+        self.wave_dim = int(wave_dim)
+        h = max(16, self.wave_dim * int(hidden_mult))
+        self.mlp = nn.Sequential(
+            nn.Linear(self.wave_dim, h),
+            nn.GELU(),
+            nn.Linear(h, self.wave_dim),
+        )
+        self.residual_scale = nn.Parameter(torch.tensor(0.1))
+        self.register_buffer("noise_scale", torch.tensor(float(noise_scale)))
+        for m in self.mlp.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        signal: torch.Tensor | None = None,
+        *,
+        noise_scale_mul: float | torch.Tensor = 1.0,
+    ) -> torch.Tensor:
+        if signal is not None:
+            x = x + signal
+        if self.training and float(self.noise_scale) > 0:
+            nsm = float(
+                noise_scale_mul.detach().item()
+                if isinstance(noise_scale_mul, torch.Tensor)
+                else noise_scale_mul
+            )
+            x = x + nsm * self.noise_scale * torch.randn_like(x)
+        delta = self.mlp(x)
+        return x + torch.tanh(self.residual_scale) * delta
 
 
 class SimpleAttractorDynamics(nn.Module):
@@ -1874,9 +2846,9 @@ def run_quick_window_tests(model: TorchAttractorLanguageModel) -> None:
     wid_b = model.window_ids_from_sequence(long_b)
     with torch.inference_mode():
         Sa = model.embed_window(wid_a)
-        Sa, _ = model.run_window_dynamics(Sa)
+        Sa, _, _ = model.run_window_dynamics(Sa)
         Sb = model.embed_window(wid_b)
-        Sb, _ = model.run_window_dynamics(Sb)
+        Sb, _, _ = model.run_window_dynamics(Sb)
     va = Sa.reshape(-1)
     vb = Sb.reshape(-1)
     dist = torch.linalg.vector_norm(va - vb).item()
@@ -1886,7 +2858,9 @@ def run_quick_window_tests(model: TorchAttractorLanguageModel) -> None:
         flush=True,
     )
     with torch.inference_mode():
-        _, logs = model.run_window_dynamics(model.embed_window(wid_a), collect_metrics=True)
+        _, logs, _ = model.run_window_dynamics(
+            model.embed_window(wid_a), collect_metrics=True
+        )
     if logs:
         print(f"  single-window dynamics: {model.summarize_dynamics_logs(logs)}", flush=True)
     print("--- end quick test ---", flush=True)
@@ -2277,11 +3251,11 @@ def mean_cross_entropy_eval(
         context_tensor = torch.as_tensor(contexts, dtype=torch.long, device=device)
         targets_tensor = torch.as_tensor(targets, dtype=torch.long, device=device)
         S = model.embed_windows_batch(context_tensor)
-        S, _ = model.run_window_dynamics(
+        S, _, _ = model.run_window_dynamics(
             S, collect_metrics=False, record_tension_log=False, context_ids=contexts
         )
         B = context_tensor.size(0)
-        logits = model.readout_window(S.reshape(B, -1))
+        logits = model.readout_window_logits(S)
         logits = logits / model.effective_temperature()
         logits = torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=-1e4)
         prev_ids = context_tensor[:, -1]
@@ -2329,13 +3303,13 @@ def mean_trajectory_contrastive_eval(
         device = model.embedder.weight.device
         context_tensor = torch.as_tensor(contexts, dtype=torch.long, device=device)
         S_pred = model.embed_windows_batch(context_tensor)
-        S_pred, _ = model.run_window_dynamics(
+        S_pred, _, _ = model.run_window_dynamics(
             S_pred, collect_metrics=False, record_tension_log=False
         )
         tgt_col = torch.as_tensor(targets, dtype=torch.long, device=device).unsqueeze(1)
         shifted_tensor = torch.cat([context_tensor[:, 1:], tgt_col], dim=1)
         S_tgt = model.embed_windows_batch(shifted_tensor)
-        S_tgt, _ = model.run_window_dynamics(
+        S_tgt, _, _ = model.run_window_dynamics(
             S_tgt, collect_metrics=False, record_tension_log=False
         )
         total += float(model.trajectory_contrastive_loss(S_pred, S_tgt).item()) * len(
@@ -2503,6 +3477,8 @@ def _save_checkpoint(
         "vocab_size": model.vocab_size,
         "max_window_steps": model.max_window_steps,
         "convergence_epsilon": model.convergence_epsilon,
+        "num_waves": model.num_waves,
+        "use_readout_fusion": bool(getattr(model, "use_readout_fusion", False)),
     }
     _dyn = model.dynamics
     if hasattr(_dyn, "use_lorentz"):
@@ -2531,6 +3507,69 @@ def _save_checkpoint(
 
 def _checkpoint_state_is_vectorized(st: dict) -> bool:
     return any(str(k).startswith("dynamics.mhd.") for k in st)
+
+
+def _broadcast_legacy_energy_head_to_heads(
+    model: "TorchAttractorLanguageModel", st: dict
+) -> None:
+    """If ``st`` has legacy ``energy_head.*`` but no ``energy_heads.*``, copy into each wave head."""
+    if any(str(k).startswith("energy_heads.") for k in st):
+        return
+    prefix = "energy_head."
+    legacy: dict[str, torch.Tensor] = {}
+    for k, v in st.items():
+        ks = str(k)
+        if ks.startswith(prefix):
+            legacy[ks[len(prefix) :]] = v
+    if not legacy:
+        return
+    for i in range(model.num_waves):
+        model.energy_heads[i].load_state_dict(legacy, strict=True)
+
+
+def load_torch_attractor_state_dict(model: "TorchAttractorLanguageModel", st: dict) -> None:
+    """
+    Load ``st`` into ``TorchAttractorLanguageModel``. Checkpoints may omit ``energy_heads.*``
+    (random init); legacy ``energy_head.*`` is copied into every ``energy_heads[i]``.
+    Older checkpoints may omit ``wave_interaction.*``; any other mismatch is an error.
+    """
+    incompat = model.load_state_dict(st, strict=False)
+    _broadcast_legacy_energy_head_to_heads(model, st)
+    missing = list(incompat.missing_keys)
+    unexpected = list(incompat.unexpected_keys)
+    has_legacy_dynamics = any(str(k).startswith("dynamics.") for k in st)
+
+    def _allowed_missing(k: str) -> bool:
+        sk = str(k)
+        if sk.startswith("energy_heads."):
+            return True
+        if sk.startswith("readout_fusion."):
+            return True
+        if sk.startswith("wave_interaction."):
+            return True
+        if sk == "wave_interaction_strength":
+            return True
+        if has_legacy_dynamics and sk.startswith("wave_dynamics."):
+            return True
+        return False
+
+    bad_missing = [k for k in missing if not _allowed_missing(k)]
+    unexpected = [
+        k
+        for k in unexpected
+        if not (has_legacy_dynamics and str(k).startswith("dynamics."))
+        and not str(k).startswith("energy_head.")
+    ]
+    if bad_missing:
+        raise RuntimeError(
+            f"load_state_dict: missing keys other than allowed optional prefixes ({len(bad_missing)}): "
+            f"{bad_missing[:20]}{'...' if len(bad_missing) > 20 else ''}"
+        )
+    if unexpected:
+        raise RuntimeError(
+            f"load_state_dict: unexpected keys ({len(unexpected)}): "
+            f"{unexpected[:20]}{'...' if len(unexpected) > 20 else ''}"
+        )
 
 
 def _checkpoint_vectorized_head_rank(st: dict) -> tuple[int, int, int] | None:
@@ -2562,6 +3601,7 @@ def load_model_from_checkpoint(
     vocab_size = int(cfg.get("vocab_size", ckpt.get("vocab_size", 50257)))
     state_dim = int(cfg.get("state_dim", 512))
     window_size = int(cfg.get("train_window_size", WINDOW_SIZE))
+    num_waves = int(cfg.get("num_waves", 1))
 
     tok = _build_tokenizer(mode=tokenizer_mode, vocab_cap=vocab_cap)
     if print_vocab_mismatch_warning and tok.n_vocab != vocab_size:
@@ -2577,6 +3617,8 @@ def load_model_from_checkpoint(
         train_window_size=window_size,
         max_window_steps=int(cfg.get("max_window_steps", MAX_WINDOW_STEPS)),
         convergence_epsilon=float(cfg.get("convergence_epsilon", 0.0)),
+        num_waves=num_waves,
+        use_readout_fusion=bool(cfg.get("use_readout_fusion", False)),
     )
     if _checkpoint_state_is_vectorized(st):
         from dynamics_vectorized import VectorizedWindowDynamics  # type: ignore[import]
@@ -2594,7 +3636,7 @@ def load_model_from_checkpoint(
         except (TypeError, ValueError):
             vectorized_dt = 0.09
         model.dynamics = VectorizedWindowDynamics(
-            state_dim=state_dim,
+            state_dim=model.wave_dim,
             window_size=window_size,
             num_heads=nh,
             rank=rk,
@@ -2602,7 +3644,7 @@ def load_model_from_checkpoint(
             dt=vectorized_dt,
             use_lorentz=use_lorentz,
         )
-    model.load_state_dict(st, strict=True)
+    load_torch_attractor_state_dict(model, st)
     model.tokenizer = tok
     model.eval()
     if device is not None:
@@ -2635,9 +3677,36 @@ def phase05_config_from_args(args: argparse.Namespace) -> Phase05Config:
         ),
         adaptive_window_dt=bool(getattr(args, "phase05_adaptive_window_dt", False)),
         tension_weights=tw,
+        tension_lambda=float(getattr(args, "phase05_tension_lambda", 0.0)),
+        anchor_lambda=float(getattr(args, "phase05_anchor_lambda", 0.0)),
+        anchor_force_strength=float(getattr(args, "phase05_anchor_force_strength", 0.0)),
+        anchor_search_topk=max(1, int(getattr(args, "phase05_anchor_search_topk", 64))),
+        anchor_contrastive_weight=float(
+            getattr(args, "phase05_anchor_contrastive_weight", 0.0)
+        ),
+        anchor_contrastive_num_negatives=max(
+            1, int(getattr(args, "phase05_anchor_contrastive_num_negatives", 8))
+        ),
+        enable_anchor_freeze=bool(getattr(args, "phase05_enable_anchor_freeze", False)),
+        anchor_freeze_threshold=float(
+            getattr(args, "phase05_anchor_freeze_threshold", 0.03)
+        ),
+        anchor_freeze_max_age=max(
+            0, int(getattr(args, "phase05_anchor_freeze_max_age", 0))
+        ),
         multi_negative=bool(getattr(args, "phase05_multi_negative", False)),
         num_negatives=max(2, int(getattr(args, "phase05_num_negatives", 4))),
         trajectory_temperature=float(getattr(args, "phase05_traj_temperature", 1.0)),
+        trajectory_intermediate_ce_weight=float(
+            getattr(args, "trajectory_intermediate_ce_weight", 0.0)
+        ),
+        enable_state_normalization=not bool(
+            getattr(args, "disable_state_normalization", False)
+        ),
+        enable_adaptive_attractor_dt=bool(
+            getattr(args, "phase05_adaptive_attractor_dt", False)
+        ),
+        energy_reg_weight=float(getattr(args, "phase05_energy_reg_weight", 0.001)),
     )
 
 
@@ -2717,6 +3786,19 @@ def main() -> None:
         dest="state_dim",
         help="Continuous state dimension D (embedding + dynamics).",
     )
+    parser.add_argument(
+        "--num-waves",
+        type=int,
+        default=8,
+        dest="num_waves",
+        help="Split D into independent wave channels; wave_dim = D // num_waves (each channel has its own dynamics).",
+    )
+    parser.add_argument(
+        "--readout-fusion",
+        action="store_true",
+        dest="readout_fusion",
+        help="Linear(D,D) on each window position before readout_window (uses full D = all wave channels).",
+    )
     parser.add_argument("--num-dynamics-steps", "--max-window-steps", type=int, default=MAX_WINDOW_STEPS,
         help="Max outer steps per window (tension-adaptive).")
     parser.add_argument(
@@ -2743,6 +3825,14 @@ def main() -> None:
     parser.add_argument("--loss-mode", choices=("trajectory", "ce"), default="trajectory")
     parser.add_argument("--token-aux-ce", type=float, default=TOKEN_AUX_CE_WEIGHT_DEFAULT,
         help="trajectory mode: aux readout_window CE weight.")
+    parser.add_argument(
+        "--trajectory-intermediate-ce-weight",
+        type=float,
+        default=0.0,
+        dest="trajectory_intermediate_ce_weight",
+        metavar="W",
+        help="trajectory mode: add W * mean(CE per outer dynamics step) to trajectory loss.",
+    )
     parser.add_argument("--lr", type=float, default=0.001)
     parser.add_argument(
         "--grad-clip",
@@ -2753,6 +3843,17 @@ def main() -> None:
     parser.add_argument("--lr-decay-every", type=int, default=0)
     parser.add_argument("--lr-gamma", type=float, default=0.5)
     parser.add_argument("--epoch-metrics-csv", type=Path, default=None)
+    parser.add_argument(
+        "--metrics-fast-csv",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Append one row per epoch: batch-wise window energy mean/var/min/max "
+            "(from _window_energy_per_batch_row), each averaged over training batches "
+            "(trajectory mode only; use e.g. metrics_fast.csv)."
+        ),
+    )
     parser.add_argument(
         "--attractor-steps-metrics-csv",
         type=Path,
@@ -2846,7 +3947,7 @@ def main() -> None:
         dest="use_goat_memory", help="Enable GOAT-TS memory-state transitions (GoatMemoryManager).")
     # ---- Phase 9: dynamics ----
     parser.add_argument("--dynamics", choices=("simple", "vectorized"), default="vectorized",
-        help="'simple': SimpleAttractorDynamics; 'vectorized': MultiHeadDynamics (default).")
+        help="'simple': per-wave WaveDynamics only; 'vectorized': MultiHeadDynamics (default).")
     parser.add_argument(
         "--use-lorentz",
         action="store_true",
@@ -2858,7 +3959,7 @@ def main() -> None:
         type=int,
         default=4,
         dest="vectorized_num_heads",
-        help="MultiHeadDynamics head count (state_dim must be divisible by this).",
+        help="MultiHeadDynamics head count (wave_dim = state_dim/num_waves must be divisible by this).",
     )
     parser.add_argument(
         "--vectorized-rank",
@@ -2888,6 +3989,26 @@ def main() -> None:
         help="Initialize per-head diag(A) eigenvalues in [-0.55,-0.25] (stronger linear contraction).",
     )
     # ---- Phase 0.5: instrumentation + stability (toggleable) ----
+    parser.add_argument(
+        "--phase05-adaptive-attractor-dt",
+        action="store_true",
+        dest="phase05_adaptive_attractor_dt",
+        help="Per-batch-row inner dt: halve if energy rises, grow (cap base dt) on significant drop.",
+    )
+    parser.add_argument(
+        "--phase05-energy-reg-weight",
+        type=float,
+        default=0.001,
+        dest="phase05_energy_reg_weight",
+        metavar="W",
+        help="Trajectory: add W * mean(E^2) with E = per-row window potential on S_pred (0 disables).",
+    )
+    parser.add_argument(
+        "--no-state-normalization",
+        action="store_true",
+        dest="disable_state_normalization",
+        help="Disable per-row L2 normalize (dim=-1) after each window step and break updates.",
+    )
     parser.add_argument(
         "--phase05-log-metrics",
         action="store_true",
@@ -2920,6 +4041,76 @@ def main() -> None:
         dest="phase05_tension_w",
         metavar="W1,W2,W3",
         help="Tension weights (energy, alignment, entropy). Default: 1,λ,μ from model buffers.",
+    )
+    parser.add_argument(
+        "--phase05-tension-lambda",
+        type=float,
+        default=0.0,
+        dest="phase05_tension_lambda",
+        metavar="LAMBDA",
+        help="λ in window energy descent: E = mean(sum_i energy_heads[i])+λ·mean(compute_tension_window); 0=head only.",
+    )
+    parser.add_argument(
+        "--phase05-anchor-lambda",
+        type=float,
+        default=0.0,
+        dest="phase05_anchor_lambda",
+        metavar="LAMBDA",
+        help="Weight on mean nearest-token-embedding L2 distance in window energy (embeddings detached); 0=off.",
+    )
+    parser.add_argument(
+        "--phase05-anchor-force-strength",
+        type=float,
+        default=0.0,
+        dest="phase05_anchor_force_strength",
+        metavar="S",
+        help="Before energy descent each step: S <- S - strength * (S - nearest_embed); embeddings detached; 0=off.",
+    )
+    parser.add_argument(
+        "--phase05-anchor-search-topk",
+        type=int,
+        default=64,
+        dest="phase05_anchor_search_topk",
+        metavar="K",
+        help="Anchor search: readout_window top-K tokens per batch row; distances only vs those embeds.",
+    )
+    parser.add_argument(
+        "--phase05-anchor-contrastive-weight",
+        type=float,
+        default=0.0,
+        dest="phase05_anchor_contrastive_weight",
+        metavar="W",
+        help="Trajectory: W * anchor contrastive loss on last window state vs target vs random neg embeds.",
+    )
+    parser.add_argument(
+        "--phase05-anchor-contrastive-num-negatives",
+        type=int,
+        default=8,
+        dest="phase05_anchor_contrastive_num_negatives",
+        metavar="K",
+        help="Anchor contrastive: K random negative token embeddings per row (excluding target).",
+    )
+    parser.add_argument(
+        "--phase05-enable-anchor-freeze",
+        action="store_true",
+        dest="phase05_enable_anchor_freeze",
+        help="Zero energy gradients on wave slices within anchor_freeze_threshold of top-k embeds; see max-age.",
+    )
+    parser.add_argument(
+        "--phase05-anchor-freeze-threshold",
+        type=float,
+        default=0.03,
+        dest="phase05_anchor_freeze_threshold",
+        metavar="D",
+        help="Per-wave L2 distance to nearest top-k anchor slice below which gradient freeze applies.",
+    )
+    parser.add_argument(
+        "--phase05-anchor-freeze-max-age",
+        type=int,
+        default=0,
+        dest="phase05_anchor_freeze_max_age",
+        metavar="N",
+        help="Max consecutive stable outer steps to keep freezing (0 = no cap).",
     )
     parser.add_argument(
         "--phase05-multi-negative",
@@ -3080,6 +4271,8 @@ def main() -> None:
 
     if window_size < 2:
         raise SystemExit("window size must be >= 2")
+    if args.state_dim % args.num_waves != 0:
+        raise SystemExit("--state-dim must be divisible by --num-waves")
     if args.loss_mode == "trajectory" and traj_batch_size < 2:
         raise SystemExit("trajectory batch size must be >= 2 for contrastive training")
     num_epochs = args.max_epochs
@@ -3116,6 +4309,8 @@ def main() -> None:
         max_window_steps=args.num_dynamics_steps,
         convergence_epsilon=float(args.convergence_epsilon),
         min_attractor_steps=max(2, int(args.min_attractor_steps)),
+        num_waves=int(args.num_waves),
+        use_readout_fusion=bool(getattr(args, "readout_fusion", False)),
         phase05=_p05,
         phase1=_p1,
         phase2=_p2,
@@ -3128,7 +4323,7 @@ def main() -> None:
 
     if args.resume_checkpoint is not None and args.resume_checkpoint.is_file():
         ckpt = torch.load(args.resume_checkpoint, map_location="cpu")
-        model.load_state_dict(ckpt["model_state"])
+        load_torch_attractor_state_dict(model, ckpt["model_state"])
         global_step = ckpt.get("step", 0)
         start_epoch = ckpt.get("epoch", 0)
         print(
@@ -3156,8 +4351,9 @@ def main() -> None:
         _np = sum(p.numel() for p in model.parameters())
         _training_debug(
             True,
-            f"model params={_np:,}  state_dim={model.state_dim}  "
-            f"train_window={model.train_window_size}  max_window_steps={model.max_window_steps}",
+            f"model params={_np:,}  state_dim={model.state_dim}  num_waves={model.num_waves}  "
+            f"wave_dim={model.wave_dim}  train_window={model.train_window_size}  "
+            f"max_window_steps={model.max_window_steps}",
         )
 
     # ---- Phase 9: dynamics swap (vectorized default; fall back to simple on failure) ----
@@ -3167,15 +4363,16 @@ def main() -> None:
             from dynamics_vectorized import VectorizedWindowDynamics  # type: ignore[import]
 
             _vnh = max(1, int(getattr(args, "vectorized_num_heads", 4)))
-            if model.state_dim % _vnh != 0:
+            if model.wave_dim % _vnh != 0:
                 raise ValueError(
-                    f"state_dim={model.state_dim} not divisible by --vectorized-num-heads={_vnh}"
+                    f"wave_dim={model.wave_dim} (state_dim/num_waves) not divisible by "
+                    f"--vectorized-num-heads={_vnh}"
                 )
             _dmin, _dmax = (-0.55, -0.25) if bool(
                 getattr(args, "vectorized_strong_diffusion", False)
             ) else (-0.4, -0.1)
             model.dynamics = VectorizedWindowDynamics(
-                state_dim=model.state_dim,
+                state_dim=model.wave_dim,
                 window_size=model.train_window_size,
                 num_heads=_vnh,
                 rank=max(1, int(getattr(args, "vectorized_rank", 64))),
@@ -3188,7 +4385,11 @@ def main() -> None:
             ).to(device)
             print("[phase-9] VectorizedWindowDynamics active", flush=True)
         except Exception as _dyn_err:
-            print(f"[phase-9] Warning: vectorized dynamics unavailable ({_dyn_err}); using simple.", flush=True)
+            print(
+                f"[phase-9] Warning: vectorized dynamics unavailable ({_dyn_err}); "
+                "using per-wave WaveDynamics.",
+                flush=True,
+            )
             _dynamics_backend = "simple"
 
     if torch.cuda.is_available():
@@ -3248,7 +4449,8 @@ def main() -> None:
     if args.debug:
         _training_debug(
             True,
-            f"dynamics={type(model.dynamics).__name__}  torch.compile={_compile_status}",
+            f"dynamics={type(model.dynamics).__name__ if model.dynamics is not None else 'WaveDynamics'}  "
+            f"torch.compile={_compile_status}",
         )
         _training_debug(
             True,
@@ -3471,10 +4673,16 @@ def main() -> None:
             )
         else:
             _training_debug(True, "pipeline: legacy in-memory iterator (no AttractorDataPipeline)")
-    if args.loss_mode == "trajectory" and args.token_aux_ce <= 0 and args.readout_aux_alpha <= 0:
+    if (
+        args.loss_mode == "trajectory"
+        and args.token_aux_ce <= 0
+        and args.readout_aux_alpha <= 0
+        and getattr(args, "trajectory_intermediate_ce_weight", 0.0) <= 0
+    ):
         print(
-            "Warning: trajectory mode with token_aux_ce=0 and readout_aux_alpha=0 — "
-            "readout head gets no gradients. Use --token-aux-ce or --readout-aux-alpha.",
+            "Warning: trajectory mode with token_aux_ce=0, readout_aux_alpha=0, and "
+            "trajectory_intermediate_ce_weight=0 — readout head gets no gradients. "
+            "Use --token-aux-ce, --readout-aux-alpha, or --trajectory-intermediate-ce-weight.",
             flush=True,
         )
 
@@ -3519,6 +4727,11 @@ def main() -> None:
         batch_idx = -1
         attractor_steps_hist: list[int] = []
         attractor_conv_hist: list[bool] = []
+        energy_fast_sum_mean = 0.0
+        energy_fast_sum_var = 0.0
+        energy_fast_sum_min = 0.0
+        energy_fast_sum_max = 0.0
+        energy_fast_n = 0
 
         if pipeline is not None:
             # ---- Phase 2: streaming data pipeline ----
@@ -3655,6 +4868,21 @@ def main() -> None:
                     attractor_steps_hist.append(int(model._last_attractor_steps_used))
                     attractor_conv_hist.append(bool(model._last_convergence_triggered))
 
+                if args.metrics_fast_csv is not None:
+                    _bem = getattr(model, "_last_batch_energy_mean", float("nan"))
+                    if math.isfinite(_bem):
+                        energy_fast_sum_mean += _bem
+                        energy_fast_sum_var += float(
+                            getattr(model, "_last_batch_energy_variance", 0.0)
+                        )
+                        energy_fast_sum_min += float(
+                            getattr(model, "_last_batch_energy_min", float("nan"))
+                        )
+                        energy_fast_sum_max += float(
+                            getattr(model, "_last_batch_energy_max", float("nan"))
+                        )
+                        energy_fast_n += 1
+
                 if phase05_csv_writer is not None:
                     _bce_log = _bce if math.isfinite(_bce) else float("nan")
                     phase05_csv_writer.writerow(
@@ -3691,14 +4919,42 @@ def main() -> None:
 
                 ts = model._last_adaptive_window_steps
                 if batch_idx % report_every == 0:
+                    _wt = model._phase05_last_window_trace or {}
+                    _ebar = _wt.get("energy_descent_base_mean", float("nan"))
+                    _etn = _wt.get("energy_descent_tension_mean", float("nan"))
+                    _etot = _wt.get("energy_descent_total_mean", float("nan"))
+                    _estr = ""
+                    if model.phase05_config.log_metrics and (
+                        math.isfinite(_ebar)
+                        or math.isfinite(_etn)
+                        or math.isfinite(_etot)
+                    ):
+                        _estr = (
+                            f"  E_base={_ebar:.4f}  T_en={_etn:.4f}  E_tot={_etot:.4f}"
+                        )
+                    _ffm = _wt.get("frozen_fraction_mean", float("nan"))
+                    _ffs = _wt.get("frozen_fraction_std", float("nan"))
+                    if model.phase05_config.log_metrics and math.isfinite(_ffm):
+                        _estr += f"  ff_m={_ffm:.3f}  ff_s={_ffs:.3f}"
+                    _adc = model._last_attractor_dt_curve
+                    if _adc and model.phase05_config.log_metrics:
+                        _estr += (
+                            "  dt_mean=["
+                            + ", ".join(f"{x:.5g}" for x in _adc[:10])
+                            + ("...]" if len(_adc) > 10 else "]")
+                        )
                     if curve:
                         cs = "[" + ", ".join(f"{x:.4f}" for x in curve) + "]"
                         print(
-                            f"    [batch {batch_idx + 1}] loss={li:.4f}  T={cs}  steps={ts}",
+                            f"    [batch {batch_idx + 1}] loss={li:.4f}  T={cs}  steps={ts}"
+                            f"{_estr}",
                             flush=True,
                         )
                     else:
-                        print(f"    [batch {batch_idx + 1}] loss={li:.4f}", flush=True)
+                        print(
+                            f"    [batch {batch_idx + 1}] loss={li:.4f}{_estr}",
+                            flush=True,
+                        )
 
             mean_loss = loss_sum / max(batch_idx + 1, 1)
             if final_tension_values:
@@ -3879,6 +5135,42 @@ def main() -> None:
                         "tscore_evolves", "tscore_last_tension",
                     ])
                 w.writerow(row)
+
+        if args.metrics_fast_csv is not None:
+            mfpath = Path(args.metrics_fast_csv)
+            mfpath.parent.mkdir(parents=True, exist_ok=True)
+            mf_new = not mfpath.exists() or mfpath.stat().st_size == 0
+            if energy_fast_n > 0:
+                inv = 1.0 / float(energy_fast_n)
+                ep_mean_e = energy_fast_sum_mean * inv
+                ep_mean_var = energy_fast_sum_var * inv
+                ep_mean_min = energy_fast_sum_min * inv
+                ep_mean_max = energy_fast_sum_max * inv
+            else:
+                ep_mean_e = ep_mean_var = ep_mean_min = ep_mean_max = float("nan")
+            with mfpath.open("a", newline="", encoding="utf-8") as mff:
+                mw = csv.writer(mff)
+                if mf_new:
+                    mw.writerow(
+                        [
+                            "epoch",
+                            "mean_energy",
+                            "energy_variance",
+                            "energy_min",
+                            "energy_max",
+                            "global_step",
+                        ]
+                    )
+                mw.writerow(
+                    [
+                        epoch + 1,
+                        f"{ep_mean_e:.8f}" if math.isfinite(ep_mean_e) else "",
+                        f"{ep_mean_var:.8f}" if math.isfinite(ep_mean_var) else "",
+                        f"{ep_mean_min:.8f}" if math.isfinite(ep_mean_min) else "",
+                        f"{ep_mean_max:.8f}" if math.isfinite(ep_mean_max) else "",
+                        str(global_step),
+                    ]
+                )
 
         if args.attractor_steps_metrics_csv is not None and attractor_steps_hist:
             apath = Path(args.attractor_steps_metrics_csv)

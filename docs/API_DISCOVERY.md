@@ -1,7 +1,7 @@
 # API Discovery — Vendored Submodules
 
 Verified entrypoints for all three TS-OS vendored repos as of the pinned submodule SHAs.
-Last verified: March 2026.
+Last verified: April 2026 (Boggers integration table refreshed for multi-wave stack).
 
 ---
 
@@ -10,25 +10,27 @@ Last verified: March 2026.
 | Entry | Role |
 |-------|------|
 | `_build_tokenizer(mode, vocab_cap)` | Loads `AttractorTokenizer` from `vendor/ts-llm` (`tiktoken` or `fallback` cap). |
-| `Phase05Config` (`phase05_config.py`) | Instrumentation: log metrics, batch CSV path, adaptive window dt, neg-def diffusion, tension weights, trajectory negatives. |
-| `Phase1Config` (`phase1_config.py`) | Multi-head drift (`num_heads`, `head_dim_mode`), window interaction `C`, head diversity weight, per-head tension logging. |
-| `Phase2Config` (`phase2_config.py`) | Directional breaks, residual mixing gate, `C` regularisation / distance decay, head tension weighting, break memory. |
-| `TorchAttractorLanguageModel(vocab_size, …, phase05=, phase1=, phase2=, convergence_epsilon=, min_attractor_steps=)` | Core model; defaults construct `Phase05Config` / `Phase1Config` / `Phase2Config` if omitted. Optional window early-exit knobs mirror CLI (`convergence_epsilon=0` runs all outer steps). Set `model.tokenizer` for encode/decode. |
-| `embed_window(ids)` / `embed_windows_batch(context_tensor)` | Single window **`(W,) → (W, D)`** vs batch **`(B, W) → (B, W, D)`** with the same norm + row-wise unit norm as stacking **`embed_window`** per row. Trajectory training uses the batched path. |
-| `run_window_dynamics(..., context_ids=…, convergence_epsilon=, min_attractor_steps=)` | Outer time loop only; caches static coupling / `C` / GOAT tensors once per call. Optional early exit when **batch size `B == 1`** and epsilon &gt; 0 (`B &gt; 1` runs all `max_window_steps`). Tension curves only when requested. |
-| `model.dynamics.step(S, signal)` | Unified step API on **`SimpleAttractorDynamics`** or **`VectorizedWindowDynamics`** (CLI default **`--dynamics vectorized`**). |
-| `phase05_batch_csv_values()` / `PHASE05_BATCH_CSV_HEADER` | Flat row + column names for `--phase05-batch-metrics-csv` (Phase 0.5 + 1 + 2 + optional attractor diagnostics: steps used, final tension, break count, convergence flag). |
-| `AttractorDataPipeline` (`data_pipeline.py`) | Streaming train batches when import succeeds; else legacy in-memory shuffle. |
-| `mean_cross_entropy_eval(model, dataset, batch_size=…)` | Held-out CE path. Uses batched `embed_windows_batch -> run_window_dynamics -> readout_window` plus the same eval-time shaping as the old single-window path (bigram bias, repeat penalties, label smoothing). |
-| `trajectory_contrastive_loss_and_logits(contexts, targets, teacher_steps=None, update_repulsion_memory=True)` | Main training forward. Student path is unchanged; detached teacher path may use fewer outer steps when `teacher_steps` is set. `update_repulsion_memory=False` keeps evaluation/logging forwards from mutating training repulsion history. |
-| `load_model_from_checkpoint(path, tokenizer_mode=, vocab_cap=, device=, …)` | Restore model + tokenizer from `_save_checkpoint` output; rebuilds **`VectorizedWindowDynamics`** (heads, rank, `dt`, `use_lorentz`) when `dynamics.mhd.*` keys exist, then **`load_state_dict`**. Used by **`scripts/generate_sample.py`** and **`inference_server.py`**. |
-| `TorchAttractorLanguageModel.generate(prompt, max_tokens=, temperature=, top_k=, …)` | Decoding: **`forward_training_window` → `readout_window` / `effective_temperature`** (training-aligned). |
+| `Phase05Config` (`phase05_config.py`) | Tension / anchor / batch CSV / adaptive window & attractor dt / **anchor freeze** (`enable_anchor_freeze`, `anchor_freeze_threshold`, `anchor_freeze_max_age`) / trajectory CE weight / energy reg. |
+| `Phase1Config` (`phase1_config.py`) | Window interaction `C`, head diversity, per-head tension logging. |
+| `Phase2Config` (`phase2_config.py`) | Directional breaks, residual mixing, `C` regularisation / decay, head tension weighting, break memory. |
+| `TorchAttractorLanguageModel(..., num_waves=, use_readout_fusion=, wave_interaction_strength=, …)` | Core model. State **`D`** splits into **`num_waves × wave_dim`**. Default **`model.dynamics`** is **`None`**; **`wave_dynamics`** (per-wave **`WaveDynamics`**) + **`wave_interaction`** act on **`evolve_token`**. **`energy_heads`**: one MLP per wave for window energy. |
+| `embed_window` / `embed_windows_batch` | **`(W,)→(W,D)`** vs **`(B,W)→(B,W,D)`** with identical geometry to stacked single windows. |
+| `run_window_dynamics` | Outer loop: coupling → GOAT → anchor pull → **inner energy gradient step** (sum of per-wave energies + optional λ·tension + anchor distance) → Phase 1 interaction → optional normalize. **Optional anchor freeze** zeros ∇ on frozen wave slices. **Not** `dynamics.step` per outer step. |
+| `readout_window_logits(S)` / `_readout_window_logits` | Canonical training readout path: normalize to **`(B,W,D)`** → optional **`readout_fusion` Linear(D,D)** per position → **`readout_window`**. |
+| `readout_window` | Final **`Linear(W·D, V)`**; calling it alone **skips** fusion. |
+| `model.dynamics.step(S, signal)` | Used in **`evolve_token`** when **`VectorizedWindowDynamics`** is attached (**`--dynamics vectorized`**); operates on **`wave_dim`** slices. |
+| `phase05_batch_csv_values` / `PHASE05_BATCH_CSV_HEADER` | Includes attractor diagnostics, **`energy_per_wave_means`**, **`frozen_fraction_mean` / `frozen_fraction_std`** when freeze enabled, Phase 1–2 columns. |
+| `AttractorDataPipeline` (`data_pipeline.py`) | Streaming train batches when import succeeds. |
+| `mean_cross_entropy_eval` | Batched **`embed_windows_batch → run_window_dynamics → readout_window_logits`** + eval shaping (bigram, repeats, label smoothing). |
+| `trajectory_contrastive_loss_and_logits` | Main training forward; teacher path optional fewer steps via **`teacher_steps`**. |
+| `load_model_from_checkpoint` | Rebuilds **`VectorizedWindowDynamics`** when **`dynamics.mhd.*`** in state dict; tolerates missing **`energy_heads`**, **`wave_interaction`**, **`readout_fusion`**; broadcasts legacy **`energy_head.*`** into every **`energy_heads[i]`**. |
+| `generate` | **`forward_training_window` → `readout_window_logits` / `effective_temperature`**. |
 
 ## Legacy inference cache (not training-parity logits)
 
 | Entry | Role |
 |-------|------|
-| `AttractorStateCache` / `generate_with_cache` (`state_cache.py`) | **`step()`** matches training embedding + `run_window_dynamics`. **`logits()`** uses **`readout(D)`** only — **not** **`readout_window`**. Deprecated for decoding; prefer **`generate`** + **`load_model_from_checkpoint`**. |
+| `AttractorStateCache` / `generate_with_cache` (`state_cache.py`) | **`step()`** matches training embedding + `run_window_dynamics`. **`logits()`** uses **`readout(D)`** only — **not** **`readout_window_logits`**. Deprecated for decoding; prefer **`generate`** + **`load_model_from_checkpoint`**. |
 
 ---
 

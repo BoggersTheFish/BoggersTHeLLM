@@ -21,7 +21,7 @@ Usage
         rank=64,
         max_steps=model.max_window_steps,
     )
-    S_out, _ = run_window_dynamics_vectorized(S, model, vec_dyn)
+    S_out, _, _ = run_window_dynamics_vectorized(S, model, vec_dyn)
 
 Parity tests
 ------------
@@ -174,7 +174,7 @@ def run_window_dynamics_vectorized(
     collect_metrics: bool = False,
     record_tension_log: bool = True,
     **kwargs: object,
-) -> tuple[torch.Tensor, list[dict] | None]:
+) -> tuple[torch.Tensor, list[dict] | None, list[torch.Tensor] | None]:
     """
     Redirect to ``model.run_window_dynamics`` with ``model.dynamics`` temporarily set to
     ``vec_dyn`` so only ``.step`` is used (no ``VectorizedWindowDynamics.forward``).
@@ -247,13 +247,19 @@ if __name__ == "__main__":
     # --- test 1: run_window_dynamics + VectorizedWindowDynamics.step is finite ---
     torch.manual_seed(0)
     vec_dyn = VectorizedWindowDynamics(state_dim=STATE_DIM, window_size=WINDOW_SIZE, num_heads=4, rank=16, max_steps=8)
-    model = sb.TorchAttractorLanguageModel(512, state_dim=STATE_DIM, train_window_size=WINDOW_SIZE, max_window_steps=8)
+    model = sb.TorchAttractorLanguageModel(
+        512,
+        state_dim=STATE_DIM,
+        train_window_size=WINDOW_SIZE,
+        max_window_steps=8,
+        num_waves=1,
+    )
     model.eval()
     saved = model.dynamics
     model.dynamics = vec_dyn
     S = torch.randn(2, WINDOW_SIZE, STATE_DIM)
     with torch.no_grad():
-        S_out, _logs = model.run_window_dynamics(S.clone(), record_tension_log=True)
+        S_out, _logs, _ = model.run_window_dynamics(S.clone(), record_tension_log=True)
     model.dynamics = saved
     assert torch.isfinite(S_out).all(), "run_window_dynamics + vec_dyn output has non-finite values"
     assert len(model._last_window_tension_curve) > 0, "tension curve is empty"
@@ -264,11 +270,17 @@ if __name__ == "__main__":
 
     # --- test 2: gradient flows through vectorized dynamics via run_window_dynamics
     vec_dyn2 = VectorizedWindowDynamics(state_dim=STATE_DIM, window_size=WINDOW_SIZE, num_heads=4, rank=16, max_steps=8)
-    model2 = sb.TorchAttractorLanguageModel(512, state_dim=STATE_DIM, train_window_size=WINDOW_SIZE, max_window_steps=8)
+    model2 = sb.TorchAttractorLanguageModel(
+        512,
+        state_dim=STATE_DIM,
+        train_window_size=WINDOW_SIZE,
+        max_window_steps=8,
+        num_waves=1,
+    )
     model2.train()
     model2.dynamics = vec_dyn2
     S_train = torch.randn(2, WINDOW_SIZE, STATE_DIM, requires_grad=True)
-    S_out2, _ = model2.run_window_dynamics(S_train, record_tension_log=False)
+    S_out2, _, _ = model2.run_window_dynamics(S_train, record_tension_log=False)
     loss = S_out2.pow(2).mean()
     loss.backward()
     grad = vec_dyn2.mhd.U.grad
@@ -276,15 +288,21 @@ if __name__ == "__main__":
     print(f"  test 2 PASS — gradient flows (mhd.U grad norm={grad.norm():.4f})", flush=True)
 
     # --- test 3: simple vs vectorized dynamics both finite (different fields) ---
-    model3 = sb.TorchAttractorLanguageModel(512, state_dim=STATE_DIM, train_window_size=WINDOW_SIZE, max_window_steps=8)
+    model3 = sb.TorchAttractorLanguageModel(
+        512,
+        state_dim=STATE_DIM,
+        train_window_size=WINDOW_SIZE,
+        max_window_steps=8,
+        num_waves=1,
+    )
     model3.eval()
     S_base = torch.randn(1, WINDOW_SIZE, STATE_DIM)
     with torch.no_grad():
-        S_simple, _ = model3.run_window_dynamics(S_base.clone())
+        S_simple, _, _ = model3.run_window_dynamics(S_base.clone())
     vec_dyn3 = VectorizedWindowDynamics(state_dim=STATE_DIM, window_size=WINDOW_SIZE, num_heads=4, rank=16, max_steps=8)
     model3.dynamics = vec_dyn3
     with torch.no_grad():
-        S_vec, _ = model3.run_window_dynamics(S_base.clone())
+        S_vec, _, _ = model3.run_window_dynamics(S_base.clone())
     assert torch.isfinite(S_simple).all(), "simple dynamics produced non-finite output"
     assert torch.isfinite(S_vec).all(), "vectorized dynamics produced non-finite output"
     ref_flat = S_simple.reshape(-1)
@@ -294,11 +312,19 @@ if __name__ == "__main__":
     print(f"  test 3 PASS — both finite; cosine(simple,vec)={cos:.4f}  L2={l2:.4f}", flush=True)
 
     # --- test 4: run_window_dynamics_vectorized drop-in -------------------
-    model4 = sb.TorchAttractorLanguageModel(512, state_dim=STATE_DIM, train_window_size=WINDOW_SIZE, max_window_steps=8)
+    model4 = sb.TorchAttractorLanguageModel(
+        512,
+        state_dim=STATE_DIM,
+        train_window_size=WINDOW_SIZE,
+        max_window_steps=8,
+        num_waves=1,
+    )
     model4.eval()
     vec_dyn4 = VectorizedWindowDynamics(state_dim=STATE_DIM, window_size=WINDOW_SIZE, num_heads=4, rank=16, max_steps=8)
     with torch.no_grad():
-        S_drop, logs = run_window_dynamics_vectorized(S_base.clone(), model4, vec_dyn4, collect_metrics=True)
+        S_drop, logs, _ = run_window_dynamics_vectorized(
+            S_base.clone(), model4, vec_dyn4, collect_metrics=True
+        )
     assert torch.isfinite(S_drop).all(), "drop-in wrapper produced non-finite output"
     assert hasattr(model4, "_last_window_tension_curve"), "model._last_window_tension_curve not set"
     print(f"  test 4 PASS — drop-in wrapper OK, tension_curve={model4._last_window_tension_curve}", flush=True)

@@ -75,7 +75,9 @@ S0 = model.embed_window(window_ids)
 
 print("[smoke] running window dynamics ...", flush=True)
 with torch.inference_mode():
-    S_out, dyn_logs = model.run_window_dynamics(S0, collect_metrics=True, record_tension_log=True)
+    S_out, dyn_logs, _ = model.run_window_dynamics(
+        S0, collect_metrics=True, record_tension_log=True
+    )
 
 # Check output tensor is finite
 assert torch.isfinite(S_out).all(), "State tensor contains non-finite values after dynamics."

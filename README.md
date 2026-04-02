@@ -4,52 +4,63 @@
 
 **Primary repository:** [github.com/BoggersTheFish/BoggersTheLLM](https://github.com/BoggersTheFish/BoggersTheLLM). **Alternate mirror:** [github.com/BoggersTheFish/idekatp](https://github.com/BoggersTheFish/idekatp). The product name is **BoggersTheLanguageModel**.
 
+**Docs:** [docs/README.md](docs/README.md) indexes all guides; [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md) summarizes what is implemented and what to do next; [docs/DEVELOPMENT_ROADMAP.md](docs/DEVELOPMENT_ROADMAP.md) is the phased roadmap.
+
 ---
 
 ## Architecture overview
 
+State dimension **`D`** splits into **`num_waves`** channels of **`wave_dim`** each (`D = num_waves × wave_dim`). Slices are **contiguous** in the last dimension.
+
 ```
-Corpus / Token stream
+Corpus / token stream
         │
         ▼
-┌─────────────────────────────────────────────────────────┐
-│  TorchAttractorLanguageModel  (sandbox.py)              │
-│                                                         │
-│  embed_window / embed_windows_batch → (W, D) or (B, W, D) │
-│         │                                               │
-│         ▼                                               │
-│  run_window_dynamics()  ← outer loop (≤ max_window_steps; optional early exit if B=1) │
-│    ┌─ positional coupling + dynamics.step(S, signal)    │
-│    │     (SimpleAttractorDynamics or VectorizedWindow)  │
-│    ├─ optional GOAT activation_bonus → per-position signal│
-│    ├─ compute_tension_window (geometry ± entropy)       │
-│    │     (alias: compute_window_tension)                │
-│    └─ tension-driven breaks (Phase 2: directional escape) │
-│         + GOAT transition + high-T renorm                  │
-│         │                                               │
-│  readout_window() → logits (training / trajectory)      │
-└─────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│  TorchAttractorLanguageModel  (sandbox.py)                           │
+│                                                                      │
+│  embed_window / embed_windows_batch  →  (W, D) or (B, W, D)         │
+│         │                                                            │
+│         ▼                                                            │
+│  run_window_dynamics()  — outer loop (≤ max_window_steps)            │
+│    • Positional coupling (+ Phase 1 C·mask after inner step)       │
+│    • Optional GOAT per-position signal                               │
+│    • Optional anchor pull (readout top-k embeds, detached)           │
+│    • Inner step: S ← S − dt·∇E  with E = Σ_i energy_head_i(wave_i)   │
+│      + optional λ·tension_window(S) + anchor distance terms          │
+│    • Optional anchor-guided freeze: zero ∇ on converged wave slices  │
+│    • Phase 2 tension breaks + renorm                                 │
+│         │                                                            │
+│         ▼                                                            │
+│  readout_window_logits(S)  — (B,W,D) full state                      │
+│    → optional Linear(D,D) per position if --readout-fusion           │
+│    → readout_window: W·D → vocab                                     │
+└──────────────────────────────────────────────────────────────────────┘
         │
         ▼
 ┌─────────────────────────────┐   ┌────────────────────────────┐
 │ Decoding (training-aligned) │   │  LLMSubstrateNode          │
 │ model.generate() →          │   │  (llm_substrate_node.py)   │
 │ forward_training_window →   │   │  Propagate → Evolve hook   │
-│ readout_window              │   │                            │
+│ readout_window_logits       │   │                            │
 └─────────────────────────────┘   └────────────────────────────┘
 
-  Legacy: state_cache.generate_with_cache / cache.logits use readout(D) only —
-  not equivalent to readout_window; prefer generate + sandbox.load_model_from_checkpoint.
+  Token path (evolve_token): per-wave WaveDynamics + wave_interaction, OR
+  VectorizedWindowDynamics.step on (num_waves, wave_dim) when model.dynamics.mhd is set.
+
+  Legacy: state_cache uses readout(D), not readout_window_logits — prefer generate + checkpoint loader.
 ```
 
-**No attention. No transformer blocks. No external model weights.**
+**No attention. No transformer blocks. No external foundation weights.**
 
-The network contains only:
-- A learnable diffusion matrix `A` (negative-definite, stable dynamics) in the **simple** path (`--dynamics simple`), or **low-rank multi-head** diffusion in the **default** **`--dynamics vectorized`** path
-- A `tanh`-bounded (simple window step) or **cubic** (vectorized) nonlinearity with damping
-- **Window path:** state `S` is `(B, W, D)`; **token path** (`evolve_token`): fast/slow `(D,)` with symplectic blend for `readout`
-- **`readout_window`:** linear map `W·D → vocab` (training default); **`readout`:** `D → vocab` (cache / `next_token_logits`)
-- **Two tension scalars:** `compute_tension_window(S)` after each window step (geometry + optional entropy); `compute_tension(fast, slow, logits, …)` inside `evolve_token` (energy drift + alignment + entropy)
+Core learnable pieces (high level):
+
+- **Window relaxation:** one small MLP **per wave** maps wave slice → scalar energy; sum defines the attractor potential (plus optional tension / anchor terms).
+- **Token-time dynamics:** **`wave_dynamics`** (`WaveDynamics` × `num_waves`) plus **`wave_interaction`** mixing across waves; **`--dynamics vectorized`** attaches **`VectorizedWindowDynamics`** on **`wave_dim`** for the **`evolve_token`** path (`step(S, signal)`).
+- **Readout:** **`readout_window`** maps flattened window to vocab; use **`readout_window_logits(S)`** so optional **readout fusion** runs.
+- **Tension:** **`compute_tension_window(S)`** on the window tensor; **`compute_tension`** on fast/slow + logits inside **`evolve_token`**.
+
+See **`docs/PROJECT_STATUS.md`** for a frank “where we are” checklist and **`docs/README.md`** for the doc index.
 
 ---
 
@@ -58,14 +69,14 @@ The network contains only:
 | File / Directory | Wave | Purpose |
 |---|---|---|
 | `sandbox.py` | Phase 0+ | **BoggersTheLanguageModel** core: training, `generate`, `load_model_from_checkpoint`, `_save_checkpoint` |
-| `phase05_config.py` | 0.5 | `Phase05Config`: tension weights, batch CSV, adaptive dt, neg-def diffusion |
+| `phase05_config.py` | 0.5 | `Phase05Config`: tension, anchor terms, batch CSV, adaptive dt, **anchor freeze**, neg-def diffusion flag |
 | `phase1_config.py` | 1 | `Phase1Config`: multi-head drift, window interaction matrix `C`, diversity loss |
 | `phase2_config.py` | 2 | `Phase2Config`: directional breaks, residual mixing, `C` reg, head tension weights |
 | `smoke_test.py` | Phase 0 | 5-assertion integration test (dynamics + TSCore wave cycle) |
 | `tests/test_embed_windows_batch.py` | — | Parity check: `embed_windows_batch` vs stacking `embed_window` per row |
 | `wave_a_tokenizer.py` | A | tiktoken BPE helpers; training uses `sandbox._build_tokenizer()` |
 | `dynamics_vectorized.py` | B | `VectorizedWindowDynamics`: `step(S, signal)` only; `forward` disabled; `run_window_dynamics_vectorized` → `model.run_window_dynamics` |
-| `state_cache.py` | C | **Deprecated for decoding:** rolling cache; `logits()` uses `readout` (≠ training `readout_window`). Prefer `model.generate`. |
+| `state_cache.py` | C | **Deprecated for decoding:** rolling cache; `logits()` uses `readout` (≠ training `readout_window_logits`). Prefer `model.generate`. |
 | `scripts/generate_sample.py` | — | Load checkpoint via `sandbox.load_model_from_checkpoint` → `model.generate` (training-parity readout) |
 | `scripts/ts_workflow_smoke.py` | — | Smoke: `forward_training_window` + `model.generate` + simple/vectorized `run_window_dynamics` |
 | `data_pipeline.py` | D | Streaming sharded DataLoader (txt / JSONL, multi-worker) |
@@ -81,9 +92,11 @@ The network contains only:
 | `vendor/GOAT-TS` | — | Constraint-graph engine (submodule) |
 | `vendor/TS-Core` | — | UniversalLivingGraph + WaveCycleRunner (submodule) |
 | `vendor/ts-llm` | — | Tokenizer, hierarchical dynamics, attractor LLM package (submodule) |
-| `docs/API_DISCOVERY.md` | — | Verified entrypoints for vendored repos + model config surface |
+| `docs/README.md` | — | Index of all docs in `docs/` |
+| `docs/PROJECT_STATUS.md` | — | Current implementation status, gaps, recommended next steps |
+| `docs/API_DISCOVERY.md` | — | Vendored TS-OS entrypoints + `sandbox.py` integration surface |
 | `docs/BASELINE.md` | — | Phase 0 baseline recording instructions |
-| `docs/DEVELOPMENT_ROADMAP.md` | — | Engineering vs validation phases (performance targets, dataset order) |
+| `docs/DEVELOPMENT_ROADMAP.md` | — | Phased roadmap (measurement, throughput, multi-wave behavior) |
 | `scripts/plot_phase05_metrics.py` | — | Plots `--phase05-batch-metrics-csv` columns (incl. Phase 1–2 extras) |
 
 ---
@@ -265,7 +278,7 @@ This section is the operational manual — what to run, how data and validation 
 
 **Device and checkpoints.** `--device auto` picks CUDA when available. `--resume-checkpoint` restores weights and optimizer state. `--checkpoint-dir` and `--save-every` control where and how often numbered checkpoints are written.
 
-**Integrations.** `--use-substrate` attaches `LLMSubstrateNode` so language tension can drive TSCore propagation and logging. `--use-goat-memory` enables `GoatMemoryManager` and injects a per-position signal into window dynamics. By default **`--dynamics vectorized`** loads `VectorizedWindowDynamics` from `dynamics_vectorized.py` (falls back to simple if import fails). Use **`--dynamics simple`** for the legacy `SimpleAttractorDynamics` path.
+**Integrations.** `--use-substrate` attaches `LLMSubstrateNode` so language tension can drive TSCore propagation and logging. `--use-goat-memory` enables `GoatMemoryManager` and injects a per-position signal into window dynamics. By default **`--dynamics vectorized`** replaces `model.dynamics` with **`VectorizedWindowDynamics`** on **`wave_dim`** (from `dynamics_vectorized.py`; falls back to non-vectorized if import fails). **`--dynamics simple`** leaves **`model.dynamics`** unset so **`evolve_token`** uses **`wave_dynamics`** (per-wave **`WaveDynamics`**) plus **`wave_interaction`**; the window path is unchanged (energy descent in **`run_window_dynamics`**). The legacy **`SimpleAttractorDynamics`** class remains in code for compatibility but is not the default.
 
 ### Corpus, paths, and automatic synthetic text
 
@@ -340,7 +353,7 @@ python3 sandbox.py --corpus data/generated.txt
 **Throughput and hardware**
 
 - Use **`--device cuda`** when available. On CUDA, **`torch.set_float32_matmul_precision("high")`** is set, and **`torch.compile`** targets only the inner step (**`dyn._step`** for vectorized, **`dyn._step_rows`** for simple)—not the outer window loop. First epoch can be slower while kernels warm up.
-- **`--dynamics vectorized`** (default) can help on GPU at larger `D`; **`--dynamics simple`** is fine for CPU smoke tests and small models.
+- **`--dynamics vectorized`** (default) can help on GPU when token-time **`evolve_token`** uses **`MultiHeadDynamics`**; ensure **`wave_dim`** is divisible by **`--vectorized-num-heads`**. **`--dynamics simple`** is fine for CPU smoke tests (per-wave **`WaveDynamics`** on the token path).
 
 **Optimisation and stability**
 
@@ -405,9 +418,11 @@ model.tokenizer = tok
 
 ### Wave B — Vectorized dynamics
 
-`dynamics_vectorized.py` provides **`VectorizedWindowDynamics`**, selected by default via **`--dynamics vectorized`** (replaces `model.dynamics` after construction; use **`--dynamics simple`** for `SimpleAttractorDynamics`).
+`dynamics_vectorized.py` provides **`VectorizedWindowDynamics`**, selected by default via **`--dynamics vectorized`**. It is attached to **`model.dynamics`** with **`state_dim=wave_dim`** (per-wave channel width). The unified **`step(S, signal) → S`** API is used on the **token** path (**`evolve_token`**) when **`model.dynamics.mhd`** is present.
 
-Both **`SimpleAttractorDynamics`** and **`VectorizedWindowDynamics`** implement the same **`step(S, signal) → S`** interface used inside **`run_window_dynamics`** (positional coupling first, then one dynamics step with the optional GOAT signal tensor). **`run_window_dynamics`** caches per-window static work (positional weight matrix, **`C * mask`** for Phase 1, GOAT bonus vector) outside the time-step loop.
+**`run_window_dynamics`** does **not** call **`dynamics.step`** each outer step: it applies positional coupling, optional GOAT signal, optional anchor pull, then **one inner energy-gradient step** (learned **`energy_heads`**, optional tension / anchor distance), then Phase 1 global interaction. Static tensors (positional weights, **`C * mask`**, GOAT bonus) are cached for the outer loop.
+
+With **`--dynamics simple`**, **`model.dynamics`** stays **`None`**; **`evolve_token`** uses **`wave_dynamics`** + **`wave_interaction`** instead.
 
 - Wraps **`MultiHeadDynamics`** from `vendor/ts-llm` (low-rank diffusion per head + cross-head coupling); window step uses **cubic** nonlinearity (simple path uses **`tanh`**).
 - **`forward` on `VectorizedWindowDynamics` is disabled** (`NotImplementedError`); use **`model.run_window_dynamics`** or **`run_window_dynamics_vectorized`**, which temporarily swaps dynamics and calls **`model.run_window_dynamics`** (optional **`**kwargs`** forwarded to **`run_window_dynamics`**).
@@ -417,9 +432,9 @@ Both **`SimpleAttractorDynamics`** and **`VectorizedWindowDynamics`** implement 
 
 ### Wave C — State cache (legacy decoding)
 
-**For text generation, use `TorchAttractorLanguageModel.generate()`** (same path as training: **`forward_training_window` → `readout_window` / `effective_temperature`**). **`scripts/generate_sample.py`** and **`inference_server.py`** both load checkpoints with **`sandbox.load_model_from_checkpoint`** (rebuilds **`VectorizedWindowDynamics`** with **`vectorized_dt`**, **`use_lorentz`** before **`load_state_dict`**).
+**For text generation, use `TorchAttractorLanguageModel.generate()`** (same path as training: **`forward_training_window` → `readout_window_logits` / `effective_temperature`**). **`scripts/generate_sample.py`** and **`inference_server.py`** both load checkpoints with **`sandbox.load_model_from_checkpoint`** (rebuilds **`VectorizedWindowDynamics`** with **`vectorized_dt`**, **`use_lorentz`** before **`load_state_dict`**).
 
-`state_cache.py` remains for experiments; **`generate_with_cache`** and **`cache.logits()`** emit **`FutureWarning`** — they use **`readout(fast/slow)`**, not **`readout_window`**, so logits **do not** match trajectory training.
+`state_cache.py` remains for experiments; **`generate_with_cache`** and **`cache.logits()`** emit **`FutureWarning`** — they use **`readout(fast/slow)`**, not **`readout_window_logits`**, so logits **do not** match trajectory training.
 
 - **`step(token_id)`** — same window embedding + **`run_window_dynamics`** on **`(1, W, D)`** (dynamics aligned; readout head is not)
 - **`logits()`** / **`generate_with_cache`** — deprecated for production decoding
@@ -496,7 +511,7 @@ State machine (per token):
 `inference_server.py` exposes the model via FastAPI:
 
 - OpenAI-compatible `/v1/completions` (drop-in for any client that targets the OpenAI API)
-- **`model.generate()`** for completions (training-parity **`readout_window`** path)
+- **`model.generate()`** for completions (training-parity **`readout_window_logits`** path)
 - Checkpoints: **`sandbox.load_model_from_checkpoint`** (same as **`scripts/generate_sample.py`**) so **vectorized** weights load correctly
 - TSCore sidecar: `/ts/propagate` and `/ts/tension` endpoints
 - Thread-safe: `threading.Lock()` wraps generate calls
@@ -594,12 +609,12 @@ S = model.embed_window(wids)  # (W, D)
 # Batched: context_tensor (B, W) long -> (B, W, D), equivalent to stacking embed_window rows
 # S_b = model.embed_windows_batch(context_tensor)
 S, logs = model.run_window_dynamics(S, context_ids=wids)  # GOAT uses token ids if enabled
-train_logits = model.readout_window(S.reshape(1, -1))  # primary training readout
+train_logits = model.readout_window_logits(S)  # primary training readout (optional fusion)
 
 # Batched trajectory contrastive loss
 loss, logits = model.trajectory_contrastive_loss_and_logits(contexts, targets)
 
-# Generation (readout_window path)
+# Generation (readout_window_logits path)
 text = model.generate("the quick brown fox", max_tokens=40)
 
 # Load a saved checkpoint (vectorized dynamics rebuilt from config + state_dict)
@@ -623,11 +638,11 @@ L_traj = mean(ReLU(0.2 − cos(pred, teacher) + cos(pred, negative)))
   teacher = evolved(shifted window [x2…xW, next_token])
   negative = shuffled teacher in batch
 
-L_token_aux = CE on readout_window(flattened pred window) vs target  (--token-aux-ce, default 0.2)
+L_token_aux = CE on readout_window_logits(pred window) vs target  (--token-aux-ce, default 0.2)
 L_readout_aux = CE on readout(final token row of pred) vs target     (--readout-aux-alpha, default 0.15)
 ```
 
-**Primary next-token signal:** **`readout_window(flatten(S))`** (training + **`model.generate`**). The single-vector **`readout`** head is for aux loss (**`--readout-aux-alpha`**), tension entropy, and legacy **`next_token_logits`** / **`state_cache`** — not the default decoding path. Use `--loss-mode ce` for classic next-token CE only.
+**Primary next-token signal:** **`readout_window_logits(S)`** → **`readout_window`** (training + **`model.generate`**). Avoid calling **`readout_window`** alone if **`--readout-fusion`** is enabled. The single-vector **`readout`** head is for aux loss (**`--readout-aux-alpha`**), tension entropy, and legacy **`next_token_logits`** / **`state_cache`** — not the default decoding path. Use `--loss-mode ce` for classic next-token CE only.
 
 ---
 
@@ -678,7 +693,7 @@ Training:
   --min-attractor-steps INT  Minimum outer steps before early exit may trigger (default: 2, ≥2)
   --trajectory-batch-size INT  Batch size for trajectory mode (default: 64, need ≥2)
   --loss-mode {trajectory,ce}
-  --token-aux-ce FLOAT       Aux CE on readout_window in trajectory mode (default: 0.2)
+  --token-aux-ce FLOAT       Aux CE on readout_window_logits path in trajectory mode (default: 0.2)
   --readout-aux-alpha FLOAT  Aux CE on single-state readout (default: 0.15; 0 = off)
   --grad-clip FLOAT          Optional global grad-norm clip (default: off)
   --lr, --lr-decay-every, --lr-gamma
@@ -741,7 +756,7 @@ Misc:
 
 ### Epoch metrics CSV columns
 
-When `--epoch-metrics-csv` is set, each row includes: `epoch`, `loss_mode`, `mean_loss`, **`train_ce`** (mean batch CE from `readout_window` logits during the epoch), **`val_ce`** (held-out `mean_cross_entropy_eval`, empty if no val), `train_traj_contrast` (last training batch trajectory loss snapshot), **`val_traj_contrast`** (full val-set mean when val exists), `mean_final_step_tension`, `max_batch_loss`, `lr`, `global_step`, **`tscore_evolves`**, **`tscore_last_tension`** (0 if substrate disabled).
+When `--epoch-metrics-csv` is set, each row includes: `epoch`, `loss_mode`, `mean_loss`, **`train_ce`** (mean batch CE from the training readout path — **`readout_window_logits`** — during the epoch), **`val_ce`** (held-out `mean_cross_entropy_eval`, empty if no val), `train_traj_contrast` (last training batch trajectory loss snapshot), **`val_traj_contrast`** (full val-set mean when val exists), `mean_final_step_tension`, `max_batch_loss`, `lr`, `global_step`, **`tscore_evolves`**, **`tscore_last_tension`** (0 if substrate disabled).
 
 **Per-batch CSV** (`--phase05-batch-metrics-csv`): separate file; one row per optimizer step with window tension curves, trajectory margins, break counters, and (when enabled) Phase 1 / Phase 2 columns — see `PHASE05_BATCH_CSV_HEADER` in `sandbox.py`. Plot with **`python3 scripts/plot_phase05_metrics.py PATH --out DIR`**.
 

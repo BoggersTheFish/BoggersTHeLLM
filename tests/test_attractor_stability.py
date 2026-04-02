@@ -37,6 +37,7 @@ def vec_model(device: torch.device):
         train_window_size=W,
         max_window_steps=12,
         convergence_epsilon=0.0,
+        num_waves=1,
     ).to(device)
     m.dynamics = VectorizedWindowDynamics(
         state_dim=D,

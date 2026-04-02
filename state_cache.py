@@ -87,7 +87,7 @@ class AttractorStateCache:
             emb = model.embedder(ids_t)
             emb = model.norm(emb)
             S = F.normalize(emb, dim=-1).unsqueeze(0)
-            S_out, _ = model.run_window_dynamics(
+            S_out, _, _ = model.run_window_dynamics(
                 S,
                 collect_metrics=False,
                 record_tension_log=False,

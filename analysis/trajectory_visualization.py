@@ -51,7 +51,7 @@ def _run_and_record_steps(
             for k in range(1, max_steps + 1):
                 model.max_window_steps = k
                 S = S0.clone()
-                S_out, _ = model.run_window_dynamics(
+                S_out, _, _ = model.run_window_dynamics(
                     S, collect_metrics=False, record_tension_log=False, context_ids=[ids]
                 )
                 traj.append(S_out.mean(dim=(0, 1)).detach().cpu())
@@ -86,6 +86,7 @@ def main() -> None:
         train_window_size=args.window_size,
         max_window_steps=args.max_steps,
         convergence_epsilon=0.0,
+        num_waves=1,
     ).to(device)
     model.dynamics = VectorizedWindowDynamics(
         state_dim=args.state_dim,

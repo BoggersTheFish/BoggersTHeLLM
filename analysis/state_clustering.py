@@ -56,6 +56,7 @@ def main() -> None:
         train_window_size=W,
         max_window_steps=args.max_steps,
         convergence_epsilon=0.0,
+        num_waves=1,
     ).to(device)
     model.dynamics = VectorizedWindowDynamics(
         state_dim=D,
@@ -73,7 +74,7 @@ def main() -> None:
             emb = model.embedder(ids)
             emb = model.norm(emb)
             S = F.normalize(emb, dim=-1).unsqueeze(0)
-            S_out, _ = model.run_window_dynamics(
+            S_out, _, _ = model.run_window_dynamics(
                 S, collect_metrics=False, record_tension_log=False
             )
             finals.append(S_out.reshape(-1).cpu())

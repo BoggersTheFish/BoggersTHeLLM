@@ -7,6 +7,16 @@ The project is documented as **BoggersTheLanguageModel**; canonical source is [g
 
 ---
 
+## Documentation + multi-wave stack snapshot (Apr 2026)
+
+- **README.md**: Architecture overview rewritten for **multi-wave** state, **per-wave energy heads**, **window energy descent** (not `dynamics.step` per outer step), **`readout_window_logits`** + optional fusion, **`wave_dynamics` / `wave_interaction`** on **`evolve_token`**, and accurate **`--dynamics simple` vs `vectorized`** description.
+- **`docs/PROJECT_STATUS.md`**: New — implementation status, gaps, prioritized next steps.
+- **`docs/README.md`**: New — documentation index.
+- **`docs/DEVELOPMENT_ROADMAP.md`**: Replaced with pillars (measurement, throughput, window attractor, token path, data scale).
+- **`docs/API_DISCOVERY.md`**: Boggers table updated for **`energy_heads`**, **`readout_window_logits`**, anchor freeze metrics, checkpoint compatibility notes.
+- **`docs/BASELINE.md`**: Notes new batch CSV columns and re-baseline triggers (`num_waves`, readout fusion, anchor freeze).
+- **`sandbox.py` / `phase05_config.py`** (and related): Per-wave **`WaveDynamics`** and **`wave_interaction`**; per-wave **`energy_heads`** with summed energy; **`readout_window_logits`** + **`--readout-fusion`**; **`--phase05-enable-anchor-freeze`** and frozen-fraction metrics; **`load_torch_attractor_state_dict`** relaxed for legacy / optional keys.
+
 ## Inference & checkpoints — training-parity decoding (Apr 2026)
 
 - **`sandbox.load_model_from_checkpoint`**: shared loader for **`torch.save`** / **`_save_checkpoint`** files; rebuilds **`VectorizedWindowDynamics`** (infer heads/rank from **`dynamics.mhd.U`**, apply **`config.use_lorentz`**, **`config.vectorized_dt`**) before **`load_state_dict`**.

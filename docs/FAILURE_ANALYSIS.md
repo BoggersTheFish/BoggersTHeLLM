@@ -14,13 +14,13 @@ If `scripts/generate_sample.py` produces repetitive tokens, garbage, or divergen
 
 ## 2. Weak or misaligned readout
 
-**Signs:** flat CE during training; good trajectory loss but poor `readout_window` CE; tokenizer vocab mismatch vs checkpoint.
+**Signs:** flat CE during training; good trajectory loss but poor readout CE; tokenizer vocab mismatch vs checkpoint; custom code calling `readout_window` instead of `readout_window_logits` when `--readout-fusion` is on.
 
 **Checks:**
 
 - Ensure `--token-aux-ce > 0` or `--readout-aux-alpha > 0` during training.
 - Match `--tokenizer` and `--vocab-cap` to the checkpoint (see `generate_sample.py` warning).
-- Inspect `readout` vs `readout_window` gradients in a short overfit run on a tiny corpus.
+- Inspect `readout` vs `readout_window` / `readout_window_logits` gradients in a short overfit run on a tiny corpus.
 
 ## 3. Insufficient training signal
 

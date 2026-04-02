@@ -34,6 +34,7 @@ def main() -> None:
         state_dim=STATE_DIM,
         train_window_size=WINDOW_SIZE,
         max_window_steps=MAX_WINDOW_STEPS,
+        num_waves=1,
     ).to(device)
     model.tokenizer = tok
     model.eval()
@@ -49,7 +50,7 @@ def main() -> None:
     ids = list(range(WINDOW_SIZE))
     emb = model.embedder(torch.tensor(ids, device=device, dtype=torch.long))
     S = F.normalize(emb, dim=-1).unsqueeze(0)
-    S_out, _logs = model.run_window_dynamics(
+    S_out, _logs, _ = model.run_window_dynamics(
         S, context_ids=[ids], record_tension_log=False
     )
     print(f"Simple dynamics S_out shape: {tuple(S_out.shape)}")
@@ -66,7 +67,7 @@ def main() -> None:
     rand_ids = torch.randint(0, VOCAB_SIZE, (WINDOW_SIZE,), device=device)
     S2 = F.normalize(model.embedder(rand_ids), dim=-1).unsqueeze(0)
     ctx = rand_ids.cpu().tolist()
-    S_vec, _ = model.run_window_dynamics(
+    S_vec, _, _ = model.run_window_dynamics(
         S2.clone(), context_ids=[ctx], record_tension_log=False
     )
     print(f"Vectorized dynamics S_out shape: {tuple(S_vec.shape)}")

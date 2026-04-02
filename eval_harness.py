@@ -255,8 +255,9 @@ def main() -> None:
             vocab_size,
             state_dim=cfg.get("state_dim", 512),
             train_window_size=args.window_size,
+            num_waves=int(cfg.get("num_waves", 1)),
         )
-        model.load_state_dict(ckpt["model_state"])
+        sb.load_torch_attractor_state_dict(model, ckpt["model_state"])
         print(f"[eval] loaded checkpoint: {args.model_checkpoint}", flush=True)
     else:
         model = sb.TorchAttractorLanguageModel(tok.n_vocab, train_window_size=args.window_size)
