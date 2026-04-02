@@ -1,24 +1,21 @@
 """
-Wave C — Rolling state cache for inference aligned with window dynamics.
+Wave C — Rolling state cache (legacy inference helper).
 
-Each ``step(token_id)`` builds the last-``W`` token ids (same padding as
-``TorchAttractorLanguageModel.window_ids_from_sequence``), embeds with
-``embedder`` + ``F.normalize`` per row (matches the prior single-token cache:
-no ``LayerNorm``), runs ``model.run_window_dynamics`` on ``S`` of shape
-``(1, W, D)`` so jitter / GOAT / high-tension behaviour matches training,
-then updates ``fast_state`` from the last window row and ``slow_memory`` with
-the same EMA as before. ``logits()`` still uses ``readout(combined)`` /
-``effective_temperature()`` (not ``readout_window``).
+.. deprecated::
+    For **next-token generation**, use :meth:`sandbox.TorchAttractorLanguageModel.generate`
+    instead of :func:`generate_with_cache`. Training aligns logits with
+    ``readout_window(flatten(S)) / effective_temperature()`` via
+    :meth:`~sandbox.TorchAttractorLanguageModel.forward_training_window`;
+    :meth:`AttractorStateCache.logits` uses ``readout(combined)`` **without**
+    ``readout_window`` or ``effective_temperature``, which skews sampling vs training.
 
-Usage
------
-    from state_cache import AttractorStateCache, generate_with_cache
-
-    cache = AttractorStateCache(model)
-    text = generate_with_cache(model, cache, prompt="the cat sat", max_tokens=30)
+``step()`` still runs the same ``run_window_dynamics`` embedding geometry as training
+and remains useful for experiments; avoid ``logits()`` / ``generate_with_cache`` for
+production decoding unless you explicitly accept the train/infer mismatch.
 """
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -28,11 +25,18 @@ import torch.nn.functional as F
 if TYPE_CHECKING:
     import sandbox as sb  # type: ignore[import]
 
+_LOGITS_MISMATCH_WARNED = False
+
 
 @dataclass
 class AttractorStateCache:
     """
     Mutable inference-state container tied to one TorchAttractorLanguageModel instance.
+
+    .. deprecated::
+        Prefer :meth:`sandbox.TorchAttractorLanguageModel.generate` for text generation
+        (training-parity readout). This cache's :meth:`logits` path is not equivalent
+        to the training readout.
 
     Attributes
     ----------
@@ -115,9 +119,21 @@ class AttractorStateCache:
 
     def logits(self) -> torch.Tensor:
         """
-        Compute readout logits from the current (fast, slow) state.
-        Symplectic blend: combined = w_fast * fast + w_slow * slow (normalised).
+        .. deprecated::
+            Uses ``readout(D)`` only — **not** ``readout_window(W·D) / effective_temperature``
+            (training path). For parity with training, call
+            ``forward_training_window(window_ids_from_sequence(...))`` or ``model.generate``.
         """
+        global _LOGITS_MISMATCH_WARNED
+        if not _LOGITS_MISMATCH_WARNED:
+            warnings.warn(
+                "AttractorStateCache.logits() uses readout(fast/slow), not readout_window; "
+                "logits differ from training. Use TorchAttractorLanguageModel.generate() "
+                "for aligned decoding.",
+                FutureWarning,
+                stacklevel=2,
+            )
+            _LOGITS_MISMATCH_WARNED = True
         model = self.model
         w_fast = float(model.w_fast)
         w_slow = float(model.w_slow)
@@ -133,7 +149,7 @@ class AttractorStateCache:
     def warmup(self, prompt_ids: list[int]) -> None:
         """
         Seed the cache by stepping through prompt token ids one at a time.
-        Call this before generate_with_cache() to warm up the attractor state.
+        Prefer :meth:`TorchAttractorLanguageModel.generate` for decoding; this is for cache experiments only.
         """
         for tid in prompt_ids:
             self.step(tid)
@@ -155,7 +171,9 @@ def generate_with_cache(
     reset: bool = True,
 ) -> str:
     """
-    Generate text using the rolling state cache.
+    .. deprecated::
+        Uses :meth:`AttractorStateCache.logits` → ``readout``, not the training
+        ``readout_window`` path. Prefer ``model.generate(..., temperature=..., top_k=...)``.
 
     Parameters
     ----------
@@ -169,6 +187,12 @@ def generate_with_cache(
     no_repeat_last_extra : extra penalty for the immediately preceding token
     reset : clear the cache before generation (True = stateless call)
     """
+    warnings.warn(
+        "generate_with_cache uses readout(fast/slow) via cache.logits(), not readout_window; "
+        "decoding is not training-aligned. Use TorchAttractorLanguageModel.generate() instead.",
+        FutureWarning,
+        stacklevel=2,
+    )
     import sandbox as _sb  # noqa: F811  # type: ignore[import]
 
     tok = getattr(model, "tokenizer", None)
@@ -244,14 +268,15 @@ if __name__ == "__main__":
     assert torch.isfinite(cache.slow_memory).all(), "slow_memory is not finite"
     print(f"  test 1 PASS — fast_state norm={cache.fast_state.norm():.4f}  slow_norm={cache.slow_memory.norm():.4f}", flush=True)
 
-    # Test 2: logits are finite
-    logits = cache.logits()
-    assert torch.isfinite(logits).all(), "logits are not finite"
-    print(f"  test 2 PASS — logits shape={logits.shape}  max={logits.max():.4f}", flush=True)
+    # Test 2: training-parity readout (readout_window), not cache.logits()
+    wid = model.window_ids_from_sequence(cache.token_history)
+    plogits = model.forward_training_window(wid)
+    assert torch.isfinite(plogits).all(), "forward_training_window logits not finite"
+    print(f"  test 2 PASS — readout_window logits shape={plogits.shape}", flush=True)
 
-    # Test 3: full generation
-    text = generate_with_cache(model, cache, prompt="the quick brown fox", max_tokens=10)
-    assert len(text.split()) > 0, "generate_with_cache returned empty string"
+    # Test 3: aligned generation path
+    text = model.generate("the quick brown fox", max_tokens=10, temperature=1.0, top_k=28)
+    assert len(text.split()) > 0, "model.generate returned empty string"
     print(f"  test 3 PASS — generated: {text!r}", flush=True)
 
     # Test 4: phrase_table rolling window

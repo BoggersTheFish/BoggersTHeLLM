@@ -46,7 +46,7 @@ For runs on a **public or large text corpus** (Hugging Face TinyStories / FineWe
 | **tscore_evolves** / **tscore_last_tension** | With `--use-substrate`: per-epoch evolve delta and last TSCore tension. |
 | **Per-batch CSV** (`--phase05-batch-metrics-csv`) | Not in epoch CSV: separate file; see `PHASE05_BATCH_CSV_HEADER` in `sandbox.py` for column names (`phase2_*`, `phase1_*`, tension curves, attractor diagnostics, etc.). |
 
-Architecture changes will change absolute numbers—re-record baseline after major `sandbox.py` updates. Window dynamics and **`AttractorStateCache`** both go through **`run_window_dynamics`**; the cache now uses the same **`Embedding -> LayerNorm -> row L2`** pipeline as training before entering the attractor. **`mean_final_T`** in CSV reflects **`compute_tension_window`** at the last outer step each window.
+Architecture changes will change absolute numbers—re-record baseline after major `sandbox.py` updates. **`run_window_dynamics`** is shared; for **decoding**, use **`model.generate`** ( **`readout_window`** ) for parity with training logits — **`state_cache`** uses a different readout head (legacy). **`mean_final_T`** in CSV reflects **`compute_tension_window`** at the last outer step each window.
 
 ## v1 scale-up success check (agreed criteria)
 

@@ -580,6 +580,7 @@ class TorchAttractorLanguageModel(nn.Module):
         return self.w_fast * fast_mid + self.w_slow * slow
 
     def _logits_for_tension(self, fast: torch.Tensor, slow: torch.Tensor) -> torch.Tensor:
+        """readout(D) for tension entropy only; next-token training uses readout_window via forward_training_window."""
         combined = self._symplectic_combined(fast, slow)
         state = combined / (torch.linalg.vector_norm(combined) + 1e-8)
         logits = self.readout(state) / self.effective_temperature()
@@ -752,6 +753,7 @@ class TorchAttractorLanguageModel(nn.Module):
         return self._symplectic_combined(fast_state, slow_state)
 
     def next_token_logits(self, fast_state, slow_state):
+        """Legacy D→V readout on fast/slow blend; prefer forward_training_window for training-aligned logits."""
         combined = self.combined_state(fast_state, slow_state)
         if self._prev_combined is not None:
             prev = self._prev_combined.to(device=combined.device, dtype=combined.dtype)
@@ -1147,7 +1149,9 @@ class TorchAttractorLanguageModel(nn.Module):
                 t_af = self.compute_tension_window(S).mean().detach()
                 _t_post_h = _t_post_h + t_af
                 _n_h_ev += 1
-            if step + 1 >= min_steps and conv_eps > 0:
+            # Early convergence only for batch size 1: with B>1, mean delta/T masks
+            # per-row heterogeneity and any scalar "ok" would stop the whole batch.
+            if step + 1 >= min_steps and conv_eps > 0 and B == 1:
                 torch.sub(S, S_prev_outer, out=delta_buf)
                 state_delta = torch.linalg.vector_norm(
                     delta_buf.reshape(B, -1), dim=-1
@@ -1547,8 +1551,13 @@ class TorchAttractorLanguageModel(nn.Module):
         max_tokens=40,
         debug_track=False,
         log_dynamics: bool = False,
+        *,
+        temperature: float | None = None,
+        top_k: int | None = None,
+        repeat_penalty: float | None = None,
+        no_repeat_last_extra: float | None = None,
     ):
-        """Autoregressive generation: each step uses last-W context → dynamics → readout (same as training)."""
+        """Autoregressive generation: each step uses last-W context → dynamics → readout_window (training path)."""
         if self.tokenizer is not None:
             input_ids = self.tokenizer.encode(prompt)
         else:
@@ -1561,9 +1570,19 @@ class TorchAttractorLanguageModel(nn.Module):
         self.reset_readout_trajectory()
         generated_ids = list(input_ids)
         with torch.inference_mode():
-            base_gen_temp = self.generation_temperature
-            if torch.is_tensor(base_gen_temp):
-                base_gen_temp = float(base_gen_temp.detach())
+            if temperature is not None:
+                base_gen_temp = float(temperature)
+            else:
+                base_gen_temp = self.generation_temperature
+                if torch.is_tensor(base_gen_temp):
+                    base_gen_temp = float(base_gen_temp.detach())
+            tk = GEN_TOP_K if top_k is None else int(top_k)
+            rp = GEN_REPEAT_LOGIT_PENALTY if repeat_penalty is None else float(repeat_penalty)
+            nre = (
+                GEN_NO_REPEAT_LAST_EXTRA
+                if no_repeat_last_extra is None
+                else float(no_repeat_last_extra)
+            )
             for ti in range(max_tokens):
                 wid = self.window_ids_from_sequence(generated_ids)
                 want_metrics = bool(log_dynamics or debug_track)
@@ -1585,10 +1604,10 @@ class TorchAttractorLanguageModel(nn.Module):
                 next_id = sample_next_token_id(
                     logits,
                     base_gen_temp,
-                    GEN_TOP_K,
+                    tk,
                     generated_ids,
-                    GEN_REPEAT_LOGIT_PENALTY,
-                    GEN_NO_REPEAT_LAST_EXTRA,
+                    rp,
+                    nre,
                 )
                 generated_ids.append(next_id)
 
@@ -2478,6 +2497,22 @@ def _save_checkpoint(
     """Save model + optimizer state to a numbered checkpoint file."""
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     ckpt_path = ckpt_dir / f"ckpt_step{step:07d}.pt"
+    _cfg = {
+        "state_dim": model.state_dim,
+        "train_window_size": model.train_window_size,
+        "vocab_size": model.vocab_size,
+        "max_window_steps": model.max_window_steps,
+        "convergence_epsilon": model.convergence_epsilon,
+    }
+    _dyn = model.dynamics
+    if hasattr(_dyn, "use_lorentz"):
+        _cfg["use_lorentz"] = bool(_dyn.use_lorentz)
+    _mhd = getattr(_dyn, "mhd", None)
+    if _mhd is not None and hasattr(_mhd, "dt"):
+        try:
+            _cfg["vectorized_dt"] = float(_mhd.dt)
+        except (TypeError, ValueError):
+            pass
     torch.save(
         {
             "model_state": model.state_dict(),
@@ -2486,16 +2521,93 @@ def _save_checkpoint(
             "epoch": epoch,
             "vocab_size": model.vocab_size,
             "tokenizer_mode": getattr(args, "tokenizer", "fallback"),
-            "config": {
-                "state_dim": model.state_dim,
-                "train_window_size": model.train_window_size,
-                "vocab_size": model.vocab_size,
-            },
+            "config": _cfg,
         },
         ckpt_path,
     )
     print(f"[ckpt] Saved: {ckpt_path}", flush=True)
     return ckpt_path
+
+
+def _checkpoint_state_is_vectorized(st: dict) -> bool:
+    return any(str(k).startswith("dynamics.mhd.") for k in st)
+
+
+def _checkpoint_vectorized_head_rank(st: dict) -> tuple[int, int, int] | None:
+    u = st.get("dynamics.mhd.U")
+    if u is None or not hasattr(u, "dim") or u.dim() != 3:
+        return None
+    nh, hd, rk = int(u.shape[0]), int(u.shape[1]), int(u.shape[2])
+    return nh, hd, rk
+
+
+def load_model_from_checkpoint(
+    ckpt_path: Path | str,
+    *,
+    tokenizer_mode: str = "tiktoken",
+    vocab_cap: int = 32768,
+    device: torch.device | None = None,
+    map_location: str | torch.device = "cpu",
+    print_vocab_mismatch_warning: bool = True,
+) -> TorchAttractorLanguageModel:
+    """
+    Restore ``TorchAttractorLanguageModel`` from ``torch.save`` output matching
+    :func:`_save_checkpoint`. Rebuilds ``VectorizedWindowDynamics`` (heads, rank,
+    ``dt``, ``use_lorentz``) before ``load_state_dict`` when ``dynamics.mhd.*`` keys exist.
+    """
+    p = Path(ckpt_path)
+    ckpt = torch.load(p, map_location=map_location)
+    st = ckpt["model_state"]
+    cfg = ckpt.get("config") or {}
+    vocab_size = int(cfg.get("vocab_size", ckpt.get("vocab_size", 50257)))
+    state_dim = int(cfg.get("state_dim", 512))
+    window_size = int(cfg.get("train_window_size", WINDOW_SIZE))
+
+    tok = _build_tokenizer(mode=tokenizer_mode, vocab_cap=vocab_cap)
+    if print_vocab_mismatch_warning and tok.n_vocab != vocab_size:
+        print(
+            f"Warning: tokenizer vocab {tok.n_vocab} != checkpoint {vocab_size} "
+            "(decode may be wrong; match training --tokenizer / --vocab-cap).",
+            flush=True,
+        )
+
+    model = TorchAttractorLanguageModel(
+        vocab_size,
+        state_dim=state_dim,
+        train_window_size=window_size,
+        max_window_steps=int(cfg.get("max_window_steps", MAX_WINDOW_STEPS)),
+        convergence_epsilon=float(cfg.get("convergence_epsilon", 0.0)),
+    )
+    if _checkpoint_state_is_vectorized(st):
+        from dynamics_vectorized import VectorizedWindowDynamics  # type: ignore[import]
+
+        inf = _checkpoint_vectorized_head_rank(st)
+        if inf is None:
+            raise RuntimeError(
+                f"Checkpoint {p} has dynamics.mhd.* keys but could not infer heads/rank from dynamics.mhd.U"
+            )
+        nh, _hd, rk = inf
+        use_lorentz = bool(cfg.get("use_lorentz", False))
+        vdt = cfg.get("vectorized_dt", 0.09)
+        try:
+            vectorized_dt = float(vdt)
+        except (TypeError, ValueError):
+            vectorized_dt = 0.09
+        model.dynamics = VectorizedWindowDynamics(
+            state_dim=state_dim,
+            window_size=window_size,
+            num_heads=nh,
+            rank=rk,
+            max_steps=model.max_window_steps,
+            dt=vectorized_dt,
+            use_lorentz=use_lorentz,
+        )
+    model.load_state_dict(st, strict=True)
+    model.tokenizer = tok
+    model.eval()
+    if device is not None:
+        model = model.to(device)
+    return model
 
 
 def _training_debug(debug: bool, msg: str) -> None:
@@ -2598,6 +2710,13 @@ def main() -> None:
         help="Write Phase-0 baseline snapshot to this file.")
     parser.add_argument("--window-size", type=int, default=WINDOW_SIZE,
         help="Sliding context length W.")
+    parser.add_argument(
+        "--state-dim",
+        type=int,
+        default=512,
+        dest="state_dim",
+        help="Continuous state dimension D (embedding + dynamics).",
+    )
     parser.add_argument("--num-dynamics-steps", "--max-window-steps", type=int, default=MAX_WINDOW_STEPS,
         help="Max outer steps per window (tension-adaptive).")
     parser.add_argument(
@@ -2634,6 +2753,13 @@ def main() -> None:
     parser.add_argument("--lr-decay-every", type=int, default=0)
     parser.add_argument("--lr-gamma", type=float, default=0.5)
     parser.add_argument("--epoch-metrics-csv", type=Path, default=None)
+    parser.add_argument(
+        "--attractor-steps-metrics-csv",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Append per-epoch attractor step stats (mean/max/min steps, convergence failures).",
+    )
     parser.add_argument("--log-hard-batch-loss-above", type=float, default=0.0)
     # ---- Phase 1: tokenizer ----
     parser.add_argument("--tokenizer", choices=("tiktoken", "fallback"), default="fallback",
@@ -2726,6 +2852,40 @@ def main() -> None:
         action="store_true",
         dest="use_lorentz",
         help="Vectorized dynamics only: Lorentz/hyperbolic step (tangent projection + curvature scaling).",
+    )
+    parser.add_argument(
+        "--vectorized-num-heads",
+        type=int,
+        default=4,
+        dest="vectorized_num_heads",
+        help="MultiHeadDynamics head count (state_dim must be divisible by this).",
+    )
+    parser.add_argument(
+        "--vectorized-rank",
+        type=int,
+        default=64,
+        dest="vectorized_rank",
+        help="Low-rank factor r per head in vectorized diffusion.",
+    )
+    parser.add_argument(
+        "--vectorized-dt",
+        type=float,
+        default=0.09,
+        dest="vectorized_dt",
+        help="Inner Euler dt for MultiHeadDynamics (vectorized path).",
+    )
+    parser.add_argument(
+        "--vectorized-coupling",
+        type=float,
+        default=0.01,
+        dest="vectorized_coupling",
+        help="Cross-head coupling strength in MultiHeadDynamics.",
+    )
+    parser.add_argument(
+        "--vectorized-strong-diffusion",
+        action="store_true",
+        dest="vectorized_strong_diffusion",
+        help="Initialize per-head diag(A) eigenvalues in [-0.55,-0.25] (stronger linear contraction).",
     )
     # ---- Phase 0.5: instrumentation + stability (toggleable) ----
     parser.add_argument(
@@ -2951,6 +3111,7 @@ def main() -> None:
     _p2 = phase2_config_from_args(args)
     model = TorchAttractorLanguageModel(
         vocab_size,
+        state_dim=int(args.state_dim),
         train_window_size=window_size,
         max_window_steps=args.num_dynamics_steps,
         convergence_epsilon=float(args.convergence_epsilon),
@@ -3005,11 +3166,25 @@ def main() -> None:
         try:
             from dynamics_vectorized import VectorizedWindowDynamics  # type: ignore[import]
 
+            _vnh = max(1, int(getattr(args, "vectorized_num_heads", 4)))
+            if model.state_dim % _vnh != 0:
+                raise ValueError(
+                    f"state_dim={model.state_dim} not divisible by --vectorized-num-heads={_vnh}"
+                )
+            _dmin, _dmax = (-0.55, -0.25) if bool(
+                getattr(args, "vectorized_strong_diffusion", False)
+            ) else (-0.4, -0.1)
             model.dynamics = VectorizedWindowDynamics(
                 state_dim=model.state_dim,
                 window_size=model.train_window_size,
+                num_heads=_vnh,
+                rank=max(1, int(getattr(args, "vectorized_rank", 64))),
                 max_steps=model.max_window_steps,
+                dt=float(getattr(args, "vectorized_dt", 0.09)),
+                coupling=float(getattr(args, "vectorized_coupling", 0.01)),
                 use_lorentz=bool(args.use_lorentz),
+                diag_eigen_min=_dmin,
+                diag_eigen_max=_dmax,
             ).to(device)
             print("[phase-9] VectorizedWindowDynamics active", flush=True)
         except Exception as _dyn_err:
@@ -3342,6 +3517,8 @@ def main() -> None:
         final_tension_values: list[float] = []
         max_batch_loss = -1.0
         batch_idx = -1
+        attractor_steps_hist: list[int] = []
+        attractor_conv_hist: list[bool] = []
 
         if pipeline is not None:
             # ---- Phase 2: streaming data pipeline ----
@@ -3427,6 +3604,7 @@ def main() -> None:
 
                 # Phase 5: auxiliary single-state readout loss
                 if args.readout_aux_alpha > 0 and model._last_pred_final_state is not None:
+                    # Aux loss only: single-position readout (not the primary readout_window CE path).
                     single_logits = model.readout(model._last_pred_final_state.to(device))
                     single_logits = single_logits / model.effective_temperature()
                     single_logits = torch.nan_to_num(
@@ -3472,6 +3650,10 @@ def main() -> None:
                     )
                 optimizer.step()
                 global_step += 1
+
+                if args.attractor_steps_metrics_csv is not None:
+                    attractor_steps_hist.append(int(model._last_attractor_steps_used))
+                    attractor_conv_hist.append(bool(model._last_convergence_triggered))
 
                 if phase05_csv_writer is not None:
                     _bce_log = _bce if math.isfinite(_bce) else float("nan")
@@ -3697,6 +3879,42 @@ def main() -> None:
                         "tscore_evolves", "tscore_last_tension",
                     ])
                 w.writerow(row)
+
+        if args.attractor_steps_metrics_csv is not None and attractor_steps_hist:
+            apath = Path(args.attractor_steps_metrics_csv)
+            apath.parent.mkdir(parents=True, exist_ok=True)
+            anew = not apath.exists() or apath.stat().st_size == 0
+            mxw = int(model.max_window_steps)
+            mean_s = statistics.mean(attractor_steps_hist)
+            max_s = max(attractor_steps_hist)
+            min_s = min(attractor_steps_hist)
+            conv_fail = sum(
+                1
+                for s, c in zip(attractor_steps_hist, attractor_conv_hist)
+                if s >= mxw and not c
+            )
+            early = sum(1 for c in attractor_conv_hist if c)
+            with apath.open("a", newline="", encoding="utf-8") as af:
+                aw = csv.writer(af)
+                if anew:
+                    aw.writerow([
+                        "epoch",
+                        "mean_steps",
+                        "max_steps",
+                        "min_steps",
+                        "convergence_failures",
+                        "early_convergence_batches",
+                        "batches",
+                    ])
+                aw.writerow([
+                    epoch + 1,
+                    f"{mean_s:.4f}",
+                    str(max_s),
+                    str(min_s),
+                    str(conv_fail),
+                    str(early),
+                    str(len(attractor_steps_hist)),
+                ])
 
         if lr_scheduler is not None:
             lr_scheduler.step()

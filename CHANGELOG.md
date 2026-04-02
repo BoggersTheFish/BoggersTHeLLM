@@ -7,6 +7,17 @@ The project is documented as **BoggersTheLanguageModel**; canonical source is [g
 
 ---
 
+## Inference & checkpoints — training-parity decoding (Apr 2026)
+
+- **`sandbox.load_model_from_checkpoint`**: shared loader for **`torch.save`** / **`_save_checkpoint`** files; rebuilds **`VectorizedWindowDynamics`** (infer heads/rank from **`dynamics.mhd.U`**, apply **`config.use_lorentz`**, **`config.vectorized_dt`**) before **`load_state_dict`**.
+- **`scripts/generate_sample.py`**: uses **`load_model_from_checkpoint`** + **`model.generate`** (`readout_window` path).
+- **`inference_server.py`**: same checkpoint path as **`generate_sample`**; **`model.generate`** instead of **`state_cache`**.
+- **`TorchAttractorLanguageModel.generate`**: optional **`temperature`**, **`top_k`**, repeat kwargs; **`forward_training_window`** each step.
+- **`run_window_dynamics`**: early convergence when **`convergence_epsilon > 0`** only if **`B == 1`** (avoids batch-wide premature exit).
+- **`state_cache`**: **`FutureWarning`** on **`generate_with_cache`** / first **`logits()`**; docs mark legacy for decoding.
+- **`tests/test_generation_pipeline.py`**: smoke test for **`generate`**.
+- **Checkpoints (`config`)**: **`use_lorentz`**, **`vectorized_dt`**, **`max_window_steps`**, **`convergence_epsilon`** (saved beside **`model_state`**).
+
 ## Performance — batched trajectory embedding + aux CE (Mar 2026)
 
 - **`sandbox.py`**: **`embed_windows_batch(context_tensor)`** — one **`Embedding` + LayerNorm + row L2** pass for shape **`(B, W)`**; matches stacking **`embed_window`** per row. **`trajectory_contrastive_loss_and_logits`** and **`mean_trajectory_contrastive_eval`** use it for student and teacher (**shifted windows** via **`torch.cat([context[:, 1:], target.unsqueeze(1)], dim=1)`**). **`_aux_ce_loss_batch`** is **fully vectorized** over **`B`** (bigram bias, repeat penalties, entropy floor branch, **`cross_entropy(..., reduction="none")`**).

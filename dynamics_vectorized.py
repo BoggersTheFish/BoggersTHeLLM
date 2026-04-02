@@ -32,8 +32,6 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 from typing import NoReturn, Optional
-import json
-import time
 
 import torch
 import torch.nn as nn
@@ -46,28 +44,6 @@ if str(_TS_LLM) not in sys.path:
     sys.path.insert(0, str(_TS_LLM))
 
 from attractor_llm.torch_core import MultiHeadDynamics, _clamp_norm  # type: ignore[import]
-
-# #region agent log
-_AGENT_DEBUG_LOG_PATH = Path("/home/boggersthefish/BoggersTheLLM/.cursor/debug-b56157.log")
-_AGENT_DEBUG_KEYS: set[str] = set()
-
-
-def _agent_debug_log(*, run_id: str, hypothesis_id: str, location: str, message: str, data: dict) -> None:
-    try:
-        payload = {
-            "sessionId": "b56157",
-            "runId": run_id,
-            "hypothesisId": hypothesis_id,
-            "location": location,
-            "message": message,
-            "data": data,
-            "timestamp": int(time.time() * 1000),
-        }
-        with _AGENT_DEBUG_LOG_PATH.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(payload, separators=(",", ":")) + "\n")
-    except Exception:
-        pass
-# #endregion
 
 
 # --------------------------------------------------------------------------
@@ -109,6 +85,8 @@ class VectorizedWindowDynamics(nn.Module):
         dt: float = 0.09,
         coupling: float = 0.01,
         use_lorentz: bool = False,
+        diag_eigen_min: float = -0.4,
+        diag_eigen_max: float = -0.1,
     ) -> None:
         super().__init__()
         self.state_dim = state_dim
@@ -124,6 +102,8 @@ class VectorizedWindowDynamics(nn.Module):
             rank=rank,
             dt=dt,
             coupling=coupling,
+            diag_eigen_min=diag_eigen_min,
+            diag_eigen_max=diag_eigen_max,
         )
 
     def minkowski_inner(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -147,26 +127,9 @@ class VectorizedWindowDynamics(nn.Module):
         B, W, D = S.shape
         flat = S.reshape(B * W, D)
         if signal is None:
-            sig = torch.zeros_like(flat)
+            sig = flat.new_zeros((B * W, D))
         else:
             sig = signal.reshape(B * W, D)
-        # #region agent log
-        if "vec_step_entry" not in _AGENT_DEBUG_KEYS:
-            _AGENT_DEBUG_KEYS.add("vec_step_entry")
-            _agent_debug_log(
-                run_id="pre-fix",
-                hypothesis_id="H2",
-                location="dynamics_vectorized.py:118",
-                message="VectorizedWindowDynamics._step entry",
-                data={
-                    "file": __file__,
-                    "flat_shape": list(flat.shape),
-                    "sig_shape": list(sig.shape),
-                    "use_lorentz": bool(self.use_lorentz),
-                    "mhd_module": type(self.mhd).__module__,
-                },
-            )
-        # #endregion
         if self.use_lorentz:
             v_raw = self.mhd.drift(flat, sig)
             v = self.project_tangent(flat, v_raw)
@@ -284,7 +247,7 @@ if __name__ == "__main__":
     # --- test 1: run_window_dynamics + VectorizedWindowDynamics.step is finite ---
     torch.manual_seed(0)
     vec_dyn = VectorizedWindowDynamics(state_dim=STATE_DIM, window_size=WINDOW_SIZE, num_heads=4, rank=16, max_steps=8)
-    model = sb.TorchAttractorLanguageModel(sb.FULL_VOCAB, state_dim=STATE_DIM, train_window_size=WINDOW_SIZE, max_window_steps=8)
+    model = sb.TorchAttractorLanguageModel(512, state_dim=STATE_DIM, train_window_size=WINDOW_SIZE, max_window_steps=8)
     model.eval()
     saved = model.dynamics
     model.dynamics = vec_dyn
@@ -301,7 +264,7 @@ if __name__ == "__main__":
 
     # --- test 2: gradient flows through vectorized dynamics via run_window_dynamics
     vec_dyn2 = VectorizedWindowDynamics(state_dim=STATE_DIM, window_size=WINDOW_SIZE, num_heads=4, rank=16, max_steps=8)
-    model2 = sb.TorchAttractorLanguageModel(sb.FULL_VOCAB, state_dim=STATE_DIM, train_window_size=WINDOW_SIZE, max_window_steps=8)
+    model2 = sb.TorchAttractorLanguageModel(512, state_dim=STATE_DIM, train_window_size=WINDOW_SIZE, max_window_steps=8)
     model2.train()
     model2.dynamics = vec_dyn2
     S_train = torch.randn(2, WINDOW_SIZE, STATE_DIM, requires_grad=True)
@@ -313,7 +276,7 @@ if __name__ == "__main__":
     print(f"  test 2 PASS — gradient flows (mhd.U grad norm={grad.norm():.4f})", flush=True)
 
     # --- test 3: simple vs vectorized dynamics both finite (different fields) ---
-    model3 = sb.TorchAttractorLanguageModel(sb.FULL_VOCAB, state_dim=STATE_DIM, train_window_size=WINDOW_SIZE, max_window_steps=8)
+    model3 = sb.TorchAttractorLanguageModel(512, state_dim=STATE_DIM, train_window_size=WINDOW_SIZE, max_window_steps=8)
     model3.eval()
     S_base = torch.randn(1, WINDOW_SIZE, STATE_DIM)
     with torch.no_grad():
@@ -331,7 +294,7 @@ if __name__ == "__main__":
     print(f"  test 3 PASS — both finite; cosine(simple,vec)={cos:.4f}  L2={l2:.4f}", flush=True)
 
     # --- test 4: run_window_dynamics_vectorized drop-in -------------------
-    model4 = sb.TorchAttractorLanguageModel(sb.FULL_VOCAB, state_dim=STATE_DIM, train_window_size=WINDOW_SIZE, max_window_steps=8)
+    model4 = sb.TorchAttractorLanguageModel(512, state_dim=STATE_DIM, train_window_size=WINDOW_SIZE, max_window_steps=8)
     model4.eval()
     vec_dyn4 = VectorizedWindowDynamics(state_dim=STATE_DIM, window_size=WINDOW_SIZE, num_heads=4, rank=16, max_steps=8)
     with torch.no_grad():

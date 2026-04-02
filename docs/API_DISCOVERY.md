@@ -15,18 +15,20 @@ Last verified: March 2026.
 | `Phase2Config` (`phase2_config.py`) | Directional breaks, residual mixing gate, `C` regularisation / distance decay, head tension weighting, break memory. |
 | `TorchAttractorLanguageModel(vocab_size, …, phase05=, phase1=, phase2=, convergence_epsilon=, min_attractor_steps=)` | Core model; defaults construct `Phase05Config` / `Phase1Config` / `Phase2Config` if omitted. Optional window early-exit knobs mirror CLI (`convergence_epsilon=0` runs all outer steps). Set `model.tokenizer` for encode/decode. |
 | `embed_window(ids)` / `embed_windows_batch(context_tensor)` | Single window **`(W,) → (W, D)`** vs batch **`(B, W) → (B, W, D)`** with the same norm + row-wise unit norm as stacking **`embed_window`** per row. Trajectory training uses the batched path. |
-| `run_window_dynamics(..., context_ids=…, convergence_epsilon=, min_attractor_steps=)` | Outer time loop only; caches static coupling / `C` / GOAT tensors once per call. Optional early exit after `min_attractor_steps` when state delta or `|ΔT_mean|` &lt; epsilon (if epsilon &gt; 0). Tension curves are only materialized when requested; collected step diagnostics stay on device until the loop exits. Break/convergence branching avoids `.item()` scalar sync checks in the loop hot path. |
+| `run_window_dynamics(..., context_ids=…, convergence_epsilon=, min_attractor_steps=)` | Outer time loop only; caches static coupling / `C` / GOAT tensors once per call. Optional early exit when **batch size `B == 1`** and epsilon &gt; 0 (`B &gt; 1` runs all `max_window_steps`). Tension curves only when requested. |
 | `model.dynamics.step(S, signal)` | Unified step API on **`SimpleAttractorDynamics`** or **`VectorizedWindowDynamics`** (CLI default **`--dynamics vectorized`**). |
 | `phase05_batch_csv_values()` / `PHASE05_BATCH_CSV_HEADER` | Flat row + column names for `--phase05-batch-metrics-csv` (Phase 0.5 + 1 + 2 + optional attractor diagnostics: steps used, final tension, break count, convergence flag). |
 | `AttractorDataPipeline` (`data_pipeline.py`) | Streaming train batches when import succeeds; else legacy in-memory shuffle. |
 | `mean_cross_entropy_eval(model, dataset, batch_size=…)` | Held-out CE path. Uses batched `embed_windows_batch -> run_window_dynamics -> readout_window` plus the same eval-time shaping as the old single-window path (bigram bias, repeat penalties, label smoothing). |
 | `trajectory_contrastive_loss_and_logits(contexts, targets, teacher_steps=None, update_repulsion_memory=True)` | Main training forward. Student path is unchanged; detached teacher path may use fewer outer steps when `teacher_steps` is set. `update_repulsion_memory=False` keeps evaluation/logging forwards from mutating training repulsion history. |
+| `load_model_from_checkpoint(path, tokenizer_mode=, vocab_cap=, device=, …)` | Restore model + tokenizer from `_save_checkpoint` output; rebuilds **`VectorizedWindowDynamics`** (heads, rank, `dt`, `use_lorentz`) when `dynamics.mhd.*` keys exist, then **`load_state_dict`**. Used by **`scripts/generate_sample.py`** and **`inference_server.py`**. |
+| `TorchAttractorLanguageModel.generate(prompt, max_tokens=, temperature=, top_k=, …)` | Decoding: **`forward_training_window` → `readout_window` / `effective_temperature`** (training-aligned). |
 
-## Inference cache
+## Legacy inference cache (not training-parity logits)
 
 | Entry | Role |
 |-------|------|
-| `AttractorStateCache.step(token_id)` (`state_cache.py`) | Rolling inference update. Builds the current window, applies **`Embedding -> LayerNorm -> row L2`** to match training geometry, then calls `run_window_dynamics` on shape `(1, W, D)`. |
+| `AttractorStateCache` / `generate_with_cache` (`state_cache.py`) | **`step()`** matches training embedding + `run_window_dynamics`. **`logits()`** uses **`readout(D)`** only — **not** **`readout_window`**. Deprecated for decoding; prefer **`generate`** + **`load_model_from_checkpoint`**. |
 
 ---
 

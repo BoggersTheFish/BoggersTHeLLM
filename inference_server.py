@@ -2,7 +2,8 @@
 Wave G — Inference server.
 
 Serves the TorchAttractorLanguageModel via FastAPI (OpenAI-compatible /v1/completions
-endpoint). Uses the rolling state cache from state_cache.py for O(1)-per-token latency.
+endpoint). Generation uses ``model.generate()`` (``readout_window`` / training-parity path),
+not ``state_cache.generate_with_cache``.
 
 Endpoints
 ---------
@@ -49,7 +50,6 @@ except ImportError:
 
 
 import sandbox as sb  # type: ignore[import]
-from state_cache import AttractorStateCache, generate_with_cache  # type: ignore[import]
 from llm_substrate_node import LLMSubstrateNode  # type: ignore[import]
 
 
@@ -62,27 +62,24 @@ def load_model(
     tokenizer_mode: str = "fallback",
     vocab_cap: int = 32768,
 ) -> "sb.TorchAttractorLanguageModel":
-    import torch
-    tok = sb._build_tokenizer(mode=tokenizer_mode, vocab_cap=vocab_cap)
+    """Same checkpoint restoration as ``scripts/generate_sample.py`` (vectorized dynamics, dt, Lorentz)."""
     if checkpoint:
         p = Path(checkpoint)
         if not p.exists():
             raise FileNotFoundError(f"Checkpoint not found: {checkpoint}")
-        ckpt = torch.load(str(p), map_location="cpu")
-        vocab_size = ckpt.get("vocab_size", tok.n_vocab)
-        cfg = ckpt.get("config", {})
-        state_dim = cfg.get("state_dim", 512)
-        window_size = cfg.get("train_window_size", 6)
-        model = sb.TorchAttractorLanguageModel(
-            vocab_size, state_dim=state_dim, train_window_size=window_size
+        model = sb.load_model_from_checkpoint(
+            p,
+            tokenizer_mode=tokenizer_mode,
+            vocab_cap=vocab_cap,
+            device=None,
         )
-        model.load_state_dict(ckpt["model_state"])
         print(f"[inference_server] loaded checkpoint: {checkpoint}", flush=True)
     else:
+        tok = sb._build_tokenizer(mode=tokenizer_mode, vocab_cap=vocab_cap)
         model = sb.TorchAttractorLanguageModel(tok.n_vocab)
+        model.tokenizer = tok
+        model.eval()
         print("[inference_server] no checkpoint — using untrained model", flush=True)
-    model.tokenizer = tok
-    model.eval()
     return model
 
 
@@ -93,7 +90,6 @@ def load_model(
 class AppState:
     def __init__(self, checkpoint: Optional[str] = None) -> None:
         self.model = load_model(checkpoint)
-        self.cache = AttractorStateCache(self.model)
         self.substrate = LLMSubstrateNode(self.model, quiet=True)
         self._lock = threading.Lock()
 
@@ -117,14 +113,11 @@ class AppState:
                 _ = self.model.forward_training_window(wid)
             curve = list(getattr(self.model, "_last_window_tension_curve", []))
 
-            text = generate_with_cache(
-                self.model,
-                self.cache,
-                prompt=prompt,
+            text = self.model.generate(
+                prompt,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 top_k=top_k,
-                reset=True,
             )
             # Compute real TSCore tension after generation.
             try:

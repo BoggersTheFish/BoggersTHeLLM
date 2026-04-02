@@ -18,7 +18,7 @@ Corpus / Token stream
 │  embed_window / embed_windows_batch → (W, D) or (B, W, D) │
 │         │                                               │
 │         ▼                                               │
-│  run_window_dynamics()  ← outer loop (≤ max_window_steps; optional early exit) │
+│  run_window_dynamics()  ← outer loop (≤ max_window_steps; optional early exit if B=1) │
 │    ┌─ positional coupling + dynamics.step(S, signal)    │
 │    │     (SimpleAttractorDynamics or VectorizedWindow)  │
 │    ├─ optional GOAT activation_bonus → per-position signal│
@@ -31,13 +31,15 @@ Corpus / Token stream
 └─────────────────────────────────────────────────────────┘
         │
         ▼
-┌──────────────────────┐   ┌───────────────────────────┐
-│  AttractorStateCache │   │  LLMSubstrateNode          │
-│  (state_cache.py)    │   │  (llm_substrate_node.py)   │
-│  same run_window_    │   │  TS-Core graph integration │
-│  dynamics per step   │   │  Propagate → Evolve hook   │
-│  readout(fast/slow)  │   │                            │
-└──────────────────────┘   └───────────────────────────┘
+┌─────────────────────────────┐   ┌────────────────────────────┐
+│ Decoding (training-aligned) │   │  LLMSubstrateNode          │
+│ model.generate() →          │   │  (llm_substrate_node.py)   │
+│ forward_training_window →   │   │  Propagate → Evolve hook   │
+│ readout_window              │   │                            │
+└─────────────────────────────┘   └────────────────────────────┘
+
+  Legacy: state_cache.generate_with_cache / cache.logits use readout(D) only —
+  not equivalent to readout_window; prefer generate + sandbox.load_model_from_checkpoint.
 ```
 
 **No attention. No transformer blocks. No external model weights.**
@@ -55,7 +57,7 @@ The network contains only:
 
 | File / Directory | Wave | Purpose |
 |---|---|---|
-| `sandbox.py` | Phase 0+ | **BoggersTheLanguageModel** core: training, generation, dynamics |
+| `sandbox.py` | Phase 0+ | **BoggersTheLanguageModel** core: training, `generate`, `load_model_from_checkpoint`, `_save_checkpoint` |
 | `phase05_config.py` | 0.5 | `Phase05Config`: tension weights, batch CSV, adaptive dt, neg-def diffusion |
 | `phase1_config.py` | 1 | `Phase1Config`: multi-head drift, window interaction matrix `C`, diversity loss |
 | `phase2_config.py` | 2 | `Phase2Config`: directional breaks, residual mixing, `C` reg, head tension weights |
@@ -63,15 +65,16 @@ The network contains only:
 | `tests/test_embed_windows_batch.py` | — | Parity check: `embed_windows_batch` vs stacking `embed_window` per row |
 | `wave_a_tokenizer.py` | A | tiktoken BPE helpers; training uses `sandbox._build_tokenizer()` |
 | `dynamics_vectorized.py` | B | `VectorizedWindowDynamics`: `step(S, signal)` only; `forward` disabled; `run_window_dynamics_vectorized` → `model.run_window_dynamics` |
-| `state_cache.py` | C | Rolling cache: `run_window_dynamics` on `(1,W,D)` aligned with training; `logits()` via `readout` + fast/slow |
-| `scripts/ts_workflow_smoke.py` | — | Smoke: `AttractorStateCache` + simple/vectorized `run_window_dynamics` (`.venv/bin/python scripts/ts_workflow_smoke.py`) |
+| `state_cache.py` | C | **Deprecated for decoding:** rolling cache; `logits()` uses `readout` (≠ training `readout_window`). Prefer `model.generate`. |
+| `scripts/generate_sample.py` | — | Load checkpoint via `sandbox.load_model_from_checkpoint` → `model.generate` (training-parity readout) |
+| `scripts/ts_workflow_smoke.py` | — | Smoke: `forward_training_window` + `model.generate` + simple/vectorized `run_window_dynamics` |
 | `data_pipeline.py` | D | Streaming sharded DataLoader (txt / JSONL, multi-worker) |
 | `data/generate_corpus.py` | — | Deterministic synthetic `.txt` corpus (tiktoken-sized); CLI + `sandbox` fallback |
 | `data/hf_remote_corpus.py` | — | TinyStories / FineWeb-Edu → cached `.txt` for training (`--dataset-source`) |
 | `data/__init__.py` | — | Package marker for `data.generate_corpus` imports |
 | `llm_substrate_node.py` | E | Registers model as a native TSCore node; Evolve hook |
 | `goat_memory_transitions.py` | F | GOAT-TS ACTIVE → DORMANT → DEEP token state transitions |
-| `inference_server.py` | G | FastAPI inference server — OpenAI-compatible `/v1/completions` |
+| `inference_server.py` | G | FastAPI — `/v1/completions`; loads checkpoints with `sandbox.load_model_from_checkpoint` (vectorized dynamics + dt + Lorentz); `model.generate` |
 | `Dockerfile` | G | CPU Docker image (swap whl URL for CUDA wheel) |
 | `docker-compose.yml` | G | One-command deploy |
 | `eval_harness.py` | H | Perplexity + tension metrics + 11-tick WaveCycleRunner |
@@ -304,7 +307,7 @@ python3 sandbox.py --corpus data/generated.txt
 | `python3 smoke_test.py` | Fast integration check: model + one dynamics pass + training step + TSCore wave cycle. Run after install or refactors. |
 | `python3 tests/test_embed_windows_batch.py` | Confirms batched window embedding matches per-row `embed_window` (prints max abs diff). |
 | `python3 eval_harness.py …` | Perplexity, mean tension, trajectory contrast, optional TSCore `WaveCycleRunner` metrics; writes JSON. Use `--dataset-source tinystories` / `fineweb-edu` to match Hub training data. |
-| `python3 inference_server.py` | FastAPI server: OpenAI-style `/v1/completions`, cache-backed generation, optional TSCore hooks. Needs `pip install fastapi uvicorn`. |
+| `python3 inference_server.py` | FastAPI: `/v1/completions` via **`model.generate`**, **`load_model_from_checkpoint`** for vectorized ckpts. Needs `pip install fastapi uvicorn`. |
 | `python3 data/generate_corpus.py --out PATH --tokens N` | Offline synthetic corpus for tests or a fixed `data/generated.txt`. |
 
 ### Docker and deployment
@@ -332,7 +335,7 @@ python3 sandbox.py --corpus data/generated.txt
 
 - **Trajectory mode** requires **`--trajectory-batch-size` ≥ 2** (negatives are drawn inside the batch). Larger batches stabilise contrastive training but cost more memory.
 - **Window size** (`--window-size`): wider context increases compute per step roughly linearly in `W` (embedding is `W×D`, dynamics run up to **`--num-dynamics-steps`** / **`--max-window-steps`** outer steps). Start with the default or `8`; increase when data and VRAM allow.
-- **`--num-dynamics-steps`** / **`--max-window-steps`**: hard cap on outer steps per window. Optional **`--convergence-epsilon`** (with **`--min-attractor-steps`**, default 2) can stop early when state change or tension is stable; default epsilon is **`0`** (full configured outer steps each window). More steps mean deeper relaxation; diminishing returns once tension curves flatten—watch **`mean_final_step_tension`** in epoch CSV.
+- **`--num-dynamics-steps`** / **`--max-window-steps`**: hard cap on outer steps per window. Optional **`--convergence-epsilon`** (with **`--min-attractor-steps`**, default 2) can stop early **only for batch size 1** when state change or tension is stable; default epsilon is **`0`**. Training batches with **`B > 1`** always use the full outer step count. Watch **`mean_final_step_tension`** in epoch CSV.
 
 **Throughput and hardware**
 
@@ -412,18 +415,21 @@ Both **`SimpleAttractorDynamics`** and **`VectorizedWindowDynamics`** implement 
 - **`get_compiled()`** caches compiled `_step` by shape key for smoke / benchmarks.
 - Parity tests: both paths produce finite outputs; equations differ by design.
 
-### Wave C — State cache
+### Wave C — State cache (legacy decoding)
 
-`state_cache.py` provides **rolling-window** inference aligned with training:
+**For text generation, use `TorchAttractorLanguageModel.generate()`** (same path as training: **`forward_training_window` → `readout_window` / `effective_temperature`**). **`scripts/generate_sample.py`** and **`inference_server.py`** both load checkpoints with **`sandbox.load_model_from_checkpoint`** (rebuilds **`VectorizedWindowDynamics`** with **`vectorized_dt`**, **`use_lorentz`** before **`load_state_dict`**).
 
-- `AttractorStateCache` holds **`fast_state (D,)`** + **`slow_memory (D,)`** + rolling **`phrase_table`**
-- **`step(token_id)`** — builds the last-**W** token ids, applies the same training embedding pipeline (**`Embedding → LayerNorm → row L2`**), runs **`model.run_window_dynamics(S, context_ids=[ids], …)`** with **`S`** **`(1, W, D)`**, then updates fast/slow from the final row and phrase table
-- **`logits()`** — **`readout(combined)`** on the symplectic blend of fast/slow (same head as **`next_token_logits`**)
-- **`warmup(prompt_ids)`** — seed cache from prompt before generation
-- **`generate_with_cache(model, cache, prompt, ...)`** — drop-in for **`model.generate()`**
-- Smoke: **`python3 state_cache.py`**; training-aligned check: **`.venv/bin/python scripts/ts_workflow_smoke.py`**
+`state_cache.py` remains for experiments; **`generate_with_cache`** and **`cache.logits()`** emit **`FutureWarning`** — they use **`readout(fast/slow)`**, not **`readout_window`**, so logits **do not** match trajectory training.
+
+- **`step(token_id)`** — same window embedding + **`run_window_dynamics`** on **`(1, W, D)`** (dynamics aligned; readout head is not)
+- **`logits()`** / **`generate_with_cache`** — deprecated for production decoding
+- Self-test: **`python3 state_cache.py`** uses **`forward_training_window`** + **`model.generate`**
 
 ```python
+# Preferred
+text = model.generate("the cat sat", max_tokens=30, temperature=1.0, top_k=28)
+
+# Legacy (warnings)
 from state_cache import AttractorStateCache, generate_with_cache
 cache = AttractorStateCache(model)
 text = generate_with_cache(model, cache, prompt="the cat sat", max_tokens=30)
@@ -490,7 +496,8 @@ State machine (per token):
 `inference_server.py` exposes the model via FastAPI:
 
 - OpenAI-compatible `/v1/completions` (drop-in for any client that targets the OpenAI API)
-- Uses `AttractorStateCache` for O(1)-per-token latency
+- **`model.generate()`** for completions (training-parity **`readout_window`** path)
+- Checkpoints: **`sandbox.load_model_from_checkpoint`** (same as **`scripts/generate_sample.py`**) so **vectorized** weights load correctly
 - TSCore sidecar: `/ts/propagate` and `/ts/tension` endpoints
 - Thread-safe: `threading.Lock()` wraps generate calls
 - `Dockerfile` (CPU; swap whl URL for CUDA) + `docker-compose.yml` with healthcheck, volume mounts for checkpoints and corpus
@@ -592,8 +599,11 @@ train_logits = model.readout_window(S.reshape(1, -1))  # primary training readou
 # Batched trajectory contrastive loss
 loss, logits = model.trajectory_contrastive_loss_and_logits(contexts, targets)
 
-# Generation
+# Generation (readout_window path)
 text = model.generate("the quick brown fox", max_tokens=40)
+
+# Load a saved checkpoint (vectorized dynamics rebuilt from config + state_dict)
+# model = sb.load_model_from_checkpoint("checkpoints/.../ckpt_step0000001.pt", tokenizer_mode="tiktoken", vocab_cap=32768, device=torch.device("cpu"))
 
 # Prompt comparison (trajectory distance)
 sb.compare_prompts(model, "cats eat fish", "fish eat cats")
@@ -617,7 +627,7 @@ L_token_aux = CE on readout_window(flattened pred window) vs target  (--token-au
 L_readout_aux = CE on readout(final token row of pred) vs target     (--readout-aux-alpha, default 0.15)
 ```
 
-The single-state **`readout`** head is what inference and `AttractorStateCache` use; **`readout_window`** is the primary training readout. Use `--loss-mode ce` for classic next-token CE only.
+**Primary next-token signal:** **`readout_window(flatten(S))`** (training + **`model.generate`**). The single-vector **`readout`** head is for aux loss (**`--readout-aux-alpha`**), tension entropy, and legacy **`next_token_logits`** / **`state_cache`** — not the default decoding path. Use `--loss-mode ce` for classic next-token CE only.
 
 ---
 
@@ -634,7 +644,7 @@ T = |ΔE_state| + λ · (1 − cos(fast, slow)) + μ · H(readout_logits)
 | T > high | Directional break (Phase 2 default) or Gaussian jitter (`--phase2-disable-directional-break`) |
 | T > break_thresh | Same break family on the token path |
 
-**Window path** (`run_window_dynamics`): after each outer iteration, **`compute_tension_window`** (alias **`compute_window_tension`**) uses neighbor energy drift + misalignment + optional readout entropy (see `WINDOW_TENSION_USE_ENTROPY` in `sandbox.py`). The outer loop runs at most **`max_window_steps`** times; if **`convergence_epsilon > 0`** (CLI **`--convergence-epsilon`**, after **`--min-attractor-steps`**), the loop may exit early when state change or tension delta falls below epsilon. Otherwise (default epsilon **`0`**) the loop uses all **`max_window_steps`**. Tension still drives **low-tension escape**, **high-tension breaks**, **GOAT transitions**, and **high-T row renorm** inside each step. Phase 2 breaks use **`state − prev_state`** (**`F.normalize`**) with tension-scaled magnitude; see [Phase 2](#phase-2--directional-breaks-and-stabilised-routing).
+**Window path** (`run_window_dynamics`): after each outer iteration, **`compute_tension_window`** (alias **`compute_window_tension`**) uses neighbor energy drift + misalignment + optional readout entropy (see `WINDOW_TENSION_USE_ENTROPY` in `sandbox.py`). The outer loop runs at most **`max_window_steps`** times. **Early convergence** (`convergence_epsilon > 0`, after **`--min-attractor-steps`**) applies only when the window batch dimension **`B == 1`** so multi-sample batches always run the full step count. If epsilon is **`0`**, all **`max_window_steps`** are used. Tension still drives **low-tension escape**, **high-tension breaks**, **GOAT transitions**, and **high-T row renorm** inside each step. Phase 2 breaks use **`state − prev_state`** (**`F.normalize`**) with tension-scaled magnitude; see [Phase 2](#phase-2--directional-breaks-and-stabilised-routing).
 
 ---
 
@@ -664,7 +674,7 @@ Training:
   --window-size INT          Context window W (default: 6)
   --num-dynamics-steps INT, --max-window-steps INT
                             Max outer attractor steps per window (default: 16)
-  --convergence-epsilon FLOAT  Early exit when ‖ΔS‖ or |ΔT_mean| below this after min steps (0 = use all configured outer steps; try 1e-3 on GPU)
+  --convergence-epsilon FLOAT  Early exit when B=1 and ‖ΔS‖ or |ΔT_mean| below this after min steps (0 = all outer steps; B>1 ignores early exit)
   --min-attractor-steps INT  Minimum outer steps before early exit may trigger (default: 2, ≥2)
   --trajectory-batch-size INT  Batch size for trajectory mode (default: 64, need ≥2)
   --loss-mode {trajectory,ce}

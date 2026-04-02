@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-TS workflow smoke: state_cache + run_window_dynamics (simple + vectorized).
+TS workflow smoke: run_window_dynamics (simple + vectorized) + training-parity generate().
+Avoids deprecated state_cache.logits / generate_with_cache for decoding.
 Run from repo root: python scripts/ts_workflow_smoke.py
 """
 from __future__ import annotations
@@ -16,7 +17,6 @@ import torch
 import torch.nn.functional as F
 
 import sandbox as sb
-from state_cache import AttractorStateCache
 from dynamics_vectorized import VectorizedWindowDynamics
 
 STATE_DIM = 512
@@ -28,22 +28,22 @@ VOCAB_SIZE = 512  # FULL_VOCAB is []; use explicit size for smoke test
 def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    tok = sb._build_tokenizer(mode="fallback", vocab_cap=512)
     model = sb.TorchAttractorLanguageModel(
         VOCAB_SIZE,
         state_dim=STATE_DIM,
         train_window_size=WINDOW_SIZE,
         max_window_steps=MAX_WINDOW_STEPS,
     ).to(device)
+    model.tokenizer = tok
     model.eval()
 
-    # 2. state_cache step
-    cache = AttractorStateCache(model)
-    token_id = 0
-    cache.step(token_id)
-    logits = cache.logits()
-    print(
-        f"Fast state norm: {cache.fast_state.norm():.4f}, logits shape: {tuple(logits.shape)}"
-    )
+    # 2. Training-parity logits (readout_window), not state_cache.logits()
+    wid = model.window_ids_from_sequence(tok.encode("hello") or [0])
+    logits = model.forward_training_window(wid)
+    print(f"forward_training_window logits shape: {tuple(logits.shape)}")
+    _ = model.generate("hello", max_tokens=2, temperature=1.0, top_k=8)
+    print("model.generate() OK (readout_window path)")
 
     # 3a. Simple dynamics (default)
     ids = list(range(WINDOW_SIZE))
