@@ -9,7 +9,8 @@ experiments/
 .tscore_smoke/
 # Local training / metric dumps (use --epoch-metrics-csv paths you choose)
 metrics.csv
-runs/
+# Root-only: do not ignore docs/runs/ (committed reference artifacts)
+/runs/
 docs/BASELINE_LAST_RUN.txt
 __pycache__/
 *.py[cod]

@@ -175,7 +175,7 @@ python3 sandbox.py \
   --save-every 500
 ```
 
-End-state reference (Apr 2026, one machine): **`val_CE` ~4.8**, **`train_CE` ~3.9** after 10 epochs; generations recognizable as story-like but not polished. Full numbers: **`docs/TRAINING_RUN_LOG.md`**.
+End-state reference (Apr 2026, one machine): **`val_CE` ~4.8**, **`train_CE` ~3.9** after 10 epochs; generations recognizable as story-like but not polished. A **committed** snapshot of `metrics_meaningful.csv` and `eval_meaningful.json` (plus a column/field glossary) lives under **`docs/runs/meaningful_apr2026/`**; narrative: **`docs/TRAINING_RUN_LOG.md`**.
 
 **A2 — Larger budget (optional GOAT + substrate).** Omit **`--hf-max-chars`** (or raise it) and scale **`--max-epochs`** / GPU batch size as appropriate.
 

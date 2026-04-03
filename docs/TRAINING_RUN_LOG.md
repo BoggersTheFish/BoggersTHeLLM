@@ -25,7 +25,9 @@ Chronological notes for **substantive** `sandbox.py` runs (real corpora, multi-e
 
 **Qualitative:** Fixed-prompt generations show TinyStories-like story tone, imperfect grammar, and **order-sensitive** `compare_prompts` (nonzero L2, cosine not equal to 1).
 
-**Artifacts:** `checkpoints/meaningful_run/ckpt_step*.pt`, `metrics_meaningful.csv`, `eval_meaningful.json` (local paths; not committed).
+**Artifacts (committed):** [`docs/runs/meaningful_apr2026/`](runs/meaningful_apr2026/README.md) — `metrics_meaningful.csv` (per-epoch table), `eval_meaningful.json` (final val + config subset). Field glossary: that folder’s **README**.
+
+**Weights (local only):** `checkpoints/meaningful_run/ckpt_step*.pt` — not in git (`.gitignore`).
 
 **Full command:** see README → [First real training run](../README.md#first-real-training-run-public-corpus--checkpoint--eval-json) → **Option A1 (CPU-sized)**.
 

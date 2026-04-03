@@ -7,6 +7,10 @@ The project is documented as **BoggersTheLanguageModel**; canonical source is [g
 
 ---
 
+## Committed run artifacts — meaningful Apr 2026 (Apr 2026)
+
+- **`docs/runs/meaningful_apr2026/`** — `metrics_meaningful.csv`, `eval_meaningful.json` (paths in JSON repo-relative), and **README** documenting every column / JSON key. Linked from **`docs/TRAINING_RUN_LOG.md`** and **`docs/README.md`**.
+
 ## Docs + training run log — TinyStories CPU slice (Apr 2026)
 
 - **README**: “First real training run” split into **A0** (large corpus / GPU), **A1** ( **`--hf-max-chars`** CPU-sized TinyStories + small model + **`--grad-clip`** ), **A2** (GOAT + substrate, long run). Notes **`HF_TOKEN`** for Hub rate limits.
