@@ -12,6 +12,7 @@ Start with the [README](../README.md) in the repo root for install, training, an
 | [FAILURE_ANALYSIS.md](FAILURE_ANALYSIS.md) | Symptoms and checks when training looks flat or wrong |
 | [MILESTONE_TRAINING.md](MILESTONE_TRAINING.md) | Milestone-oriented training notes |
 | [TRAINING_RUN_LOG.md](TRAINING_RUN_LOG.md) | Log of verified multi-epoch runs (metrics, corpus caps, wall time) |
-| [runs/meaningful_apr2026/README.md](runs/meaningful_apr2026/README.md) | **Committed** epoch CSV + eval JSON from the Apr 2026 CPU TinyStories run (field meanings) |
+| [runs/meaningful_apr2026/README.md](runs/meaningful_apr2026/README.md) | **Committed** epoch CSV + eval JSON from the Apr 2026 **10-epoch** CPU TinyStories run (field meanings) |
+| [runs/apr2026_3epoch_cpu_example/README.md](runs/apr2026_3epoch_cpu_example/README.md) | **Example:** full **3-epoch** CPU transcript + metrics (`EXAMPLE_RUN_OUTPUT.md`) |
 
 Submodule docs live under `vendor/*` (GOAT-TS, TS-Core, ts-llm) and are not duplicated here.

@@ -7,6 +7,20 @@ The project is documented as **BoggersTheLanguageModel**; canonical source is [g
 
 ---
 
+## 2026-04-04 — Documentation refresh + 3-epoch CPU example + training/profiling updates
+
+### Documentation
+
+- **`docs/runs/apr2026_3epoch_cpu_example/`** — README with command, epoch table, dynamics-depth note; **`EXAMPLE_RUN_OUTPUT.md`** = full pasted console from a real **3-epoch** TinyStories CPU run (~3300 s total, git `d65dd64`, **16** outer steps in the log).
+- **`docs/TRAINING_RUN_LOG.md`**, **`docs/README.md`**, **`docs/PROJECT_STATUS.md`**, root **`README.md`** — cross-links, “progress snapshot,” and **A1b** quick-run pointer.
+
+### Code / tooling
+
+- **`sandbox.py`**: default **`MAX_WINDOW_STEPS`** **32**; trajectory contrastive **teacher** from **consecutive stop-gradient states** (no second dynamics on shifted window); **`return_intermediate_states=True`** when needed; micro-optimizations (**`matmul`/`bmm`** / **`flatten`** in hot paths).
+- **`scripts/profile_training_step.py`**: CPU-safe timing when CUDA profiler fields are absent.
+
+---
+
 ## 2026-04-04 — Attractor Dynamics Depth Update
 
 ### Change

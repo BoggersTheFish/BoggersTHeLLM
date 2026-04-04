@@ -11,6 +11,22 @@ Chronological notes for **substantive** `sandbox.py` runs (real corpora, multi-e
 
 ---
 
+## 2026-04-04 — TinyStories CPU, 3 epochs (full transcript example)
+
+**Goal:** Short wall-clock run (~55 min total) on the same **1.5M-char** TinyStories cache as the 10-epoch reference, with **verbatim** console output committed for onboarding and debugging.
+
+**Corpus / hardware:** Same TinyStories cache and batching as the **2026-04-02** 10-epoch entry below: `tinystories_46047f2aaf7b6ad7399c.txt`, **CPU**, ~17 min/epoch, **4998 batches/epoch** (batch 64).
+
+**Dynamics depth:** Printed **`dynamics_steps=16`** and 16-step tension vectors — that matches **`MAX_WINDOW_STEPS = 16`** on git **`d65dd64`**. Current **`main`** defaults **`MAX_WINDOW_STEPS = 32`**; pass **`--num-dynamics-steps 16`** to match this run’s depth.
+
+**Metrics (epoch 3):** `mean_loss` 3.6845, `train_CE` 4.2371, `val_CE` 4.8071, `val_traj_contrast` ~0.0031. **Total wall** ~3300 s for 3 epochs.
+
+**Artifacts (committed):** [`docs/runs/apr2026_3epoch_cpu_example/README.md`](runs/apr2026_3epoch_cpu_example/README.md) — command, tables, and link to **[`EXAMPLE_RUN_OUTPUT.md`](runs/apr2026_3epoch_cpu_example/EXAMPLE_RUN_OUTPUT.md)** (full progress bars, checkpoints, Phase 0 baseline block, sample generations, debug attractor lines, `compare_prompts`).
+
+**Weights (local only):** `checkpoints/meaningful_run/ckpt_step*.pt` — not in git.
+
+---
+
 ## 2026-04-02 — TinyStories CPU slice (verified meaningful run)
 
 **Goal:** Real LM signal on consumer CPU without multi-day epochs.

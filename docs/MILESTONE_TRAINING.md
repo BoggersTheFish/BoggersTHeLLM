@@ -11,7 +11,7 @@ Goal: coherent multi-token generation from attractor dynamics. Use trajectory lo
 | State dim | `--state-dim 128` |
 | Heads | `--vectorized-num-heads 4` (requires `state_dim % 4 == 0`) |
 | Batch | `--batch-size 64` (trajectory mode) |
-| Max outer steps | `--num-dynamics-steps 16` (ceiling) |
+| Max outer steps | `--num-dynamics-steps 32` (ceiling; default since Apr 2026) |
 | Early exit | `--convergence-epsilon 5e-3` or `1e-2` (target mean steps ~4–6) |
 | Adaptive inner scale | `--phase05-adaptive-window-dt` |
 | Stronger linear contraction | `--vectorized-strong-diffusion` |
@@ -59,7 +59,7 @@ python sandbox.py \
   --batch-size 64 \
   --vectorized-num-heads 4 \
   --vectorized-rank 64 \
-  --num-dynamics-steps 16 \
+  --num-dynamics-steps 32 \
   --convergence-epsilon 0.01 \
   --min-attractor-steps 2 \
   --phase05-adaptive-window-dt \

@@ -119,6 +119,7 @@ For a dated record, see **[CHANGELOG.md](CHANGELOG.md)** (2026-04-04) and **[doc
 | `vendor/TS-Core` | — | UniversalLivingGraph + WaveCycleRunner (submodule) |
 | `vendor/ts-llm` | — | Tokenizer, hierarchical dynamics, attractor LLM package (submodule) |
 | `docs/README.md` | — | Index of all docs in `docs/` |
+| `docs/runs/apr2026_3epoch_cpu_example/` | — | Full **3-epoch** CPU transcript + metrics (TinyStories, ~55 min) |
 | `docs/PROJECT_STATUS.md` | — | Current implementation status, gaps, recommended next steps |
 | `docs/API_DISCOVERY.md` | — | Vendored TS-OS entrypoints + `sandbox.py` integration surface |
 | `docs/BASELINE.md` | — | Phase 0 baseline recording instructions |
@@ -203,6 +204,8 @@ python3 sandbox.py \
 ```
 
 End-state reference (Apr 2026, one machine): **`val_CE` ~4.8**, **`train_CE` ~3.9** after 10 epochs; generations recognizable as story-like but not polished. A **committed** snapshot of `metrics_meaningful.csv` and `eval_meaningful.json` (plus a column/field glossary) lives under **`docs/runs/meaningful_apr2026/`**; narrative: **`docs/TRAINING_RUN_LOG.md`**.
+
+**A1b — Same recipe, fewer epochs (quick sanity check).** Use **`--max-epochs 3`** (and omit CSV/JSON flags if you only need console metrics). Wall time is roughly **~55 minutes** on a typical CPU at batch 64 for this corpus slice. A **verbatim** log (progress bars, checkpoints, Phase 0 baseline block, sample generations, debug dynamics) is committed under **`docs/runs/apr2026_3epoch_cpu_example/`** ([README](docs/runs/apr2026_3epoch_cpu_example/README.md), [full output](docs/runs/apr2026_3epoch_cpu_example/EXAMPLE_RUN_OUTPUT.md)). That example was captured at git **`d65dd64`** with **`dynamics_steps=16`**; current defaults use **`--num-dynamics-steps 32`** unless you pass **`16`** explicitly.
 
 **A2 — Larger budget (optional GOAT + substrate).** Omit **`--hf-max-chars`** (or raise it) and scale **`--max-epochs`** / GPU batch size as appropriate.
 

@@ -95,7 +95,7 @@ GEN_TENSION_TEMP_SCALE = 0.035
 
 # Training: full-window state (W × D), tension-adaptive interaction + step_state (no attention).
 NUM_WINDOW_DYNAMICS_STEPS = 8  # legacy default for max_window_steps if not overridden
-MAX_WINDOW_STEPS = 16
+MAX_WINDOW_STEPS = 32
 # Window tension: two regimes — with readout entropy (scale ~0.7–0.9) vs geometry-only (much smaller).
 WINDOW_TENSION_USE_ENTROPY = False
 WINDOW_TENSION_TOL_GEOMETRY = 0.05
@@ -480,10 +480,8 @@ class TorchAttractorLanguageModel(nn.Module):
         Sb = self._window_batch_full_state(S)
         if self.readout_fusion is not None:
             Sb = self.readout_fusion(Sb)
-        B = Sb.size(0)
-        return self.readout_window(
-            Sb.reshape(B, self.train_window_size * self.state_dim)
-        )
+        # flatten(1,-1) matches reshape(B, W*D); contiguous layout for Linear matmul
+        return self.readout_window(Sb.flatten(1, -1))
 
     def readout_window_logits(self, S: torch.Tensor) -> torch.Tensor:
         """Public alias for :meth:`_readout_window_logits` (training / inference parity)."""
@@ -914,7 +912,8 @@ class TorchAttractorLanguageModel(nn.Module):
             C_eff = C * mask
         else:
             C_eff = C_masked
-        delta = torch.einsum("bid,ij->bjd", S, C_eff)
+        # Same as einsum("bid,ij->bjd", S, C_eff): delta[b] = C_eff.T @ S[b]  (W,W) @ (B,W,D) -> (B,W,D)
+        delta = torch.matmul(C_eff.transpose(0, 1), S)
         rms = torch.sqrt(delta.pow(2).mean() + 1e-12)
         self._phase1_last_interaction_rms = rms
         return S + float(p.interaction_scale) * delta, rms
@@ -2126,7 +2125,11 @@ class TorchAttractorLanguageModel(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Batched trajectory contrastive loss + readout logits from pred state.
-        Teacher states are detached (no grad through shifted window).
+
+        Teacher states are derived from the predicted trajectory using stop-gradient alignment
+        (consecutive outer-step states) to avoid a second ``run_window_dynamics`` on a shifted
+        window. ``teacher_steps`` is ignored for the core contrastive term (kept for API
+        compatibility).
 
         When ``phase05_config.trajectory_intermediate_ce_weight > 0``, also adds
         ``weight * mean_k CE(readout_window(S_k), target)`` over post-step states
@@ -2144,6 +2147,7 @@ class TorchAttractorLanguageModel(nn.Module):
         """
         B = len(contexts)
         assert B == len(targets) and B >= 1
+        _ = teacher_steps  # ignored: teacher from stop-gradient trajectory alignment
         if self.phase05_config.log_metrics:
             self._phase05_evolve_high_breaks = 0
             self._phase05_evolve_low_exits = 0
@@ -2168,13 +2172,15 @@ class TorchAttractorLanguageModel(nn.Module):
             if beta <= 0.0:
                 ts_dyn = None
         S_pred = self.embed_windows_batch(context_tensor)
+        # Always collect intermediate states: needed for intermediate CE (optional) and for
+        # stop-gradient teacher pairs (consecutive trajectory steps) without a second dynamics solve.
         S_pred, _, states_pred = self.run_window_dynamics(
             S_pred,
             collect_metrics=False,
             record_tension_log=True,
             context_ids=contexts,
             target_states=ts_dyn,
-            return_intermediate_states=(w_ce > 0.0),
+            return_intermediate_states=True,
         )
         al_cfg = float(self.phase05_config.anchor_lambda)
         if al_cfg != 0.0:
@@ -2187,20 +2193,18 @@ class TorchAttractorLanguageModel(nn.Module):
             self._phase05_anchor_energy_mean = float("nan")
             self._phase05_anchor_energy_std = float("nan")
         self._last_traj_student_tension_mean = self.compute_tension_window(S_pred).mean().detach()
-        with torch.no_grad():
-            tgt_col = targets_tensor_tj.unsqueeze(1)
-            shifted_tensor = torch.cat([context_tensor[:, 1:], tgt_col], dim=1)
-            S_tgt = self.embed_windows_batch(shifted_tensor)
-            orig_steps = self.max_window_steps
-            try:
-                if teacher_steps is not None:
-                    self.max_window_steps = max(1, int(teacher_steps))
-                S_tgt, _, _ = self.run_window_dynamics(
-                    S_tgt, collect_metrics=False, record_tension_log=False
-                )
-            finally:
-                self.max_window_steps = orig_steps
-        loss_core = self.trajectory_contrastive_loss(S_pred, S_tgt)
+        Wm = self.train_window_size
+        Dm = self.state_dim
+        if states_pred is not None and len(states_pred) >= 2:
+            # Align consecutive outer-step window states: predict step t from t-1; teacher is
+            # detached future state along the same student trajectory (no second dynamics).
+            S_stack = torch.stack(states_pred, dim=0)
+            S_pred_aligned = S_stack[:-1].reshape(-1, Wm, Dm)
+            S_tgt = S_stack[1:].detach().reshape(-1, Wm, Dm)
+            loss_core = self.trajectory_contrastive_loss(S_pred_aligned, S_tgt)
+        else:
+            # Single outer step or missing intermediates: no pairwise trajectory term.
+            loss_core = S_pred.mean() * 0.0
         self._phase05_loss_traj_core = float(loss_core.detach().item())
         loss_ce_intermediate: torch.Tensor | None = None
         if w_ce > 0.0 and states_pred:
@@ -2736,9 +2740,11 @@ class SimpleAttractorDynamics(nn.Module):
         H = self.num_heads
         if self.head_dim_mode == "split":
             x = state_batch.reshape(N, H, self.dh)
-            drifts = torch.einsum("nhd,hde->nhe", x, self.diffusion_heads)
+            # (H,N,dh) @ (H,dh,dh) -> (H,N,dh); same as einsum("nhd,hde->nhe", x, diffusion_heads)
+            drifts = torch.bmm(x.transpose(0, 1), self.diffusion_heads).transpose(0, 1)
         else:
-            drifts = torch.einsum("nd,hde->nhe", state_batch, self.diffusion_heads)
+            # (N,1,dim) @ (H,dim,dim) -> (N,H,dim); same as einsum("nd,hde->nhe", ...)
+            drifts = torch.matmul(state_batch.unsqueeze(1), self.diffusion_heads)
         if self.training and self._track_head_drifts:
             self._last_multihead_drifts = drifts
         p2 = self.phase2
@@ -3021,7 +3027,7 @@ def positional_coupling_delta(
             asym_fac = 1.0 + POSITION_ASYM_STRENGTH * torch.tanh(position_asym) * sign_ji
             weights = weights * asym_fac.clamp(min=0.2)
         wsum = weights.sum(dim=1, keepdim=True)
-        weighted = torch.einsum("ij,bjd->bid", weights, S)
+        weighted = torch.matmul(weights, S)
         return weighted - wsum.unsqueeze(0) * S
     W, _D = S.shape
     device = S.device
@@ -3070,7 +3076,7 @@ def positional_coupling_delta_from_weights(
     wsum: torch.Tensor,
 ) -> torch.Tensor:
     """``sum_j w_ij (S_j - S_i)`` using precomputed ``weights`` (same as :func:`positional_coupling_delta` 3D)."""
-    weighted = torch.einsum("ij,bjd->bid", weights, S)
+    weighted = torch.matmul(weights, S)
     return weighted - wsum.unsqueeze(0) * S
 
 
@@ -3394,18 +3400,22 @@ def mean_trajectory_contrastive_eval(
         device = model.embedder.weight.device
         context_tensor = torch.as_tensor(contexts, dtype=torch.long, device=device)
         S_pred = model.embed_windows_batch(context_tensor)
-        S_pred, _, _ = model.run_window_dynamics(
-            S_pred, collect_metrics=False, record_tension_log=False
+        S_pred, _, states_pred = model.run_window_dynamics(
+            S_pred,
+            collect_metrics=False,
+            record_tension_log=False,
+            return_intermediate_states=True,
         )
-        tgt_col = torch.as_tensor(targets, dtype=torch.long, device=device).unsqueeze(1)
-        shifted_tensor = torch.cat([context_tensor[:, 1:], tgt_col], dim=1)
-        S_tgt = model.embed_windows_batch(shifted_tensor)
-        S_tgt, _, _ = model.run_window_dynamics(
-            S_tgt, collect_metrics=False, record_tension_log=False
-        )
-        total += float(model.trajectory_contrastive_loss(S_pred, S_tgt).item()) * len(
-            contexts
-        )
+        Wm = model.train_window_size
+        Dm = model.state_dim
+        if states_pred is not None and len(states_pred) >= 2:
+            S_stack = torch.stack(states_pred, dim=0)
+            S_aligned = S_stack[:-1].reshape(-1, Wm, Dm)
+            S_tgt = S_stack[1:].detach().reshape(-1, Wm, Dm)
+            traj = model.trajectory_contrastive_loss(S_aligned, S_tgt)
+        else:
+            traj = S_pred.mean() * 0.0
+        total += float(traj.item()) * len(contexts)
         n_seen += len(contexts)
         i += batch_size
     if was_training:
