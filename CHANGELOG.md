@@ -7,6 +7,16 @@ The project is documented as **BoggersTheLanguageModel**; canonical source is [g
 
 ---
 
+## 2026-04 — Documentation sync (README + docs)
+
+- **README.md** — Project table: **`evaluation/prompts.py`**, **`benchmarks/training_throughput.json`**, **`scripts/profile_training_step.py`**; checkpoints **`training_config`**; end-of-epoch **`logs/eval_epoch_*.txt`**; **`state_cache`** shim; **trajectory teacher** description (stop-gradient consecutive states); **`--max-epochs`** default **3**; eval harness / throughput / Wave C / Wave H cross-links.
+- **docs/README.md** — Index rows for evaluation prompts, benchmarks JSON, profile script.
+- **docs/PROJECT_STATUS.md** — Throughput + fixed-prompt eval; **`training_config`**; **`generate`** vs teacher-forced eval.
+- **docs/API_DISCOVERY.md** — **`trajectory_contrastive_loss_and_logits`**, **`load_model_from_checkpoint`**, **`generate`**, **`state_cache`**.
+- **docs/BASELINE.md** — **`EVAL_PROMPTS`** vs **`BASELINE_PROMPT_*`**.
+- **docs/architecture_changes.md** — Observability / reproducibility subsection.
+- **docs/DEVELOPMENT_ROADMAP.md** — Checkpoint discipline + throughput JSON.
+
 ## 2026-04-04 — Documentation refresh + 3-epoch CPU example + training/profiling updates
 
 ### Documentation

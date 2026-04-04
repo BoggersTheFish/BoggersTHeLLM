@@ -22,15 +22,15 @@ Last verified: April 2026 (Boggers integration table refreshed for multi-wave st
 | `phase05_batch_csv_values` / `PHASE05_BATCH_CSV_HEADER` | Includes attractor diagnostics, **`energy_per_wave_means`**, **`frozen_fraction_mean` / `frozen_fraction_std`** when freeze enabled, Phase 1–2 columns. |
 | `AttractorDataPipeline` (`data_pipeline.py`) | Streaming train batches when import succeeds. **`epoch_batches` → `(contexts, targets, target_states_batch)`**; optional **`train_target_states`** `(n_windows, W, D)` CPU for trajectory-guided batches (stream mode only). |
 | `mean_cross_entropy_eval` | Batched **`embed_windows_batch → run_window_dynamics → readout_window_logits`** + eval shaping (bigram, repeats, label smoothing). |
-| `trajectory_contrastive_loss_and_logits` | Main training forward; teacher path optional fewer steps via **`teacher_steps`**. Optional **`target_states`** `(B,W,D)` for nudge + MSE when Phase05 guidance weights set; teacher dynamics **not** nudged. |
-| `load_model_from_checkpoint` | Rebuilds **`VectorizedWindowDynamics`** when **`dynamics.mhd.*`** in state dict; tolerates missing **`energy_heads`**, **`wave_interaction`**, **`readout_fusion`**; broadcasts legacy **`energy_head.*`** into every **`energy_heads[i]`**. |
-| `generate` | **`forward_training_window` → `readout_window_logits` / `effective_temperature`**. |
+| `trajectory_contrastive_loss_and_logits` | Main training forward; **teacher** = **stop-gradient** consecutive states along the student trajectory (no second **`run_window_dynamics`** on a shifted window). Optional **`teacher_steps`** kept for API compatibility. Optional **`target_states`** `(B,W,D)` for nudge + MSE when Phase05 guidance weights set. |
+| `load_model_from_checkpoint` | Rebuilds **`VectorizedWindowDynamics`** when **`dynamics.mhd.*`** in state dict; merges **`training_config`** when present (warns if missing/incomplete); tolerates missing **`energy_heads`**, **`wave_interaction`**, **`readout_fusion`**; broadcasts legacy **`energy_head.*`** into every **`energy_heads[i]`**. |
+| `generate` | Single supported decoding path: **`forward_training_window` → `readout_window_logits` / `effective_temperature`** + sampling (see docstring in **`sandbox.py`**). |
 
 ## Legacy inference cache (not training-parity logits)
 
 | Entry | Role |
 |-------|------|
-| `AttractorStateCache` / `generate_with_cache` (`state_cache.py`) | **`step()`** matches training embedding + `run_window_dynamics`. **`logits()`** uses **`readout(D)`** only — **not** **`readout_window_logits`**. Deprecated for decoding; prefer **`generate`** + **`load_model_from_checkpoint`**. |
+| `AttractorStateCache` / `generate_with_cache` (`state_cache.py`) | **`step()`** matches training embedding + `run_window_dynamics`. **`generate_with_cache`** delegates to **`model.generate`** (shim). **`logits()`** still uses **`readout(D)`** only — **not** **`readout_window_logits`**. Prefer **`generate`**. |
 
 ---
 

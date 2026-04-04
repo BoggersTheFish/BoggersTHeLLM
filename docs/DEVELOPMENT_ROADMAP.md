@@ -11,7 +11,7 @@ This roadmap is **practical**: it aligns with the current **multi-wave** stack i
 - Use **stream split + enough val windows** (`BASELINE.md`, `MIN_VAL_WINDOWS`).
 - Log **epoch CSV** + optional **`--phase05-batch-metrics-csv`**.
 - For decoding, **`model.generate`** only (training-parity readout path).
-- **Checkpoint discipline:** save `use_readout_fusion`, `num_waves`, `use_readout_fusion`, vectorized metadata in `config` (already partially done).
+- **Checkpoint discipline:** newer checkpoints include **`training_config`** (full training CLI snapshot) plus legacy **`config`** for model geometry; **`load_model_from_checkpoint`** warns if **`training_config`** is missing or incomplete.
 
 **Exit:** You can compare two runs on the same corpus and say which improved val CE / samples without confounding tokenizer or readout mismatch.
 
@@ -21,7 +21,7 @@ This roadmap is **practical**: it aligns with the current **multi-wave** stack i
 
 **Goal:** Make one optimizer step as cheap as possible on your GPU without changing math silently.
 
-- Profile: `scripts/profile_training_step.py` (adjust `--simple-dynamics` / vectorized as needed).
+- Profile: `scripts/profile_training_step.py` (adjust `--simple-dynamics` / vectorized as needed). Throughput numbers are printed after profiling and saved under **`benchmarks/training_throughput.json`** (see **`--throughput-iters`**).
 - Targets are **environment-specific**; record GPU model, batch size, W, D, `max_window_steps` when claiming a number.
 - Candidates: fewer `.item()` syncs in hot loops (ongoing), compiled inner dynamics (`dyn._step`), larger batches if memory allows.
 

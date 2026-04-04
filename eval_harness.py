@@ -7,6 +7,13 @@ Runs the full 11-step WaveCycleRunner on the language substrate and measures:
   - TSCore global tension before and after 11-tick relaxation
   - trajectory contrastive score on val set
 
+**Text decoding / samples:** use :meth:`sandbox.TorchAttractorLanguageModel.generate` only.
+
+**Perplexity / CE:** :func:`compute_perplexity` uses teacher-forced
+:meth:`~sandbox.TorchAttractorLanguageModel.forward_training_window` logits (standard next-token
+cross-entropy), not autoregressive ``generate()`` — that is intentional; PPL is not defined on
+sampled rollouts.
+
 Usage
 -----
     python eval_harness.py [--corpus data/corpus.txt] [--val-fraction 0.2]
@@ -46,8 +53,11 @@ def compute_perplexity(
     dataset: list,
 ) -> float:
     """
-    Compute token-level perplexity on a (context, target_id) dataset.
-    PPL = exp(mean cross-entropy).
+    Token-level perplexity on a (context, target_id) dataset: PPL = exp(mean CE).
+
+    Uses **teacher-forced** :meth:`~sandbox.TorchAttractorLanguageModel.forward_training_window`
+    logits (same readout path as training). For **generated text**, call
+    :meth:`~sandbox.TorchAttractorLanguageModel.generate` instead — not this function.
     """
     if not dataset:
         return float("nan")

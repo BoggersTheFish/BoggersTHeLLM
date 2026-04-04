@@ -12,14 +12,16 @@ This document answers: **where the codebase is today**, **what is solid**, **wha
 | **3-epoch** full-console example (same corpus caps, ~55 min, git `d65dd64`, **16** outer steps at run time) | [`docs/runs/apr2026_3epoch_cpu_example/README.md`](runs/apr2026_3epoch_cpu_example/README.md) |
 | Chronological run notes | [`docs/TRAINING_RUN_LOG.md`](TRAINING_RUN_LOG.md) |
 | Default relaxation depth | **`MAX_WINDOW_STEPS = 32`** in `sandbox.py` (CLI `--num-dynamics-steps`); the 3-epoch example used **16** — see that folder’s README |
+| **Throughput benchmark** | `scripts/profile_training_step.py` → **`benchmarks/training_throughput.json`** (`step_time_ms`, batches/sec, tokens/sec) |
+| **Fixed-prompt eval (training)** | [`evaluation/prompts.py`](../evaluation/prompts.py) — **`EVAL_PROMPTS`** → **`logs/eval_epoch_{N}.txt`** each epoch |
 
-Recent engineering (same release line as the depth bump): trajectory contrastive **teacher** is built from **stop-gradient consecutive states** along the student trajectory (no second `run_window_dynamics` on a shifted window); hot paths replace some **`einsum`** with **`matmul`/`bmm`**; `scripts/profile_training_step.py` sorts CPU/CUDA times without assuming `cuda_time_total` on every profiler event type.
+Recent engineering: trajectory contrastive **teacher** from **stop-gradient consecutive** trajectory states (no second `run_window_dynamics` on a shifted window); checkpoints include **`training_config`** for reproducibility; **`generate_with_cache`** delegates to **`model.generate`**; hot paths use **`matmul`/`bmm`** where applicable; `scripts/profile_training_step.py` handles CPU/CUDA profiler fields and appends throughput metrics.
 
 ---
 
 ## What this project is
 
-A **continuous attractor language model** without transformer attention: window state `S ∈ (B, W, D)` evolves under **positional coupling**, **learned per-wave energy heads**, optional **tension** and **anchor** terms, **Phase 1/2** window coupling and breaks, then **readout** to vocabulary logits. Training defaults to **trajectory contrastive** loss plus auxiliary CE paths. Decoding should use **`model.generate`** / **`forward_training_window`** so logits match training (**`readout_window_logits`** path, optionally with fusion).
+A **continuous attractor language model** without transformer attention: window state `S ∈ (B, W, D)` evolves under **positional coupling**, **learned per-wave energy heads**, optional **tension** and **anchor** terms, **Phase 1/2** window coupling and breaks, then **readout** to vocabulary logits. Training defaults to **trajectory contrastive** loss plus auxiliary CE paths. **Autoregressive text** must use **`model.generate`** ( **`forward_training_window` → `readout_window_logits`** each step). Teacher-forced metrics use **`forward_training_window`** or batched readout without sampling.
 
 ---
 
@@ -38,7 +40,7 @@ A **continuous attractor language model** without transformer attention: window 
 | **Vectorized window dynamics module** | Stable | `VectorizedWindowDynamics` on **`wave_dim`** when `--dynamics vectorized`; `step` used in **`evolve_token`** when `mhd` present |
 | **`--dynamics simple`** | Stable | Means **no** `VectorizedWindowDynamics`; token path uses **`wave_dynamics`** (not legacy `SimpleAttractorDynamics` unless attached manually) |
 | **Readout** | Stable | `readout_window_logits(S)` → optional `Linear(D,D)` per position (`--readout-fusion`) → `readout_window` |
-| **Checkpoints** | Stable | `load_model_from_checkpoint`, legacy `energy_head.*` → broadcast to `energy_heads`; optional missing keys for `wave_interaction`, `readout_fusion`, etc. |
+| **Checkpoints** | Stable | `load_model_from_checkpoint`; **`training_config`** in newer saves (warn if missing/incomplete); legacy `energy_head.*` → broadcast to `energy_heads`; optional missing keys for `wave_interaction`, `readout_fusion`, etc. |
 | **Anchor freeze (window path)** | Optional | `--phase05-enable-anchor-freeze`; zeros energy grad on converged wave slices; metrics `frozen_fraction_*` |
 | **Inference** | Stable | `generate_sample.py`, `inference_server.py` use checkpoint loader + `generate` |
 | **GOAT / substrate** | Optional | Integrated; not required for core LM training |
@@ -51,7 +53,7 @@ A **continuous attractor language model** without transformer attention: window 
 1. **Documentation lag** — Older notes may still mention `run_window_dynamics` calling `dynamics.step` every outer step; the **window** path is primarily **energy + coupling**. Token path uses `step` / `wave_dynamics`. External tutorials must use the **3-tuple** `epoch_batches` API when copying pipeline examples. Verified runs may cite **`num_dynamics_steps: 16`** while the current default is **32** — check the date and CLI in each doc.
 2. **Hyperparameter surface** — `num_waves`, `wave_interaction_strength`, `anchor_freeze_threshold`, `readout_fusion`, and per-wave energy heads multiply knobs; **re-baseline** after architectural toggles.
 3. **GPU performance** — Roadmap targets (batch &lt; 1 s, etc.) are **aspirational** until measured on your hardware; profile with `scripts/profile_training_step.py`.
-4. **Eval vs training** — `state_cache` / `readout(D)` is **not** training-parity decoding; use **`generate`** for real samples.
+4. **Eval vs training** — `state_cache.logits()` / `readout(D)` is **not** training-parity decoding; use **`generate`** for samples. **`eval_harness` PPL** uses teacher-forced logits (not **`generate`**).
 5. **Tests** — Smoke and parity tests exist; **no** full regression suite for every Phase 0.5 flag combination.
 
 ---

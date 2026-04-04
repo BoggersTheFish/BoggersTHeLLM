@@ -102,7 +102,7 @@ For a dated record, see **[CHANGELOG.md](CHANGELOG.md)** (2026-04-04) and **[doc
 | `tests/test_embed_windows_batch.py` | — | Parity check: `embed_windows_batch` vs stacking `embed_window` per row |
 | `wave_a_tokenizer.py` | A | tiktoken BPE helpers; training uses `sandbox._build_tokenizer()` |
 | `dynamics_vectorized.py` | B | `VectorizedWindowDynamics`: `step(S, signal)` only; `forward` disabled; `run_window_dynamics_vectorized` → `model.run_window_dynamics` |
-| `state_cache.py` | C | **Deprecated for decoding:** rolling cache; `logits()` uses `readout` (≠ training `readout_window_logits`). Prefer `model.generate`. |
+| `state_cache.py` | C | **Deprecated for decoding:** `generate_with_cache` delegates to **`model.generate`**; `cache.logits()` still uses legacy `readout(D)`. Prefer **`model.generate`**. |
 | `scripts/generate_sample.py` | — | Load checkpoint via `sandbox.load_model_from_checkpoint` → `model.generate` (training-parity readout) |
 | `scripts/ts_workflow_smoke.py` | — | Smoke: `forward_training_window` + `model.generate` + simple/vectorized `run_window_dynamics` |
 | `data_pipeline.py` | D | Streaming sharded DataLoader (txt / JSONL, multi-worker) |
@@ -119,6 +119,9 @@ For a dated record, see **[CHANGELOG.md](CHANGELOG.md)** (2026-04-04) and **[doc
 | `vendor/TS-Core` | — | UniversalLivingGraph + WaveCycleRunner (submodule) |
 | `vendor/ts-llm` | — | Tokenizer, hierarchical dynamics, attractor LLM package (submodule) |
 | `docs/README.md` | — | Index of all docs in `docs/` |
+| `evaluation/prompts.py` | — | **`EVAL_PROMPTS`** — fixed strings for end-of-epoch **`model.generate`** samples (`logs/eval_epoch_*.txt`) |
+| `benchmarks/training_throughput.json` | — | Written by **`scripts/profile_training_step.py`** — wall-clock step time, batches/sec, tokens/sec |
+| `scripts/profile_training_step.py` | — | Torch profiler + throughput benchmark (sandbox / ts-llm training step) |
 | `docs/runs/apr2026_3epoch_cpu_example/` | — | Full **3-epoch** CPU transcript + metrics (TinyStories, ~55 min) |
 | `docs/PROJECT_STATUS.md` | — | Current implementation status, gaps, recommended next steps |
 | `docs/API_DISCOVERY.md` | — | Vendored TS-OS entrypoints + `sandbox.py` integration surface |
@@ -341,7 +344,9 @@ This section is the operational manual — what to run, how data and validation 
 
 **Default data mode is streaming (recommended).** The whole corpus file (or merged directory of `.txt` / `.jsonl`) is read as one string, encoded once into a single token sequence, and training uses all sliding windows `(context, target)` along that sequence. Legacy **line-based** mode (`--no-streaming-dataset`) tokenizes each non-empty line separately and skips lines shorter than `window_size + 1`; it also uses `--epoch-copies` to repeat the training line list each epoch. In **stream mode**, `--epoch-copies` is ignored on purpose: repetition is controlled only by `--max-epochs` and by shuffled window sampling, not by duplicating tokens in memory.
 
-**Device and checkpoints.** `--device auto` picks CUDA when available. `--resume-checkpoint` restores weights and optimizer state. `--checkpoint-dir` and `--save-every` control where and how often numbered checkpoints are written.
+**Device and checkpoints.** `--device auto` picks CUDA when available. **`_save_checkpoint`** stores **`model_state`**, **`optimizer_state`**, step/epoch, legacy **`config`** (model geometry for loading), and **`training_config`** (full CLI hyperparameters: `window_size`, `state_dim`, `num_waves`, `max_window_steps`, `batch_size`, `lr`, tokenizer, dataset, seed, `max_epochs`, …). **`load_model_from_checkpoint`** merges **`training_config`** when present and warns if it is missing or incomplete. **`--resume-checkpoint`** restores weights and optimizer state. **`--checkpoint-dir`** and **`--save-every`** control where and how often numbered checkpoints are written.
+
+**End-of-epoch fixed prompts.** After each epoch (before CSV metrics), the training loop runs **`model.generate(prompt, max_tokens=120)`** for every string in **`evaluation/prompts.EVAL_PROMPTS`**, prints each result, and appends **`logs/eval_epoch_{epoch}.txt`** (1-based epoch index). This is separate from the final **Phase 0 baseline** block, which still uses **`BASELINE_PROMPT_1`–`3`** in `sandbox.py`.
 
 **Integrations.** `--use-substrate` attaches `LLMSubstrateNode` so language tension can drive TSCore propagation and logging. `--use-goat-memory` enables `GoatMemoryManager` and injects a per-position signal into window dynamics. By default **`--dynamics vectorized`** replaces `model.dynamics` with **`VectorizedWindowDynamics`** on **`wave_dim`** (from `dynamics_vectorized.py`; falls back to non-vectorized if import fails). **`--dynamics simple`** leaves **`model.dynamics`** unset so **`evolve_token`** uses **`wave_dynamics`** (per-wave **`WaveDynamics`**) plus **`wave_interaction`**; the window path is unchanged (energy descent in **`run_window_dynamics`**). The legacy **`SimpleAttractorDynamics`** class remains in code for compatibility but is not the default.
 
@@ -384,8 +389,9 @@ python3 sandbox.py --corpus data/generated.txt
 |--------|---------|
 | `python3 smoke_test.py` | Fast integration check: model + one dynamics pass + training step + TSCore wave cycle. Run after install or refactors. |
 | `python3 tests/test_embed_windows_batch.py` | Confirms batched window embedding matches per-row `embed_window` (prints max abs diff). |
-| `python3 eval_harness.py …` | Perplexity, mean tension, trajectory contrast, optional TSCore `WaveCycleRunner` metrics; writes JSON. Use `--dataset-source tinystories` / `fineweb-edu` to match Hub training data. |
+| `python3 eval_harness.py …` | Perplexity (teacher-forced **`forward_training_window`**), mean tension, trajectory contrast, optional TSCore `WaveCycleRunner` metrics; writes JSON. Text samples use **`model.generate`**. Use `--dataset-source tinystories` / `fineweb-edu` to match Hub training data. |
 | `python3 inference_server.py` | FastAPI: `/v1/completions` via **`model.generate`**, **`load_model_from_checkpoint`** for vectorized ckpts. Needs `pip install fastapi uvicorn`. |
+| `python3 scripts/profile_training_step.py` | Torch profiler on one training step; writes **`benchmarks/training_throughput.json`** and prints **`=== Throughput ===`** (see **`--throughput-iters`**). |
 | `python3 data/generate_corpus.py --out PATH --tokens N` | Offline synthetic corpus for tests or a fixed `data/generated.txt`. |
 
 ### Docker and deployment
@@ -418,6 +424,7 @@ python3 sandbox.py --corpus data/generated.txt
 **Throughput and hardware**
 
 - Use **`--device cuda`** when available. On CUDA, **`torch.set_float32_matmul_precision("high")`** is set, and **`torch.compile`** targets only the inner step (**`dyn._step`** for vectorized, **`dyn._step_rows`** for simple)—not the outer window loop. First epoch can be slower while kernels warm up.
+- **`python3 scripts/profile_training_step.py`** records Chrome/TensorBoard traces and, after profiling, times **`--throughput-iters`** plain optimizer steps (default **32**). It prints **`step_time_ms`**, **`batches/sec`**, **`tokens/sec`** and overwrites **`benchmarks/training_throughput.json`** (repo root). Default **`--max-window-steps`** in the script is **32** to match **`sandbox.py`**.
 - **`--dynamics vectorized`** (default) can help on GPU when token-time **`evolve_token`** uses **`MultiHeadDynamics`**; ensure **`wave_dim`** is divisible by **`--vectorized-num-heads`**. **`--dynamics simple`** is fine for CPU smoke tests (per-wave **`WaveDynamics`** on the token path).
 
 **Optimisation and stability**
@@ -430,6 +437,7 @@ python3 sandbox.py --corpus data/generated.txt
 **Logging for analysis**
 
 - **`--epoch-metrics-csv`**: one row per epoch (loss, CE, tension, TSCore fields).
+- **`logs/eval_epoch_{epoch}.txt`**: fixed-prompt **`model.generate`** samples each epoch (from **`evaluation/prompts.EVAL_PROMPTS`**); distinct from **`--baseline-out`** / **`BASELINE_PROMPT_*`** at end of training.
 - **`--phase05-batch-metrics-csv`** (with **`--phase05-log-metrics`** implied): per-batch diagnostics; plot with **`scripts/plot_phase05_metrics.py`**. When metrics logging is off, the runtime skips heavy tracing arrays and keeps only the tension values needed for control flow.
 
 ### Debug mode
@@ -499,7 +507,7 @@ With **`--dynamics simple`**, **`model.dynamics`** stays **`None`**; **`evolve_t
 
 **For text generation, use `TorchAttractorLanguageModel.generate()`** (same path as training: **`forward_training_window` → `readout_window_logits` / `effective_temperature`**). **`scripts/generate_sample.py`** and **`inference_server.py`** both load checkpoints with **`sandbox.load_model_from_checkpoint`** (rebuilds **`VectorizedWindowDynamics`** with **`vectorized_dt`**, **`use_lorentz`** before **`load_state_dict`**).
 
-`state_cache.py` remains for experiments; **`generate_with_cache`** and **`cache.logits()`** emit **`FutureWarning`** — they use **`readout(fast/slow)`**, not **`readout_window_logits`**, so logits **do not** match trajectory training.
+`state_cache.py` remains for experiments. **`generate_with_cache`** is a **shim** that calls **`model.generate`** ( **`FutureWarning`** ). **`cache.logits()`** still uses **`readout(fast/slow)`**, not **`readout_window_logits`**, so logits **do not** match trajectory training.
 
 - **`step(token_id)`** — same window embedding + **`run_window_dynamics`** on **`(1, W, D)`** (dynamics aligned; readout head is not)
 - **`logits()`** / **`generate_with_cache`** — deprecated for production decoding
@@ -509,7 +517,7 @@ With **`--dynamics simple`**, **`model.dynamics`** stays **`None`**; **`evolve_t
 # Preferred
 text = model.generate("the cat sat", max_tokens=30, temperature=1.0, top_k=28)
 
-# Legacy (warnings)
+# Legacy (warnings; delegates to model.generate)
 from state_cache import AttractorStateCache, generate_with_cache
 cache = AttractorStateCache(model)
 text = generate_with_cache(model, cache, prompt="the cat sat", max_tokens=30)
@@ -596,7 +604,7 @@ python inference_server.py --self-test
 
 `eval_harness.py` provides the full evaluation loop:
 
-- `compute_perplexity(model, dataset)` — token-level PPL = exp(mean CE)
+- `compute_perplexity(model, dataset)` — token-level PPL = exp(mean CE) on **teacher-forced** **`forward_training_window`** logits (standard next-token CE; not **`generate`**)
 - `compute_mean_tension(model, dataset)` — mean final window tension across batches
 - `compute_traj_contrast(model, dataset)` — mean trajectory contrastive loss
 - `run_wave_cycle(model, substrate, dataset, max_ticks=11)` — feeds language batches into TSCore, runs `run_until_stable(max_ticks)`, returns before/after tension delta and evolve count
@@ -711,7 +719,8 @@ L = L_traj + w_token · L_token_aux + α · L_readout_aux + w_guide · L_traj_ms
 
 L_traj = mean(ReLU(0.2 − cos(pred, teacher) + cos(pred, negative)))
   pred   = evolved(context window)
-  teacher = evolved(shifted window [x2…xW, next_token])
+  teacher = stop-gradient next state along the same predicted trajectory (consecutive outer-step
+            states; no second run_window_dynamics on a shifted window)
   negative = shuffled teacher in batch
 
 L_token_aux = CE on readout_window_logits(pred window) vs target  (--token-aux-ce, default 0.2)
@@ -786,7 +795,7 @@ Training:
   --grad-clip FLOAT          Optional global grad-norm clip (default: off)
   --lr, --lr-decay-every, --lr-gamma
   --epoch-copies INT         Repeat training lines per epoch
-  --max-epochs N, --epochs N Number of training epochs (default: 25)
+  --max-epochs N, --epochs N Number of training epochs (default: 3)
   --seed INT
 
 Device & checkpointing:

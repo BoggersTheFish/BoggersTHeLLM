@@ -101,26 +101,19 @@ class AppState:
         top_k: int = 28,
     ) -> dict:
         with self._lock:
-            # Run full window dynamics for one forward pass to populate tension curve.
-            tok = self.model.tokenizer
-            prompt_ids = tok.encode(prompt) if tok is not None else [0]
-            if not prompt_ids:
-                prompt_ids = [0]
             import torch
-            self.model.eval()
-            # no_grad (not inference_mode): forward_training_window → run_window_dynamics
-            # uses nested enable_grad + autograd.grad for the energy step.
-            with torch.no_grad():
-                wid = self.model.window_ids_from_sequence(prompt_ids)
-                _ = self.model.forward_training_window(wid)
-            curve = list(getattr(self.model, "_last_window_tension_curve", []))
 
-            text = self.model.generate(
-                prompt,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_k=top_k,
-            )
+            self.model.eval()
+            # Decoding only via model.generate (readout_window path); tension curve reflects
+            # the last autoregressive step inside generate().
+            with torch.no_grad():
+                text = self.model.generate(
+                    prompt,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_k=top_k,
+                )
+            curve = list(getattr(self.model, "_last_window_tension_curve", []))
             # Compute real TSCore tension after generation.
             try:
                 self.substrate.on_batch(self.model)

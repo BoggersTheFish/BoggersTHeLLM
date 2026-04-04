@@ -14,6 +14,7 @@ from collections import Counter
 from tqdm import tqdm
 from pathlib import Path
 
+from evaluation.prompts import EVAL_PROMPTS
 from phase05_config import Phase05Config
 from phase1_config import Phase1Config
 from phase2_config import Phase2Config
@@ -178,7 +179,7 @@ PHASE05_BATCH_CSV_HEADER = [
 ]
 
 
-def sample_next_token_id(
+def _sample_next_token_id(
     logits: torch.Tensor,
     temperature: float,
     top_k: int,
@@ -186,7 +187,7 @@ def sample_next_token_id(
     repeat_penalty: float,
     no_repeat_last_extra: float,
 ) -> int:
-    """Apply repetition penalty, optional top-k, temperature, multinomial sample."""
+    """Sampling helper used only from :meth:`TorchAttractorLanguageModel.generate`."""
     lo = logits.clone()
     for tid in recent_token_ids[-4:]:
         lo[tid] -= repeat_penalty
@@ -2096,7 +2097,9 @@ class TorchAttractorLanguageModel(nn.Module):
     ) -> torch.Tensor:
         """
         Embed window tokens to (W, D), run multi-step interacting dynamics, read out vocab logits.
-        Training, validation, and generation all use this path.
+
+        Used for **teacher-forced** training and metrics (CE, PPL). **Autoregressive text output**
+        must use :meth:`generate`, which calls this each step with the rolling context.
         """
         assert len(context_ids) == self.train_window_size
         S = self.embed_window(context_ids)
@@ -2527,7 +2530,16 @@ class TorchAttractorLanguageModel(nn.Module):
         repeat_penalty: float | None = None,
         no_repeat_last_extra: float | None = None,
     ):
-        """Autoregressive generation: each step uses last-W context → dynamics → readout_window (training path)."""
+        """
+        Autoregressive text generation (single supported decoding entry point).
+        Each step: **window token ids** → :meth:`embed_window` (inside
+        :meth:`forward_training_window`) → :meth:`run_window_dynamics` →
+        :meth:`readout_window_logits` / effective temperature → **sample** next id.
+
+        Teacher-forced metrics (validation CE, perplexity) use :meth:`forward_training_window`
+        or batched readout without sampling — not this method.
+        """
+        # All evaluation and inference must use this method for reproducibility.
         if self.tokenizer is not None:
             input_ids = self.tokenizer.encode(prompt)
         else:
@@ -2580,7 +2592,7 @@ class TorchAttractorLanguageModel(nn.Module):
                             f"attractor_dt_mean={adt_s}  "
                             f"steps={self._last_adaptive_window_steps}  {summ}"
                         )
-                next_id = sample_next_token_id(
+                next_id = _sample_next_token_id(
                     logits,
                     base_gen_temp,
                     tk,
@@ -3293,7 +3305,7 @@ def mean_cross_entropy_eval(
     dataset: list,
     batch_size: int = TRAJECTORY_BATCH_SIZE_DEFAULT,
 ) -> float:
-    """Validation CE: batched window eval with the same logit shaping as training, without noise or entropy-floor branch."""
+    """Validation CE: batched teacher-forced logits (not :meth:`TorchAttractorLanguageModel.generate`)."""
     if not dataset:
         return float("nan")
     was_training = model.training
@@ -3561,6 +3573,65 @@ def _format_phase0_baseline_block(
     )
 
 
+# Keys expected in checkpoint["training_config"] (new checkpoints; used for warnings + load merge).
+_TRAINING_CONFIG_KEYS = (
+    "window_size",
+    "state_dim",
+    "num_waves",
+    "vectorized_num_heads",
+    "max_window_steps",
+    "batch_size",
+    "lr",
+    "grad_clip",
+    "tokenizer",
+    "vocab_cap",
+    "dataset_source",
+    "seed",
+    "num_epochs",
+)
+
+
+def _training_config_from_args(args) -> dict[str, int | float | str | None]:
+    """Serializable training hyperparameters for checkpoint reproducibility."""
+    return {
+        "window_size": int(args.window_size),
+        "state_dim": int(args.state_dim),
+        "num_waves": int(args.num_waves),
+        "vectorized_num_heads": int(getattr(args, "vectorized_num_heads", 4)),
+        "max_window_steps": int(args.num_dynamics_steps),
+        "batch_size": args.batch_size,
+        "lr": float(args.lr),
+        "grad_clip": getattr(args, "grad_clip", None),
+        "tokenizer": str(getattr(args, "tokenizer", "fallback")),
+        "vocab_cap": int(getattr(args, "vocab_cap", 32768)),
+        "dataset_source": str(getattr(args, "dataset_source", "local")),
+        "seed": int(getattr(args, "seed", 42)),
+        "num_epochs": int(getattr(args, "max_epochs", NUM_EPOCHS)),
+    }
+
+
+def _warn_if_training_config_incomplete(ckpt: dict, *, context: str = "") -> None:
+    """Warn when training_config is missing or incomplete (older checkpoints)."""
+    suffix = f" {context}" if context else ""
+    tc = ckpt.get("training_config")
+    if tc is None:
+        print(
+            f"Warning: checkpoint{suffix} has no training_config block; "
+            "training hyperparameters are not fully recorded for reproducibility.",
+            flush=True,
+        )
+        return
+    if not isinstance(tc, dict):
+        print(f"Warning: checkpoint{suffix} training_config is not a dict.", flush=True)
+        return
+    missing = [k for k in _TRAINING_CONFIG_KEYS if k not in tc]
+    if missing:
+        print(
+            f"Warning: checkpoint{suffix} training_config is missing fields: {missing}",
+            flush=True,
+        )
+
+
 def _save_checkpoint(
     model: TorchAttractorLanguageModel,
     optimizer: torch.optim.Optimizer,
@@ -3590,6 +3661,7 @@ def _save_checkpoint(
             _cfg["vectorized_dt"] = float(_mhd.dt)
         except (TypeError, ValueError):
             pass
+    training_config = _training_config_from_args(args)
     torch.save(
         {
             "model_state": model.state_dict(),
@@ -3599,6 +3671,7 @@ def _save_checkpoint(
             "vocab_size": model.vocab_size,
             "tokenizer_mode": getattr(args, "tokenizer", "fallback"),
             "config": _cfg,
+            "training_config": training_config,
         },
         ckpt_path,
     )
@@ -3694,17 +3767,60 @@ def load_model_from_checkpoint(
     Restore ``TorchAttractorLanguageModel`` from ``torch.save`` output matching
     :func:`_save_checkpoint`. Rebuilds ``VectorizedWindowDynamics`` (heads, rank,
     ``dt``, ``use_lorentz``) before ``load_state_dict`` when ``dynamics.mhd.*`` keys exist.
+
+    When ``training_config`` is present, its ``state_dim``, ``window_size``, ``num_waves``,
+    ``max_window_steps``, ``tokenizer``, and ``vocab_cap`` override the corresponding
+    ``config`` / defaults for model construction and tokenizer setup.
     """
     p = Path(ckpt_path)
     ckpt = torch.load(p, map_location=map_location)
+    _warn_if_training_config_incomplete(ckpt, context=str(p))
     st = ckpt["model_state"]
     cfg = ckpt.get("config") or {}
-    vocab_size = int(cfg.get("vocab_size", ckpt.get("vocab_size", 50257)))
-    state_dim = int(cfg.get("state_dim", 512))
-    window_size = int(cfg.get("train_window_size", WINDOW_SIZE))
-    num_waves = int(cfg.get("num_waves", 1))
+    tc = ckpt.get("training_config")
+    if not isinstance(tc, dict):
+        tc = {}
 
-    tok = _build_tokenizer(mode=tokenizer_mode, vocab_cap=vocab_cap)
+    def _int_from_training_or_config(
+        tc_d: dict,
+        cfg_d: dict,
+        *,
+        tc_key: str,
+        cfg_key: str | None,
+        default: int,
+    ) -> int:
+        if tc_key in tc_d:
+            return int(tc_d[tc_key])
+        if cfg_key and cfg_key in cfg_d:
+            return int(cfg_d[cfg_key])
+        return int(default)
+
+    vocab_size = int(cfg.get("vocab_size", ckpt.get("vocab_size", 50257)))
+    state_dim = _int_from_training_or_config(
+        tc, cfg, tc_key="state_dim", cfg_key="state_dim", default=512
+    )
+    window_size = _int_from_training_or_config(
+        tc, cfg, tc_key="window_size", cfg_key="train_window_size", default=WINDOW_SIZE
+    )
+    num_waves = _int_from_training_or_config(
+        tc, cfg, tc_key="num_waves", cfg_key="num_waves", default=1
+    )
+    max_window_steps = _int_from_training_or_config(
+        tc,
+        cfg,
+        tc_key="max_window_steps",
+        cfg_key="max_window_steps",
+        default=MAX_WINDOW_STEPS,
+    )
+
+    tok_mode = tokenizer_mode
+    vocab_cap_use = vocab_cap
+    if "tokenizer" in tc:
+        tok_mode = str(tc["tokenizer"])
+    if "vocab_cap" in tc:
+        vocab_cap_use = int(tc["vocab_cap"])
+
+    tok = _build_tokenizer(mode=tok_mode, vocab_cap=vocab_cap_use)
     if print_vocab_mismatch_warning and tok.n_vocab != vocab_size:
         print(
             f"Warning: tokenizer vocab {tok.n_vocab} != checkpoint {vocab_size} "
@@ -3716,7 +3832,7 @@ def load_model_from_checkpoint(
         vocab_size,
         state_dim=state_dim,
         train_window_size=window_size,
-        max_window_steps=int(cfg.get("max_window_steps", MAX_WINDOW_STEPS)),
+        max_window_steps=max_window_steps,
         convergence_epsilon=float(cfg.get("convergence_epsilon", 0.0)),
         num_waves=num_waves,
         use_readout_fusion=bool(cfg.get("use_readout_fusion", False)),
@@ -4465,6 +4581,7 @@ def main() -> None:
 
     if args.resume_checkpoint is not None and args.resume_checkpoint.is_file():
         ckpt = torch.load(args.resume_checkpoint, map_location="cpu")
+        _warn_if_training_config_incomplete(ckpt, context=str(args.resume_checkpoint))
         load_torch_attractor_state_dict(model, ckpt["model_state"])
         global_step = ckpt.get("step", 0)
         start_epoch = ckpt.get("epoch", 0)
@@ -5332,6 +5449,24 @@ def main() -> None:
                     f"(max lang_tension={_max_tension:.4f} < threshold={substrate.high_tension_threshold:.3f})",
                     flush=True,
                 )
+
+        # Fixed-prompt evaluation: same prompts every epoch, saved under logs/
+        _ep_n = epoch + 1
+        _log_dir = _REPO_ROOT / "logs"
+        _log_dir.mkdir(parents=True, exist_ok=True)
+        _eval_path = _log_dir / f"eval_epoch_{_ep_n}.txt"
+        _eval_chunks: list[str] = []
+        print(
+            f"  [eval] fixed prompts (n={len(EVAL_PROMPTS)}, max_tokens=120) ...",
+            flush=True,
+        )
+        for prompt in EVAL_PROMPTS:
+            text = model.generate(prompt, max_tokens=120)
+            _eval_chunks.append(f"{prompt}\n----\n{text}\n\n")
+            print(f"  [eval] prompt: {prompt}", flush=True)
+            print(f"  [eval] text: {text}", flush=True)
+        _eval_path.write_text("".join(_eval_chunks), encoding="utf-8")
+        print(f"  [eval] saved {_eval_path}", flush=True)
 
         # Phase 12: CSV metrics logging (updated headers for Bug 4/5).
         if args.epoch_metrics_csv is not None:

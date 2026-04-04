@@ -45,7 +45,9 @@ Historical baseline runs remain unchanged and still record the values used durin
 
 3. Copy the printed block into the **“Recorded baseline”** section below when you want a frozen snapshot in git.
 
-**Fixed generation prompts** (defined in `sandbox.py` as `BASELINE_PROMPT_1` … `BASELINE_PROMPT_3`) are always the same so outputs are comparable across runs.
+**Fixed generation prompts (end of training run)** — defined in **`sandbox.py`** as **`BASELINE_PROMPT_1` … `BASELINE_PROMPT_3`** — are always the same so the printed Phase 0 baseline block is comparable across runs.
+
+**Fixed prompts during training** — each epoch, **`sandbox.py`** also runs **`model.generate`** on **`evaluation/prompts.EVAL_PROMPTS`** (eight strings, `max_tokens=120`) and writes **`logs/eval_epoch_{epoch}.txt`**. Use those logs to track learning curves without waiting for the final baseline block.
 
 ## Metrics to care about
 

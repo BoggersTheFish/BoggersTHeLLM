@@ -81,9 +81,13 @@ python sandbox.py \
 - `metrics_epoch.csv` (if enabled): trajectory contrastive, train CE, tension.
 - Phase 0.5 batch CSV (optional `--phase05-log-metrics --phase05-batch-metrics-csv ...`) for fine-grained tension and step counts.
 
+## During training
+
+Each epoch, **`sandbox.py`** runs **`model.generate`** on **`evaluation/prompts.EVAL_PROMPTS`** (`max_tokens=120`) and writes **`logs/eval_epoch_{N}.txt`** — use these to spot regressions without waiting for the final **`BASELINE_PROMPT_*`** block.
+
 ## After training
 
-`scripts/generate_sample.py` calls **`sandbox.load_model_from_checkpoint`** (vectorized dynamics + `dt` + Lorentz from checkpoint `config`) then **`model.generate`** — same readout path as training.
+`scripts/generate_sample.py` calls **`sandbox.load_model_from_checkpoint`** (vectorized dynamics + `dt` + Lorentz from checkpoint `config`; merges **`training_config`** when present) then **`model.generate`** — same readout path as training.
 
 ```bash
 python scripts/generate_sample.py \

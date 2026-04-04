@@ -39,7 +39,7 @@ def main() -> None:
     model.tokenizer = tok
     model.eval()
 
-    # 2. Training-parity logits (readout_window), not state_cache.logits()
+    # 2. Teacher-forced logits path (CE / eval), readout_window — not for free-running decode.
     wid = model.window_ids_from_sequence(tok.encode("hello") or [0])
     logits = model.forward_training_window(wid)
     print(f"forward_training_window logits shape: {tuple(logits.shape)}")

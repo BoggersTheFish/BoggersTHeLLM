@@ -16,6 +16,11 @@ Usage (repo root)
   python scripts/profile_training_step.py --mode ts-llm --device cuda --seq-len 8 --state-dim 512
   python scripts/profile_training_step.py --mode sandbox --trace traces/step.json
 
+Throughput
+----------
+  After profiling, runs ``--throughput-iters`` timed ``train_step()`` calls (wall clock, no profiler).
+  Writes ``benchmarks/training_throughput.json`` and prints ``=== Throughput ===`` summary.
+
 View Chrome trace
 -----------------
   Open chrome://tracing in Chromium, Load → select traces/step.json
@@ -33,7 +38,9 @@ Memory
 from __future__ import annotations
 
 import argparse
+import json
 import sys
+import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -115,10 +122,16 @@ def main() -> None:
     ap.add_argument("--batch-size", type=int, default=16)
     ap.add_argument("--state-dim", type=int, default=128)
     ap.add_argument("--window-size", type=int, default=8)
-    ap.add_argument("--max-window-steps", type=int, default=8)
+    ap.add_argument("--max-window-steps", type=int, default=32)
     ap.add_argument("--seq-len", type=int, default=8, help="(ts-llm) sequence length for training_step")
     ap.add_argument("--warmup", type=int, default=2)
     ap.add_argument("--active", type=int, default=3, help="Profiled steps after warmup")
+    ap.add_argument(
+        "--throughput-iters",
+        type=int,
+        default=32,
+        help="Timed train_step() iterations for throughput (after profiling).",
+    )
     ap.add_argument("--top", type=int, default=25, help="Number of ops to print")
     ap.add_argument("--vectorized", action="store_true", default=True)
     ap.add_argument(
@@ -247,6 +260,68 @@ def main() -> None:
 
     if device.type == "cuda":
         torch.cuda.synchronize()
+
+    # Wall-clock throughput (no profiler overhead): elapsed_time / number_of_steps
+    bench_iters = max(1, int(args.throughput_iters))
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    t_tp0 = time.perf_counter()
+    for _ in range(bench_iters):
+        train_step()
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    elapsed_tp = time.perf_counter() - t_tp0
+
+    step_time_ms = (elapsed_tp / bench_iters) * 1000.0
+    batches_per_second = bench_iters / elapsed_tp if elapsed_tp > 0 else float("nan")
+    if args.mode == "sandbox":
+        B = max(2, args.batch_size)
+        W = args.window_size
+        tokens_per_step = B * W
+        state_dim = args.state_dim
+        dyn_steps = args.max_window_steps
+    else:
+        B = 1
+        W = args.seq_len
+        tokens_per_step = W
+        state_dim = args.state_dim
+        dyn_steps = args.seq_len
+    tokens_per_second = (tokens_per_step * bench_iters) / elapsed_tp if elapsed_tp > 0 else float("nan")
+
+    tp_lines = [
+        "",
+        "=== Throughput ===",
+        f"batch_size: {B}",
+        f"window_size: {W}",
+        f"state_dim: {state_dim}",
+        f"steps: {dyn_steps}",
+        "",
+        f"step_time_ms: {step_time_ms:.4f}",
+        f"batches/sec: {batches_per_second:.4f}",
+        f"tokens/sec: {tokens_per_second:.4f}",
+        "",
+    ]
+    print("\n".join(tp_lines), flush=True)
+
+    throughput_payload = {
+        "mode": args.mode,
+        "device": str(device),
+        "batch_size": B,
+        "window_size": W,
+        "state_dim": state_dim,
+        "max_window_steps": int(args.max_window_steps) if args.mode == "sandbox" else None,
+        "seq_len": int(args.seq_len) if args.mode == "ts-llm" else None,
+        "throughput_benchmark_iters": bench_iters,
+        "elapsed_seconds": elapsed_tp,
+        "step_time_ms": step_time_ms,
+        "batches_per_second": batches_per_second,
+        "tokens_per_second": tokens_per_second,
+        "tokens_per_step": tokens_per_step,
+    }
+    bench_path = REPO / "benchmarks" / "training_throughput.json"
+    bench_path.parent.mkdir(parents=True, exist_ok=True)
+    bench_path.write_text(json.dumps(throughput_payload, indent=2) + "\n", encoding="utf-8")
+    print(f"Wrote {bench_path}", flush=True)
 
     if args.trace is not None:
         args.trace.parent.mkdir(parents=True, exist_ok=True)

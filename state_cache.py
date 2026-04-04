@@ -10,8 +10,8 @@ Wave C — Rolling state cache (legacy inference helper).
     ``readout_window`` or ``effective_temperature``, which skews sampling vs training.
 
 ``step()`` still runs the same ``run_window_dynamics`` embedding geometry as training
-and remains useful for experiments; avoid ``logits()`` / ``generate_with_cache`` for
-production decoding unless you explicitly accept the train/infer mismatch.
+and remains useful for experiments. ``generate_with_cache`` is a deprecated shim that
+calls :meth:`sandbox.TorchAttractorLanguageModel.generate`; avoid ``logits()`` for decoding.
 """
 from __future__ import annotations
 
@@ -172,74 +172,37 @@ def generate_with_cache(
 ) -> str:
     """
     .. deprecated::
-        Uses :meth:`AttractorStateCache.logits` → ``readout``, not the training
-        ``readout_window`` path. Prefer ``model.generate(..., temperature=..., top_k=...)``.
+        Legacy wrapper — now delegates to :meth:`TorchAttractorLanguageModel.generate`.
+        The ``cache`` / ``reset`` arguments are ignored; kept for API compatibility only.
 
     Parameters
     ----------
     model : TorchAttractorLanguageModel
-    cache : AttractorStateCache (will be reset if reset=True)
+    cache : ignored (compatibility only)
     prompt : seed text
     max_tokens : tokens to generate
     temperature : sampling temperature
     top_k : top-k truncation
-    repeat_penalty : logit divisor for recently seen tokens
-    no_repeat_last_extra : extra penalty for the immediately preceding token
-    reset : clear the cache before generation (True = stateless call)
+    repeat_penalty : passed to ``model.generate``
+    no_repeat_last_extra : passed to ``model.generate``
+    reset : ignored (compatibility only)
     """
     warnings.warn(
-        "generate_with_cache uses readout(fast/slow) via cache.logits(), not readout_window; "
-        "decoding is not training-aligned. Use TorchAttractorLanguageModel.generate() instead.",
+        "generate_with_cache is deprecated; it now calls model.generate() only. "
+        "Pass prompt and sampling kwargs directly to TorchAttractorLanguageModel.generate.",
         FutureWarning,
         stacklevel=2,
     )
-    import sandbox as _sb  # noqa: F811  # type: ignore[import]
-
-    tok = getattr(model, "tokenizer", None)
-    if tok is not None:
-        prompt_ids = tok.encode(prompt)
-    else:
-        prompt_ids = list(range(min(model.train_window_size, 6)))
-    if not prompt_ids:
-        prompt_ids = [0]
-
     if reset:
         cache.reset()
-
-    was_training = model.training
-    model.eval()
-
-    # no_grad (not inference_mode): cache.step → run_window_dynamics needs nested enable_grad.
-    with torch.no_grad():
-        cache.warmup(prompt_ids)
-
-        generated_ids = list(prompt_ids)
-
-        for _ in range(max_tokens):
-            logits = cache.logits()
-            recent = generated_ids[-top_k:] if len(generated_ids) > top_k else generated_ids
-            for rid in set(recent):
-                logits[rid] = logits[rid] / repeat_penalty
-            if generated_ids:
-                logits[generated_ids[-1]] = logits[generated_ids[-1]] / no_repeat_last_extra
-
-            next_id = _sb.sample_next_token_id(
-                logits,
-                temperature,
-                top_k,
-                generated_ids,
-                repeat_penalty,
-                no_repeat_last_extra,
-            )
-            generated_ids.append(next_id)
-            cache.step(next_id)
-
-    if was_training:
-        model.train()
-
-    if tok is not None:
-        return tok.decode(generated_ids)
-    return " ".join(str(i) for i in generated_ids)
+    return model.generate(
+        prompt,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        top_k=top_k,
+        repeat_penalty=repeat_penalty,
+        no_repeat_last_extra=no_repeat_last_extra,
+    )
 
 
 # --------------------------------------------------------------------------
