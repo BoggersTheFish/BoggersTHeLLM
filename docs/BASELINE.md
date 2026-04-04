@@ -8,6 +8,18 @@ For runs on a **public or large text corpus** (Hugging Face TinyStories / FineWe
 
 **Phase 0.5 / 1 / 2:** If you enable **`--phase05-batch-metrics-csv`**, each batch row includes extra diagnostics (window tension traces, breaks, Phase 1 interaction RMS / head tension / diversity loss, Phase 2 break direction norm, α, ΔT, Δalignment, head-weight entropy, interaction reg). Additional columns include **attractor step count**, **final window tension**, **break count**, **convergence triggered**, **`energy_per_wave_means`** (semicolon-separated), and when anchor freeze is on **`frozen_fraction_mean` / `frozen_fraction_std`** (see **`PHASE05_BATCH_CSV_HEADER`** in **`sandbox.py`**). When **`--phase05-log-metrics`** is off, heavy tracing is skipped. Re-baseline after changing **`--num-waves`**, **`--readout-fusion`**, **`--phase05-enable-anchor-freeze`**, **`--phase2-*`**, **`--phase1-*`**, **`--dynamics`**, **`--convergence-epsilon`**, or **`--num-dynamics-steps`** / **`--max-window-steps`**.
 
+### Architecture Change: Relaxation Horizon
+
+| Parameter | Old | New |
+|-----------|-----|-----|
+| max_window_steps | 16 | 32 |
+
+**Date:** 2026-04-04
+
+**Reason:** Increase attractor relaxation depth for improved convergence.
+
+Historical baseline runs remain unchanged and still record the values used during those runs.
+
 ## How to record a baseline run
 
 1. From the repo root, with your venv active:

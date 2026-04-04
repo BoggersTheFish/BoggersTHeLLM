@@ -64,6 +64,32 @@ See **`docs/PROJECT_STATUS.md`** for a frank “where we are” checklist and **
 
 ---
 
+## Attractor Dynamics Depth Update (April 2026)
+
+The attractor relaxation horizon was increased from **16 to 32 steps**.
+
+This parameter controls how many outer relaxation iterations the window-state attractor dynamics performs during training.
+
+**Previous:**
+
+```text
+MAX_WINDOW_STEPS = 16
+```
+
+**Current:**
+
+```text
+MAX_WINDOW_STEPS = 32
+```
+
+This change allows the latent state trajectory to settle deeper into its attractor basin before computing trajectory contrastive loss.
+
+No architecture or loss changes were introduced.
+
+For a dated record, see **[CHANGELOG.md](CHANGELOG.md)** (2026-04-04) and **[docs/architecture_changes.md](docs/architecture_changes.md)**.
+
+---
+
 ## Project structure
 
 | File / Directory | Wave | Purpose |
@@ -96,6 +122,7 @@ See **`docs/PROJECT_STATUS.md`** for a frank “where we are” checklist and **
 | `docs/PROJECT_STATUS.md` | — | Current implementation status, gaps, recommended next steps |
 | `docs/API_DISCOVERY.md` | — | Vendored TS-OS entrypoints + `sandbox.py` integration surface |
 | `docs/BASELINE.md` | — | Phase 0 baseline recording instructions |
+| `docs/architecture_changes.md` | — | Dated architecture / default changes (e.g. relaxation horizon) |
 | `docs/DEVELOPMENT_ROADMAP.md` | — | Phased roadmap (measurement, throughput, multi-wave behavior) |
 | `scripts/plot_phase05_metrics.py` | — | Plots `--phase05-batch-metrics-csv` columns (incl. Phase 1–2 extras) |
 
@@ -637,7 +664,7 @@ model = sb.TorchAttractorLanguageModel(
     vocab_size=tok.n_vocab,
     state_dim=512,
     train_window_size=6,
-    max_window_steps=16,
+    max_window_steps=32,
     phase05=sb.Phase05Config(),
     phase1=sb.Phase1Config(),
     phase2=sb.Phase2Config(),
@@ -740,7 +767,7 @@ Data & tokenizer:
 Training:
   --window-size INT          Context window W (default: 6)
   --num-dynamics-steps INT, --max-window-steps INT
-                            Max outer attractor steps per window (default: 16)
+                            Max outer attractor steps per window (default: 32)
   --convergence-epsilon FLOAT  Early exit when B=1 and ‖ΔS‖ or |ΔT_mean| below this after min steps (0 = all outer steps; B>1 ignores early exit)
   --min-attractor-steps INT  Minimum outer steps before early exit may trigger (default: 2, ≥2)
   --trajectory-batch-size INT  Batch size for trajectory mode (default: 64, need ≥2)

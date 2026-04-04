@@ -7,6 +7,36 @@ The project is documented as **BoggersTheLanguageModel**; canonical source is [g
 
 ---
 
+## 2026-04-04 — Attractor Dynamics Depth Update
+
+### Change
+
+Default attractor relaxation depth increased:
+
+**`MAX_WINDOW_STEPS`:** **16 → 32**
+
+### Files affected
+
+- `sandbox.py`
+
+### Reason
+
+Early training diagnostics showed shallow attractor basins during trajectory relaxation.
+
+Increasing the relaxation horizon allows the system state to converge deeper into stable minima within each token window.
+
+This does not change the algorithm or model structure. Only the number of outer relaxation iterations increases.
+
+### Impact
+
+- Deeper attractor convergence
+- Slightly slower training step
+- Improved trajectory stability
+
+CLI default: **`--num-dynamics-steps`** and **`--max-window-steps`** now default to **32** (via `MAX_WINDOW_STEPS`).
+
+---
+
 ## Committed run artifacts — meaningful Apr 2026 (Apr 2026)
 
 - **`docs/runs/meaningful_apr2026/`** — `metrics_meaningful.csv`, `eval_meaningful.json` (paths in JSON repo-relative), and **README** documenting every column / JSON key. Linked from **`docs/TRAINING_RUN_LOG.md`** and **`docs/README.md`**.
