@@ -16,6 +16,7 @@ Goal: coherent multi-token generation from attractor dynamics. Use trajectory lo
 | Adaptive inner scale | `--phase05-adaptive-window-dt` |
 | Stronger linear contraction | `--vectorized-strong-diffusion` |
 | Aux signal | `--token-aux-ce 0.2` and/or `--readout-aux-alpha 0.15` |
+| CE drift fix | If **`train_CE` / `val_CE` increase** over epochs, use README **A1c**: `--lr 0.0003`, `--token-aux-ce 0.5`, `--trajectory-batch-size 32`, `--num-dynamics-steps 16` (see **`docs/FAILURE_ANALYSIS.md`** §3b) |
 
 ## Example command — CPU-friendly slice (verified Apr 2026)
 
@@ -44,6 +45,10 @@ python3 sandbox.py \
   --checkpoint-dir checkpoints/meaningful_run \
   --save-every 500
 ```
+
+## Rebalanced CE (same corpus, smaller batch)
+
+When trajectory diagnostics look fine but CE worsens epoch-to-epoch, prefer **`--lr 0.0003`**, **`--token-aux-ce 0.5`**, **`--grad-clip 1.0`**, **`--trajectory-batch-size 32`** — full one-liner in root README **A1c**.
 
 ## Example command — larger corpus (GPU / long run)
 

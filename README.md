@@ -4,7 +4,7 @@
 
 **Primary repository:** [github.com/BoggersTheFish/BoggersTheLLM](https://github.com/BoggersTheFish/BoggersTheLLM). **Alternate mirror:** [github.com/BoggersTheFish/idekatp](https://github.com/BoggersTheFish/idekatp). The product name is **BoggersTheLanguageModel**.
 
-**Docs:** [docs/README.md](docs/README.md) indexes all guides; [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md) summarizes what is implemented and what to do next; [docs/DEVELOPMENT_ROADMAP.md](docs/DEVELOPMENT_ROADMAP.md) is the phased roadmap.
+**Docs:** [docs/README.md](docs/README.md) indexes all guides; [docs/BOGGERS_THE_LANGUAGE_MODEL_AUDIT.md](docs/BOGGERS_THE_LANGUAGE_MODEL_AUDIT.md) is the **full architecture / training audit**; [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md) summarizes what is implemented and what to do next; [docs/DEVELOPMENT_ROADMAP.md](docs/DEVELOPMENT_ROADMAP.md) is the phased roadmap.
 
 ---
 
@@ -128,6 +128,7 @@ For a dated record, see **[CHANGELOG.md](CHANGELOG.md)** (2026-04-04) and **[doc
 | `docs/BASELINE.md` | — | Phase 0 baseline recording instructions |
 | `docs/architecture_changes.md` | — | Dated architecture / default changes (e.g. relaxation horizon) |
 | `docs/DEVELOPMENT_ROADMAP.md` | — | Phased roadmap (measurement, throughput, multi-wave behavior) |
+| `docs/BOGGERS_THE_LANGUAGE_MODEL_AUDIT.md` | — | Full technical audit of `sandbox.py` model, dynamics, losses, metrics |
 | `scripts/plot_phase05_metrics.py` | — | Plots `--phase05-batch-metrics-csv` columns (incl. Phase 1–2 extras) |
 
 ---
@@ -207,6 +208,27 @@ python3 sandbox.py \
 ```
 
 End-state reference (Apr 2026, one machine): **`val_CE` ~4.8**, **`train_CE` ~3.9** after 10 epochs; generations recognizable as story-like but not polished. A **committed** snapshot of `metrics_meaningful.csv` and `eval_meaningful.json` (plus a column/field glossary) lives under **`docs/runs/meaningful_apr2026/`**; narrative: **`docs/TRAINING_RUN_LOG.md`**.
+
+That reference run used **`--lr 0.001`** and **`--token-aux-ce 0.2`** (defaults). If **`train_CE` and `val_CE` rise together** over epochs while dynamics diagnostics stay healthy, the trajectory objective is likely **overpowering token CE** — prefer **`--lr 3e-4`** (or **`1e-4`**) and **`--token-aux-ce 0.5`** with **`--grad-clip 1.0`**, and compare **`train_CE` / `val_CE`** (not raw `mean_loss`, which scales with aux weights). See **`docs/FAILURE_ANALYSIS.md`** and **A1c** below.
+
+**A1c — Rebalanced loss (recommended when CE drifts up).** Same TinyStories slice and model shape as A1; smaller trajectory batch (more batches/epoch on CPU), lower LR, stronger `readout_window` CE aux:
+
+```bash
+python3 sandbox.py --device cpu \
+  --dataset-source tinystories \
+  --hf-max-rows 50000 --hf-max-chars 1500000 \
+  --tokenizer tiktoken --vocab-cap 8192 \
+  --state-dim 128 --num-waves 4 --window-size 8 \
+  --num-dynamics-steps 16 \
+  --max-epochs 5 --trajectory-batch-size 32 \
+  --lr 0.0003 \
+  --token-aux-ce 0.5 \
+  --grad-clip 1.0 \
+  --val-fraction 0.1 \
+  --epoch-metrics-csv metrics_rebalanced.csv
+```
+
+Wall time is roughly **~28 min/epoch** on a typical laptop CPU (~10k batches/epoch at batch 32). Use **`--num-dynamics-steps 32`** to match current **`MAX_WINDOW_STEPS`** defaults if you want deeper relaxation (slower per step).
 
 **A1b — Same recipe, fewer epochs (quick sanity check).** Use **`--max-epochs 3`** (and omit CSV/JSON flags if you only need console metrics). Wall time is roughly **~55 minutes** on a typical CPU at batch 64 for this corpus slice. A **verbatim** log (progress bars, checkpoints, Phase 0 baseline block, sample generations, debug dynamics) is committed under **`docs/runs/apr2026_3epoch_cpu_example/`** ([README](docs/runs/apr2026_3epoch_cpu_example/README.md), [full output](docs/runs/apr2026_3epoch_cpu_example/EXAMPLE_RUN_OUTPUT.md)). That example was captured at git **`d65dd64`** with **`dynamics_steps=16`**; current defaults use **`--num-dynamics-steps 32`** unless you pass **`16`** explicitly.
 
@@ -429,7 +451,7 @@ python3 sandbox.py --corpus data/generated.txt
 
 **Optimisation and stability**
 
-- **`--lr`** 1e-3 with **`StepLR`** (`--lr-decay-every`, `--lr-gamma`) is a reasonable default; lower LR if loss spikes or **`grad_norm`** explodes (see **`--debug`**).
+- **`--lr`** 1e-3 with **`StepLR`** (`--lr-decay-every`, `--lr-gamma`) is a reasonable starting point; **if `train_CE` and `val_CE` rise over epochs** while dynamics look stable, try **`--lr 3e-4`**–**`1e-4`** and **`--token-aux-ce 0.5`** (README **A1c**). Lower LR if loss spikes or **`grad_norm`** explodes (see **`--debug`**).
 - Keep at least one of **`--token-aux-ce`** or **`--readout-aux-alpha`** on in trajectory mode so the readout heads receive gradients (the script warns if both are zero).
 - **Phase 1 window interaction** (`--phase1-enable-window-interaction`) plus **Phase 2** **`--phase2-interaction-reg-weight`** and optional **`--phase2-interaction-decay-tau`** help keep coupling matrix **`C`** from drifting; enable when you see unstable window norms.
 - **Checkpoints:** **`--checkpoint-dir`** + **`--save-every`** for long runs; **`--resume-checkpoint`** restores weights and optimizer. Newer code may add parameters—use **`strict=False`** in custom loaders if needed.

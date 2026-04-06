@@ -31,6 +31,20 @@ If `scripts/generate_sample.py` produces repetitive tokens, garbage, or divergen
 - More data (`--hf-max-rows`), more epochs, learning rate.
 - Trajectory batch size ≥ 2; contrastive negatives (`--phase05-num-negatives`).
 
+## 3b. Rising train CE and val CE (healthy dynamics, worse token prediction)
+
+**Signs:** `mean_loss` or trajectory diagnostics look fine; **`train_CE` and `val_CE` increase** over epochs; tension curves and `[diag] … HEALTHY` still print.
+
+**Cause:** Trajectory contrastive + default aux weights can **dominate** the `readout_window` cross-entropy path at **`--lr 0.001`** with **`--token-aux-ce 0.2`**.
+
+**Checks / fixes:**
+
+- Lower **`--lr`** to **`3e-4`** or **`1e-4`**.
+- Raise **`--token-aux-ce`** (e.g. **`0.5`**) so the **window readout CE** term weighs more; keep **`--readout-aux-alpha`** in mind (default **`0.15`**).
+- Use **`--grad-clip 1.0`**.
+- Compare **CE columns** in `--epoch-metrics-csv`, not raw `mean_loss` (scale changes with aux weights).
+- See README **A1c** and **`docs/PROJECT_STATUS.md`** (Gaps).
+
 ## 4. Trajectory collapse
 
 **Signs:** all final states similar (PCA variance ~0); margin in trajectory loss saturates; repetitive generation.

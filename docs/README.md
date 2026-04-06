@@ -4,6 +4,7 @@ Start with the [README](../README.md) in the repo root for install, training, an
 
 | Document | Purpose |
 |----------|---------|
+| [BOGGERS_THE_LANGUAGE_MODEL_AUDIT.md](BOGGERS_THE_LANGUAGE_MODEL_AUDIT.md) | **Full technical audit:** `TorchAttractorLanguageModel` submodules, shapes, dynamics, losses, training loop, metrics |
 | [PROJECT_STATUS.md](PROJECT_STATUS.md) | **Current state:** what is implemented, gaps, recommended next steps |
 | [DEVELOPMENT_ROADMAP.md](DEVELOPMENT_ROADMAP.md) | Phased engineering and research priorities (updated for multi-wave stack) |
 | [API_DISCOVERY.md](API_DISCOVERY.md) | Vendored TS-OS repos + `sandbox.py` / model entrypoints |

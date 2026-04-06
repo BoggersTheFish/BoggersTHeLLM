@@ -2,12 +2,15 @@
 
 This document answers: **where the codebase is today**, **what is solid**, **what is experimental**, and **what to do next**. It is meant to stay roughly in sync with `sandbox.py` and `phase05_config.py`; when in doubt, trust the code.
 
+**Full architecture audit:** [`docs/BOGGERS_THE_LANGUAGE_MODEL_AUDIT.md`](BOGGERS_THE_LANGUAGE_MODEL_AUDIT.md) (submodules, tensor shapes, `run_window_dynamics`, trajectory loss, metrics).
+
 ---
 
 ## Progress snapshot (documentation and runs)
 
 | Item | Location |
 |------|----------|
+| **Technical audit** (sandbox `TorchAttractorLanguageModel`) | [`docs/BOGGERS_THE_LANGUAGE_MODEL_AUDIT.md`](BOGGERS_THE_LANGUAGE_MODEL_AUDIT.md) |
 | **10-epoch** TinyStories CPU reference (CSV + eval JSON, ~3.9 h) | [`docs/runs/meaningful_apr2026/README.md`](runs/meaningful_apr2026/README.md) |
 | **3-epoch** full-console example (same corpus caps, ~55 min, git `d65dd64`, **16** outer steps at run time) | [`docs/runs/apr2026_3epoch_cpu_example/README.md`](runs/apr2026_3epoch_cpu_example/README.md) |
 | Chronological run notes | [`docs/TRAINING_RUN_LOG.md`](TRAINING_RUN_LOG.md) |
@@ -51,10 +54,11 @@ A **continuous attractor language model** without transformer attention: window 
 ## Gaps and risks
 
 1. **Documentation lag** — Older notes may still mention `run_window_dynamics` calling `dynamics.step` every outer step; the **window** path is primarily **energy + coupling**. Token path uses `step` / `wave_dynamics`. External tutorials must use the **3-tuple** `epoch_batches` API when copying pipeline examples. Verified runs may cite **`num_dynamics_steps: 16`** while the current default is **32** — check the date and CLI in each doc.
-2. **Hyperparameter surface** — `num_waves`, `wave_interaction_strength`, `anchor_freeze_threshold`, `readout_fusion`, and per-wave energy heads multiply knobs; **re-baseline** after architectural toggles.
-3. **GPU performance** — Roadmap targets (batch &lt; 1 s, etc.) are **aspirational** until measured on your hardware; profile with `scripts/profile_training_step.py`.
-4. **Eval vs training** — `state_cache.logits()` / `readout(D)` is **not** training-parity decoding; use **`generate`** for samples. **`eval_harness` PPL** uses teacher-forced logits (not **`generate`**).
-5. **Tests** — Smoke and parity tests exist; **no** full regression suite for every Phase 0.5 flag combination.
+2. **Trajectory vs CE balance** — At **`lr=1e-3`** with default **`--token-aux-ce 0.2`**, **`train_CE` / `val_CE` can increase** over epochs while tension diagnostics look fine. Prefer **`--lr 3e-4`**–**`1e-4`**, **`--token-aux-ce 0.5`**, **`--grad-clip 1.0`**, and track **CE** (see README **A1c**, **`docs/FAILURE_ANALYSIS.md`**).
+3. **Hyperparameter surface** — `num_waves`, `wave_interaction_strength`, `anchor_freeze_threshold`, `readout_fusion`, and per-wave energy heads multiply knobs; **re-baseline** after architectural toggles.
+4. **GPU performance** — Roadmap targets (batch &lt; 1 s, etc.) are **aspirational** until measured on your hardware; profile with `scripts/profile_training_step.py`.
+5. **Eval vs training** — `state_cache.logits()` / `readout(D)` is **not** training-parity decoding; use **`generate`** for samples. **`eval_harness` PPL** uses teacher-forced logits (not **`generate`**).
+6. **Tests** — Smoke and parity tests exist; **no** full regression suite for every Phase 0.5 flag combination.
 
 ---
 
@@ -63,7 +67,7 @@ A **continuous attractor language model** without transformer attention: window 
 ### Near term (engineering)
 
 1. **Profile one training step on target GPU** — confirm bottleneck is window loop vs embedding vs readout.
-2. **Single “golden” config** — **CPU:** README Option **A1** + **`docs/TRAINING_RUN_LOG.md`** (TinyStories + `hf-max-chars`, `state_dim=128`, `num_waves=4`). **GPU:** scale up rows/chars and batch size; same vectorized head divisibility rule (`wave_dim % vectorized_num_heads == 0`).
+2. **Single “golden” config** — **CPU:** README Option **A1** (reference `lr=1e-3` run) or **A1c** (rebalanced CE: `lr=3e-4`, `token_aux_ce=0.5`) + **`docs/TRAINING_RUN_LOG.md`**. **GPU:** scale up rows/chars and batch size; same vectorized head divisibility rule (`wave_dim % vectorized_num_heads == 0`).
 3. **Plot script** — extend `plot_phase05_metrics.py` for `frozen_fraction_*` and `energy_per_wave_means` if you rely on them.
 
 ### Near term (science / product)

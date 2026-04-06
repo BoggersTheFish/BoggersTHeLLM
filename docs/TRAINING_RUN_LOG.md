@@ -11,6 +11,16 @@ Chronological notes for **substantive** `sandbox.py` runs (real corpora, multi-e
 
 ---
 
+## 2026-04-06 — Rebalanced CE recipe (A1c, documented)
+
+**Goal:** Avoid **rising `train_CE` / `val_CE`** when trajectory diagnostics remain healthy (see **`docs/FAILURE_ANALYSIS.md`** §3b).
+
+**Recipe:** README **A1c** — TinyStories `--hf-max-chars 1500000`, `--lr 0.0003`, `--token-aux-ce 0.5`, `--grad-clip 1.0`, `--trajectory-batch-size 32`, `--num-dynamics-steps 16` (or **32** to match `MAX_WINDOW_STEPS` default). Roughly **~28 min/epoch** on a typical laptop CPU (~10k batches/epoch).
+
+**Metrics (example, epoch 1):** `train_CE` ~5.1, `val_CE` ~5.2 — use as a **sanity band**, not a golden benchmark; compare against your own `metrics_rebalanced.csv`.
+
+---
+
 ## 2026-04-04 — TinyStories CPU, 3 epochs (full transcript example)
 
 **Goal:** Short wall-clock run (~55 min total) on the same **1.5M-char** TinyStories cache as the 10-epoch reference, with **verbatim** console output committed for onboarding and debugging.

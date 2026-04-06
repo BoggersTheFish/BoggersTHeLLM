@@ -7,6 +7,13 @@ The project is documented as **BoggersTheLanguageModel**; canonical source is [g
 
 ---
 
+## 2026-04-06 — Documentation: audit index, CE balance (A1c), failure analysis
+
+- **`docs/README.md`** — Index row for **`docs/BOGGERS_THE_LANGUAGE_MODEL_AUDIT.md`** (full technical audit).
+- **`README.md`** — Doc links + project table; **A1c** recipe (TinyStories CPU, `--lr 0.0003`, `--token-aux-ce 0.5`, `--grad-clip 1.0`, `trajectory-batch-size 32`); note on **CE drift** vs trajectory when using **`lr=1e-3`** / default **`token-aux-ce`.
+- **`docs/PROJECT_STATUS.md`** — Link to audit; **Trajectory vs CE balance** gap; golden config points to **A1** or **A1c**.
+- **`docs/FAILURE_ANALYSIS.md`** — New **§3b** (rising train/val CE with healthy dynamics).
+
 ## 2026-04 — Documentation sync (README + docs)
 
 - **README.md** — Project table: **`evaluation/prompts.py`**, **`benchmarks/training_throughput.json`**, **`scripts/profile_training_step.py`**; checkpoints **`training_config`**; end-of-epoch **`logs/eval_epoch_*.txt`**; **`state_cache`** shim; **trajectory teacher** description (stop-gradient consecutive states); **`--max-epochs`** default **3**; eval harness / throughput / Wave C / Wave H cross-links.
